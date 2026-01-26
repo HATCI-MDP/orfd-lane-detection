@@ -28,7 +28,7 @@ A deep learning system for detecting traversable road areas in off-road environm
 
 ```bash
 # Clone the repository
-git clone <repository-url>
+git clone https://github.com/bryansbtian/orfd-lane-detection.git
 cd "Off Road"
 
 # Create virtual environment (optional but recommended)
