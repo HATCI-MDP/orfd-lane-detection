@@ -1,0 +1,35 @@
+# Deployment overlay for a client on a separate machine from the simulator:
+# BeamNG runs on another host (here, a Windows workstation reached over the
+# network from this Linux/WSL2 client), so the stack attaches instead of
+# launching. Personal/local use only (not for a PR) - the address is
+# hardcoded rather than read from BEAMNG_HOST/PORT so it runs with no env
+# vars; WSL2's gateway address, re-derive with `ip route` if this stops
+# working (e.g. after a WSL update or a different network).
+extends: default.yaml
+
+beamng:
+  home: ""
+  host: 172.23.224.1
+  port: 64256
+  launch: false
+  # shared_memory needs BeamNG on this machine; a remote client must use
+  # socket, same as the Jetson container.
+  camera_transport: socket
+  cameras:
+    sync:
+      # Each socket poll ships a full frame (~2.4 MB), so the two reads of a
+      # pair are tens of milliseconds apart rather than ~1 ms. The 8 ms
+      # shared-memory limit would reject every pair and starve stereo; this
+      # accepts pairs within about two render frames at 30 FPS.
+      max_read_skew_ms: 60.0
+
+ui:
+  # WSLg gives this WSL2 install a working X11/Wayland display, so the
+  # dashboard window can actually show up here - confirmed working with the
+  # March-commit comparison run.
+  headless: false
+  # main.py assumes the OpenCV window backend is safe to drive from the
+  # dashboard's own thread; under this WSLg setup that call hangs forever on
+  # the first frame (0 drawn, every publish superseded). Rendering inline
+  # avoids the hang - costs some loop time, but the dashboard actually shows.
+  display_async: false
