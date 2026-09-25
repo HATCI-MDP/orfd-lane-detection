@@ -80,6 +80,12 @@ then run:
 offroad-autonomy --config configs/default.yaml --log-level INFO
 ```
 
+Add `--record-video` to save the dashboard, with a small orbit-camera inset
+in the corner, to `output/videos/<config-name>_<timestamp>.mp4` (useful for
+comparing this pipeline's behavior against another version). Use
+`--record-video-out <path>` to choose the file yourself, and
+`--record-video-fps <hz>` to change the recorded frame rate (default: 20).
+
 You can also use the helper script:
 
 ```bash

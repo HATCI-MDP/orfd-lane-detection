@@ -99,6 +99,15 @@ class ControlCommand:
     parkingbrake: float = 0.0
 
 
+# A fixed chase camera used only when recording a comparison video; it has
+# no bearing on perception, so it is a few plain constants rather than a
+# config-tunable field.
+ORBIT_CAMERA_POS = (0.0, 6.0, 2.6)
+ORBIT_CAMERA_DIR = (0.0, -1.0, -0.2)
+ORBIT_CAMERA_UP = (0.0, 0.0, 1.0)
+ORBIT_CAMERA_FOV = 60.0
+
+
 @dataclass
 class PipelineStepResult:
     """Outputs from one full pipeline iteration."""

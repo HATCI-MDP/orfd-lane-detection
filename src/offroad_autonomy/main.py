@@ -17,6 +17,7 @@ from pathlib import Path
 import numpy as np
 
 from offroad_autonomy.pipeline import AutonomyPipeline
+from offroad_autonomy.runtime.video_recorder import DashboardVideoRecorder
 from offroad_autonomy.simulation.beamng_client import BeamNGClient
 from offroad_autonomy.types import ControlCommand
 from offroad_autonomy.utils.config import load_config
@@ -25,6 +26,7 @@ from offroad_autonomy.visualization import (
     AutonomyDashboard,
     DashboardTelemetry,
     DashboardWindow,
+    composite_pip,
 )
 
 logger = logging.getLogger("offroad_autonomy.main")
@@ -38,6 +40,9 @@ def _signal_handler(signum, frame) -> None:
     del signum, frame
     global _shutdown
     _shutdown = True
+
+
+_DEFAULT_VIDEO_FPS = 20.0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -55,7 +60,31 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging verbosity.",
     )
+    parser.add_argument(
+        "--record-video",
+        action="store_true",
+        help=(
+            "Record the live dashboard, with an orbit-camera inset, to an mp4 file. "
+            "Used to capture a run for direct comparison against another pipeline version."
+        ),
+    )
+    parser.add_argument(
+        "--record-video-out",
+        default="",
+        help="Video output path (default: output/videos/<config-name>_<timestamp>.mp4).",
+    )
+    parser.add_argument(
+        "--record-video-fps",
+        type=float,
+        default=_DEFAULT_VIDEO_FPS,
+        help="Frame rate for the recorded video (default: %(default)s).",
+    )
     return parser
+
+
+def _default_video_path(label: str) -> str:
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    return f"output/videos/{label}_{timestamp}.mp4"
 
 
 _NO_ROAD_CONFIDENCE_THRESHOLD = 0.05
@@ -152,7 +181,7 @@ def main() -> None:
 
     signal.signal(signal.SIGINT, _signal_handler)
 
-    client = BeamNGClient(config)
+    client = BeamNGClient(config, record_orbit=args.record_video)
     pipeline = AutonomyPipeline(config)
     dashboard = AutonomyDashboard(
         width=1600,
@@ -160,6 +189,7 @@ def main() -> None:
         colors=config.dashboard_colors,
     )
     dashboard_window = None
+    video_recorder: DashboardVideoRecorder | None = None
 
     frame_count = 0
     t_start = time.perf_counter()
@@ -176,6 +206,15 @@ def main() -> None:
             dashboard.width,
             dashboard.height,
         )
+        if args.record_video:
+            video_path = args.record_video_out or _default_video_path(config_path.stem)
+            video_recorder = DashboardVideoRecorder(
+                video_path,
+                dashboard.width,
+                dashboard.height,
+                fps=args.record_video_fps,
+            )
+            logger.info("Recording dashboard video to %s", video_recorder.path)
         logger.info("Entering main loop - press Ctrl+C to stop")
         logger.info("Press E in dashboard to trigger safe stop; press P to resume autopilot")
 
@@ -258,6 +297,17 @@ def main() -> None:
             telemetry.autopilot_active = autopilot_active
             dashboard_frame = dashboard.render(raw_frame, mask, plan, telemetry)
 
+            if video_recorder is not None:
+                composite_pip(dashboard_frame, client.capture_orbit())
+                try:
+                    video_recorder.write(dashboard_frame)
+                except Exception:
+                    # One broken write is a codec or disk problem that will
+                    # not fix itself; retrying it every frame would just
+                    # spam the log and slow down the live dashboard.
+                    logger.exception("Video recording failed - disabling further recording")
+                    video_recorder = None
+
             if dashboard_window is not None and not dashboard_window.show(dashboard_frame):
                 _shutdown = True
                 continue
@@ -286,6 +336,11 @@ def main() -> None:
     finally:
         if dashboard_window is not None:
             dashboard_window.close()
+        if video_recorder is not None:
+            video_recorder.close()
+            logger.info(
+                "Video saved to %s (%d frames)", video_recorder.path, video_recorder.frames_written
+            )
         client.disconnect()
         elapsed = time.perf_counter() - t_start
         logger.info("Session complete - %d frames in %.1f s", frame_count, elapsed)

@@ -14,7 +14,15 @@ import time
 import cv2
 import numpy as np
 
-from offroad_autonomy.types import ControlCommand, PipelineConfig, VehicleState
+from offroad_autonomy.types import (
+    ORBIT_CAMERA_DIR,
+    ORBIT_CAMERA_FOV,
+    ORBIT_CAMERA_POS,
+    ORBIT_CAMERA_UP,
+    ControlCommand,
+    PipelineConfig,
+    VehicleState,
+)
 
 logger = logging.getLogger("offroad_autonomy.simulation")
 
@@ -22,11 +30,15 @@ logger = logging.getLogger("offroad_autonomy.simulation")
 class BeamNGClient:
     """Manages the BeamNG.tech session lifecycle and sensor I/O."""
 
-    def __init__(self, config: PipelineConfig) -> None:
+    def __init__(self, config: PipelineConfig, record_orbit: bool = False) -> None:
         self._config = config
         self._bng = None
         self._vehicle = None
         self._camera = None
+        # A separate flag rather than a config field: the orbit camera exists
+        # only when a run is being recorded, not as something a config tunes.
+        self._record_orbit = bool(record_orbit)
+        self._orbit_camera = None
 
     def connect(self) -> None:
         """Launch BeamNG, load the configured map, spawn the vehicle, and attach a camera."""
@@ -83,6 +95,28 @@ class BeamNGClient:
             is_using_shared_memory=cfg.beamng_launch,
             is_streaming=True,
         )
+
+        if self._record_orbit:
+            logger.info("Attaching orbit chase camera for recording")
+            self._orbit_camera = Camera(
+                name="orbit_cam",
+                bng=self._bng,
+                vehicle=vehicle,
+                pos=ORBIT_CAMERA_POS,
+                dir=ORBIT_CAMERA_DIR,
+                up=ORBIT_CAMERA_UP,
+                resolution=(cfg.camera_width, cfg.camera_height),
+                field_of_view_y=ORBIT_CAMERA_FOV,
+                near_far_planes=(0.1, 500.0),
+                requested_update_time=0.01,
+                update_priority=1.0,
+                is_render_colours=True,
+                is_render_annotations=False,
+                is_render_depth=False,
+                is_using_shared_memory=cfg.beamng_launch,
+                is_streaming=True,
+            )
+
         time.sleep(1.0)
 
         self._vehicle = vehicle
@@ -106,6 +140,28 @@ class BeamNGClient:
             return cv2.cvtColor(np.array(colour.convert("RGB")), cv2.COLOR_RGB2BGR)
         except Exception as exc:
             logger.debug("Frame capture failed: %s", exc)
+            return None
+
+    def capture_orbit(self) -> np.ndarray | None:
+        """Grab the latest colour frame from the orbit chase camera.
+
+        Only meaningful when ``record_orbit`` was requested at construction;
+        used solely to composite into a recorded comparison video, never on
+        the perception path.
+        """
+        if self._orbit_camera is None:
+            return None
+        try:
+            if self._config.beamng_launch:
+                images = self._orbit_camera.stream()
+            else:
+                images = self._orbit_camera.poll()
+            colour = images.get("colour")
+            if colour is None:
+                return None
+            return cv2.cvtColor(np.array(colour.convert("RGB")), cv2.COLOR_RGB2BGR)
+        except Exception as exc:
+            logger.debug("Orbit frame capture failed: %s", exc)
             return None
 
     def get_vehicle_state(self) -> VehicleState:
@@ -180,6 +236,13 @@ class BeamNGClient:
             except Exception:
                 pass
             self._camera = None
+
+        if self._orbit_camera is not None:
+            try:
+                self._orbit_camera.remove()
+            except Exception:
+                pass
+            self._orbit_camera = None
 
         if self._bng is not None:
             try:
