@@ -1,0 +1,17 @@
+# Experiment: does a wider baseline actually buy better far-range depth, or
+# just cost near-field overlap? default.yaml picked 0.6 m from a stated
+# "sensible range" of 0.4-0.8 m without testing the top of that range - this
+# takes it there. Nothing else about the rig changes: same bumper mount,
+# same pitch, same 0 deg toe-out.
+#
+# depth.num_disparities is 0 in default.yaml ("derive from the rig"), so the
+# search range re-derives for the new baseline automatically - no manual
+# retuning needed there. Compare against local-network.yaml (baseline_m 0.6)
+# with scripts/diagnose_perception.py or a benchmark run's
+# valid_disparity_fraction / depth coverage numbers.
+extends: ../local-network.yaml
+
+beamng:
+  cameras:
+    stereo_rig:
+      baseline_m: 0.8

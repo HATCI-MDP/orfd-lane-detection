@@ -1,0 +1,85 @@
+# Experiment: the stack's own docs point at two very different placements -
+# a low bumper mount that clears all bodywork by design (default.yaml), and
+# the windshield/roofline mount most 2-camera guidance recommends instead.
+# This moves the PERCEPTION pair to where configs/default.yaml's separate,
+# non-computational display camera already sits (height_m 1.85,
+# forward_offset_m -0.30 - see beamng.cameras.visualization).
+#
+# toe_out_deg is left at 0, not combined with experiments/toe-out.yaml's
+# value, on purpose: segmentation_mode: left means the ENTIRE perception
+# pipeline runs on this one camera, and an earlier version of this file that
+# added toe-out on top of the height change made the perception gate reject
+# 145 of 162 frames (centerline too short, then no road at vehicle, then
+# zero confidence) - confirmed by comparing telemetry against the bumper
+# rig's clean reference run and by ruling out other causes first (no stale
+# vehicle in the world, control commands logged correctly as 0
+# throttle/0.8 brake). Starved of active control for that long, the vehicle
+# rolled backward down the spawn point's slope - a real perception failure
+# with a dramatic downstream symptom, not a coordinate bug. This file
+# isolates height/forward_offset alone; toe-out stays in its own experiment.
+#
+# pitch_deg is deliberately left at the bumper rig's -2.0, not the display
+# camera's -8.0: default.yaml's own comment notes the horizon row depends on
+# pitch alone, not height, so holding pitch fixed isolates "what changes if
+# only the mount MOVES" from "what changes if the camera is also re-aimed".
+# Verified with CameraModel.ground_to_image(): the horizon sits at row 225
+# (51.6% up of 465) for BOTH rigs - pitch is unchanged, so it doesn't move.
+#
+# Two things the bumper mount's tuning does NOT carry over here. Both are
+# re-derived below for real, not guessed:
+#
+# 1. ego_mask - the whole reason for the bumper mount was that it clears all
+#    bodywork, so left/right never needed an exclusion mask. This mount sits
+#    behind the hood instead, and re-running the repo's own derivation
+#    confirms it: 9.9% of each camera's frame is now hood.
+#      python scripts/derive_ego_mask.py --config configs/experiments/windshield-mount.yaml --camera pair
+#
+# 2. planning.roi_height - default.yaml's 0.49 reaches ~15 m for THAT rig's
+#    height (see its row-by-distance table). Re-measured for this rig with
+#    ground_to_image(), holding the same ~15 m target:
+#      distance   this rig's row   roi_height to reach it   (bumper rig's row)
+#        3 m        351 (24.5% up)      0.25                  290 (37.5% up)
+#        6 m        289 (37.9% up)      0.38                  258 (44.5% up)
+#       10 m        263 (43.3% up)      0.43                  245 (47.3% up)
+#       15 m        251 (46.1% up)      0.46                  238 (48.7% up)
+#    Counterintuitive but verified: the higher mount pushes a given distance
+#    to a row CLOSER to the bottom of frame, not further up - so it needs a
+#    slightly SMALLER roi_height than the bumper rig to reach the same ~15 m,
+#    not a larger one. depth.roi.row_top is untouched: it excludes a fixed
+#    band of sky above the horizon, and the horizon didn't move (see above).
+extends: ../local-network.yaml
+
+beamng:
+  cameras:
+    stereo_rig:
+      height_m: 1.85
+      forward_offset_m: -0.30
+    left:
+      name: left_bumper
+      ego_mask:
+        enabled: true
+        margin_px: 1
+        polygon:
+          - [0.3394, 1.0000]
+          - [0.9179, 1.0000]
+          - [0.8206, 0.8879]
+          - [0.7079, 0.7737]
+          - [0.5814, 0.7586]
+          - [0.4339, 0.7737]
+          - [0.3866, 0.8750]
+    right:
+      name: right_bumper
+      ego_mask:
+        enabled: true
+        margin_px: 1
+        polygon:
+          - [0.0834, 1.0000]
+          - [0.6620, 1.0000]
+          - [0.6147, 0.8750]
+          - [0.5675, 0.7737]
+          - [0.4409, 0.7586]
+          - [0.2935, 0.7737]
+          - [0.1808, 0.8879]
+
+planning:
+  roi_height: 0.46

@@ -1,0 +1,25 @@
+# Experiment: default.yaml keeps toe_out_deg at 0 with a one-line claim -
+# "widens the stitched view but eats stereo overlap" - that trade-off has
+# never actually been measured. This isolates just that one variable: same
+# bumper mount, same baseline, same pitch, only the outward angle changes.
+#
+# toe_out_deg is applied PER CAMERA (see StereoRigSpec.mount() - left yaws
+# +toe_out_deg, right yaws -toe_out_deg), so the two optical axes end up
+# 2x toe_out_deg apart. perception/camera_geometry.py's StereoRig refuses
+# anything past 20 deg combined ("the views would barely overlap") - a first
+# attempt at 15 deg per camera (30 deg combined) hit that check and silently
+# disabled stereo depth for the whole run. 8 deg per camera (16 deg
+# combined) is comfortably under the limit while still clearly nonzero.
+#
+# Toeing the pair out rotates each camera's yaw, which the stereo rectifier
+# corrects for (see perception/stereo_rectification.py) rather than assuming
+# parallel axes, so this is not expected to break rectification outright -
+# the open question is how much of the overlapping field it leaves for
+# matching. Watch depth.valid_disparity_fraction and stitching's seam
+# quality (debug view 5) against local-network.yaml's 0 deg baseline.
+extends: ../local-network.yaml
+
+beamng:
+  cameras:
+    stereo_rig:
+      toe_out_deg: 8.0
