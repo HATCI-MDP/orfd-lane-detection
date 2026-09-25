@@ -15,6 +15,7 @@ import cv2
 import numpy as np
 
 from offroad_autonomy.types import (
+    DEFAULT_ORBIT_CAMERA,
     CameraSpec,
     ControlCommand,
     PipelineConfig,
@@ -29,7 +30,7 @@ _SENSOR_WARMUP_S = 1.0
 
 
 class BeamNGClient:
-    def __init__(self, config: PipelineConfig) -> None:
+    def __init__(self, config: PipelineConfig, record_orbit: bool = False) -> None:
         self._config = config
         self._bng = None
         self._vehicle = None
@@ -37,6 +38,9 @@ class BeamNGClient:
         self._frame_id = 0
         self._last_signatures: tuple[int | None, int | None] = (None, None)
         self._shared_memory = config.beamng_camera_transport == "shared_memory"
+        # A separate flag rather than a config field: the orbit camera exists
+        # only when a run is being recorded, not as something a config tunes.
+        self._record_orbit = bool(record_orbit)
 
     def connect(self) -> None:
         from beamngpy import BeamNGpy, Scenario, Vehicle
@@ -98,6 +102,9 @@ class BeamNGClient:
             spec = cfg.display_camera
             self._cameras["display"] = self._attach_camera(Camera, vehicle, spec)
             logger.info("Attaching display-only camera: %s", spec.sensor.describe())
+        if self._record_orbit:
+            self._cameras["orbit"] = self._attach_camera(Camera, vehicle, DEFAULT_ORBIT_CAMERA)
+            logger.info("Attaching orbit chase camera: %s", DEFAULT_ORBIT_CAMERA.sensor.describe())
         time.sleep(_SENSOR_WARMUP_S)
 
         self._vehicle = vehicle
@@ -149,6 +156,13 @@ class BeamNGClient:
         if "display" not in self._cameras:
             return None
         return self._decode(self._live_buffer("display"), self._config.display_camera)
+
+    def capture_orbit(self) -> np.ndarray | None:
+        """Called only from the dashboard thread, to composite into the
+        recorded video; never on the perception path."""
+        if "orbit" not in self._cameras:
+            return None
+        return self._decode(self._live_buffer("orbit"), DEFAULT_ORBIT_CAMERA)
 
     def _read_pair(self) -> StereoFramePair | None:
         cfg = self._config

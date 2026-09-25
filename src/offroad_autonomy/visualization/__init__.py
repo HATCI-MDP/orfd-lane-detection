@@ -5,6 +5,7 @@ from offroad_autonomy.visualization.dashboard import (
     DashboardTelemetry,
 )
 from offroad_autonomy.visualization.path_projector import GroundProjector
+from offroad_autonomy.visualization.pip_overlay import composite_pip
 from offroad_autonomy.visualization.window import DashboardWindow
 
 __all__ = [
@@ -12,4 +13,5 @@ __all__ = [
     "DashboardTelemetry",
     "DashboardWindow",
     "GroundProjector",
+    "composite_pip",
 ]

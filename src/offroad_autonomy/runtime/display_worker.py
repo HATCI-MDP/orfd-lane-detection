@@ -66,6 +66,7 @@ class DisplayWorker:
         show: Callable[[np.ndarray], bool],
         read_key: Callable[[], int],
         capture: Callable[[], np.ndarray | None] | None = None,
+        record: Callable[[np.ndarray], None] | None = None,
         rate_hz: float = 20.0,
         asynchronous: bool = True,
         stats: RuntimeStats | None = None,
@@ -74,6 +75,7 @@ class DisplayWorker:
         self._show = show
         self._read_key = read_key
         self._capture = capture
+        self._record = record
         self._period = 0.0
         if rate_hz > 0.0:
             self._period = 1.0 / rate_hz
@@ -179,10 +181,21 @@ class DisplayWorker:
                 self._last_error_log = t0
             return
 
+        if self._record is not None:
+            try:
+                self._record(canvas)
+            except Exception:
+                # One broken write is a codec or disk problem that will not
+                # fix itself; retrying it every frame would just spam the log.
+                logger.exception("Video recording failed - disabling further recording")
+                self._record = None
+        t4 = time.perf_counter()
+
         self.stats.record("display_capture", (t1 - t0) * 1000.0)
         self.stats.record("dashboard_render", (t2 - t1) * 1000.0)
         self.stats.record("dashboard_show", (t3 - t2) * 1000.0)
-        self.stats.record("dashboard_total", (t3 - t0) * 1000.0)
+        self.stats.record("dashboard_record", (t4 - t3) * 1000.0)
+        self.stats.record("dashboard_total", (t4 - t0) * 1000.0)
         self.stats.tick()
         self.rendered += 1
 

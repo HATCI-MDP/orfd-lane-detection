@@ -46,6 +46,7 @@ DISPLAY_STAGES = (
     "display_capture",
     "dashboard_render",
     "dashboard_show",
+    "dashboard_record",
     "dashboard_total",
 )
 

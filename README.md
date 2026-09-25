@@ -29,6 +29,7 @@ offroad-autonomy --config configs/default.yaml
 - Launches BeamNG.tech if it is not already running, then spawns the vehicle and opens the dashboard
 - `E` safe stop, `P` resume, `0`-`9` debug views, `T` timing overlay, `Q` quit
 - `--headless` runs without a window
+- `--record-video` saves the dashboard to `output/videos/<label>_<timestamp>.mp4`, with a small orbit-camera inset in the corner; overrides `--headless` since recording needs the dashboard. Use `--record-video-out <path>` to choose the file yourself.
 
 ## Run On Jetson (Docker)
 
@@ -72,6 +73,7 @@ BEAMNG_HOST=192.168.1.50 docker compose up
 | Command                                                         | What it does                                            |
 | --------------------------------------------------------------- | ------------------------------------------------------- |
 | `offroad-autonomy --config <file>`                              | Run the stack with a config                             |
+| `offroad-autonomy --config <file> --record-video`               | Same, plus save a dashboard + orbit-cam video            |
 | `ruff check src tests scripts`                                  | Lint                                                    |
 | `ruff format src tests scripts`                                 | Format (CI runs it with `--check`)                      |
 | `python -m build`                                               | Build the wheel and sdist                               |

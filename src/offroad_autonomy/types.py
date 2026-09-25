@@ -346,6 +346,27 @@ DEFAULT_DISPLAY_CAMERA = display_camera_spec(
     DEFAULT_DISPLAY_RIG, DISPLAY_SENSOR, DEFAULT_DISPLAY_OVERLAY_CLIP
 )
 
+#: A fixed chase camera used only for recording. It rides behind and above
+#: the vehicle like the display camera, but has no reprojection use, so it
+#: gets a plain ``CameraSpec`` rather than its own rig type.
+_ORBIT_CENTER = (0.0, 6.0, 2.6)
+_ORBIT_PITCH_DEG = -12.0
+
+
+def _orbit_camera_spec() -> CameraSpec:
+    direction, up = mount_pose(_ORBIT_PITCH_DEG, 0.0)
+    return CameraSpec(
+        name="orbit_view",
+        pos=_ORBIT_CENTER,
+        dir=direction,
+        up=up,
+        sensor=DISPLAY_SENSOR,
+        ego_mask=EgoMaskSpec(enabled=False),
+    )
+
+
+DEFAULT_ORBIT_CAMERA = _orbit_camera_spec()
+
 
 @dataclass
 class StereoFramePair:

@@ -21,6 +21,7 @@ from offroad_autonomy.pipeline import AutonomyPipeline
 from offroad_autonomy.runtime.benchmark import BenchmarkRecorder
 from offroad_autonomy.runtime.display_worker import DisplayState, DisplayWorker
 from offroad_autonomy.runtime.timing import DISPLAY_STAGES, MAIN_STAGES, STEREO_STAGES
+from offroad_autonomy.runtime.video_recorder import DashboardVideoRecorder
 from offroad_autonomy.simulation.beamng_client import BeamNGClient
 from offroad_autonomy.types import (
     DEBUG_VIEWS,
@@ -37,6 +38,7 @@ from offroad_autonomy.visualization import (
     DashboardTelemetry,
     DashboardWindow,
     GroundProjector,
+    composite_pip,
 )
 
 logger = logging.getLogger("offroad_autonomy.main")
@@ -100,6 +102,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--label",
         default="",
         help="Name for the benchmark run (default: the config file name).",
+    )
+    parser.add_argument(
+        "--record-video",
+        action="store_true",
+        help=(
+            "Record the live dashboard, with an orbit-camera inset, to an mp4 file. "
+            "Requires the dashboard, so it overrides --headless."
+        ),
+    )
+    parser.add_argument(
+        "--record-video-out",
+        default="",
+        help="Video output path (default: output/videos/<label>_<timestamp>.mp4).",
     )
     return parser
 
@@ -325,6 +340,11 @@ def _build_projector(
     return projector, clip
 
 
+def _default_video_path(label: str) -> str:
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    return f"output/videos/{label}_{timestamp}.mp4"
+
+
 def _open_window(width: int, height: int) -> DashboardWindow | None:
     """A missing display must not stop the vehicle, so a failed window
     degrades to headless instead of aborting the run."""
@@ -367,6 +387,9 @@ def main() -> None:
     config = load_config(config_path)
     if args.headless:
         config.ui_headless = True
+    if args.record_video and config.ui_headless:
+        logger.warning("--record-video requires the dashboard - disabling headless mode")
+        config.ui_headless = False
     logger.info("Configuration loaded from %s", config_path)
 
     # SIGTERM is what `docker stop` sends; without a handler the process dies
@@ -374,10 +397,11 @@ def main() -> None:
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
-    client = BeamNGClient(config)
+    client = BeamNGClient(config, record_orbit=args.record_video)
     pipeline = AutonomyPipeline(config)
     dashboard_window: DashboardWindow | None = None
     display: DisplayWorker | None = None
+    video_recorder: DashboardVideoRecorder | None = None
     stats = pipeline.stats
 
     debug_view = config.ui_debug_view
@@ -421,7 +445,7 @@ def main() -> None:
             window = dashboard_window
 
             def _render(state: DisplayState, frame) -> np.ndarray:
-                return dashboard.render(
+                canvas = dashboard.render(
                     state.result,
                     state.telemetry,
                     plan=state.plan,
@@ -432,10 +456,26 @@ def main() -> None:
                     depth_roi=state.depth_roi,
                     display_frame=frame,
                 )
+                if args.record_video:
+                    canvas = composite_pip(canvas, client.capture_orbit())
+                return canvas
 
             capture = None
             if config.display_rig.enabled:
                 capture = client.capture_display
+
+            if args.record_video:
+                video_path = args.record_video_out or _default_video_path(
+                    args.label or config_path.stem
+                )
+                video_recorder = DashboardVideoRecorder(
+                    video_path,
+                    dashboard.width,
+                    dashboard.height,
+                    fps=config.ui_display_rate_hz,
+                )
+                logger.info("Recording dashboard video to %s", video_recorder.path)
+
             # Tkinter's event loop belongs to the thread that built the root
             # window, so only the OpenCV backend can be driven off-thread.
             display = DisplayWorker(
@@ -443,6 +483,7 @@ def main() -> None:
                 show=window.show,
                 read_key=lambda: window.last_key,
                 capture=capture,
+                record=video_recorder.write if video_recorder is not None else None,
                 rate_hz=config.ui_display_rate_hz,
                 asynchronous=config.ui_display_async and window.backend == "opencv",
             )
@@ -597,6 +638,11 @@ def main() -> None:
         # window, so it stops before either is torn down.
         if display is not None:
             display.stop()
+        if video_recorder is not None:
+            video_recorder.close()
+            logger.info(
+                "Video saved to %s (%d frames)", video_recorder.path, video_recorder.frames_written
+            )
         if dashboard_window is not None:
             dashboard_window.close()
         client.disconnect()

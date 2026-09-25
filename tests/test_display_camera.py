@@ -236,6 +236,41 @@ def test_no_display_camera_means_no_capture_call():
     assert drawn[0][1] is None
 
 
+def test_rendered_canvas_reaches_the_recorder():
+    recorded: list = []
+    worker, _ = _worker(record=recorded.append)
+
+    worker.publish(DisplayState(result=object(), telemetry=object()))
+
+    assert len(recorded) == 1
+    assert recorded[0].shape == (4, 4, 3)
+    assert worker.stats.stage("dashboard_record").count == 1
+
+
+def test_no_recorder_means_no_record_call():
+    worker, _ = _worker(record=None)
+
+    worker.publish(DisplayState(result=object(), telemetry=object()))
+
+    assert worker.stats.stage("dashboard_record").count == 1
+
+
+def test_a_failing_recorder_disables_itself_without_stopping_the_dashboard():
+    """A broken video writer must not take the live dashboard down with it."""
+
+    def explode(frame):
+        raise OSError("disk full")
+
+    worker, drawn = _worker(record=explode)
+
+    worker.publish(DisplayState(result=object(), telemetry=object()))
+    worker.publish(DisplayState(result=object(), telemetry=object()))
+
+    assert len(drawn) == 2
+    assert worker.rendered == 2
+    assert worker._record is None
+
+
 def test_worker_draws_on_a_background_thread_without_the_caller_waiting():
     """The whole point: publish() returns, and drawing happens elsewhere."""
     import threading
