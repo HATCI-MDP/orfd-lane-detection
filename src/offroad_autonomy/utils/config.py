@@ -72,6 +72,7 @@ def load_config(path: str | Path) -> PipelineConfig:
         beamng_home=bng.get("home", ""),
         beamng_host=bng.get("host", "localhost"),
         beamng_port=bng.get("port", 64256),
+        beamng_launch=bng.get("launch", True),
         beamng_map=bng.get("map", "automation_test_track"),
         beamng_vehicle=bng.get("vehicle", "pickup"),
         beamng_spawn_index=bng.get("spawn_index", 0),

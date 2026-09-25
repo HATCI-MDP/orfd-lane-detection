@@ -35,9 +35,17 @@ class BeamNGClient:
 
         cfg = self._config
 
-        logger.info("Launching BeamNG from %s", cfg.beamng_home)
-        self._bng = BeamNGpy(cfg.beamng_host, cfg.beamng_port, home=cfg.beamng_home)
-        self._bng.open(launch=True)
+        if cfg.beamng_launch:
+            logger.info("Launching BeamNG from %s", cfg.beamng_home)
+        else:
+            logger.info("Connecting to running BeamNG at %s:%s", cfg.beamng_host, cfg.beamng_port)
+        # close() sends a quit request regardless of who launched the process,
+        # so a remote client must disable that or it kills someone else's sim
+        # on every disconnect, including a clean one.
+        self._bng = BeamNGpy(
+            cfg.beamng_host, cfg.beamng_port, home=cfg.beamng_home, quit_on_close=cfg.beamng_launch
+        )
+        self._bng.open(launch=cfg.beamng_launch)
 
         spawn_pos, spawn_rot = self._resolve_spawn(cfg)
 
@@ -70,7 +78,9 @@ class BeamNGClient:
             is_render_colours=True,
             is_render_annotations=False,
             is_render_depth=False,
-            is_using_shared_memory=True,
+            # Shared memory needs the client on the same machine as BeamNG; a
+            # remote client (cfg.beamng_launch False) must stream over the socket.
+            is_using_shared_memory=cfg.beamng_launch,
             is_streaming=True,
         )
         time.sleep(1.0)
@@ -79,11 +89,17 @@ class BeamNGClient:
         logger.info("BeamNG session ready")
 
     def capture_frame(self) -> np.ndarray | None:
-        """Grab the latest colour frame from the streaming camera."""
+        """Grab the latest colour frame from the camera."""
         if self._camera is None:
             return None
         try:
-            images = self._camera.stream()
+            # stream() only ever reads from shared memory, even with
+            # is_streaming=True - a remote client (no shared memory) gets
+            # nothing back from it and must poll over the socket instead.
+            if self._config.beamng_launch:
+                images = self._camera.stream()
+            else:
+                images = self._camera.poll()
             colour = images.get("colour")
             if colour is None:
                 return None

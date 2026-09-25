@@ -117,6 +117,9 @@ class PipelineConfig:
     beamng_home: str = ""
     beamng_host: str = "localhost"
     beamng_port: int = 64256
+    # False attaches to an already running simulator instead of launching one;
+    # needed to compare this commit's behaviour against a remote BeamNG host.
+    beamng_launch: bool = True
     beamng_map: str = "automation_test_track"
     beamng_vehicle: str = "pickup"
     beamng_spawn_index: int = 0
