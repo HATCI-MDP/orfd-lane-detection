@@ -51,6 +51,18 @@ def test_gate_rejects_low_confidence():
     assert "confidence" in decision.reason
 
 
+def test_shipped_gate_accepts_connected_road_at_screenshot_confidence():
+    from pathlib import Path
+
+    from offroad_autonomy.utils.config import load_config
+
+    cfg = load_config(Path(__file__).resolve().parents[1] / "configs/default.yaml")
+    gate = PerceptionGate(cfg)
+    assert gate.evaluate(_stabilized(_road(), confidences=(0.19,))).ok
+    assert not gate.evaluate(_stabilized(_road(), confidences=(0.1,))).ok
+    assert not gate.evaluate(_stabilized(np.zeros((H, W), bool), confidences=(0.9,))).ok
+
+
 def test_gate_rejects_empty_mask():
     decision = PerceptionGate(_config()).evaluate(
         _stabilized(np.zeros((H, W), bool), confidences=())
@@ -73,6 +85,33 @@ def test_gate_ignores_sky_above_the_roi():
     decision = gate.evaluate(_stabilized(mask))
     assert decision.ok
     assert not decision.component[: gate.roi_top(H)].any()
+
+
+def test_road_above_the_dashcam_hood_is_anchored():
+    from offroad_autonomy.perception.ego_mask import EgoMask
+
+    config = _config()
+    valid = EgoMask(config.camera.ego_mask).valid_roi((H, W))
+    mask = _road(half_width=80) & valid
+    state = _stabilized(mask)
+    state.valid_roi = valid
+    decision = PerceptionGate(config).evaluate(state)
+    assert decision.ok, decision.reason
+    assert not decision.component[~valid].any()
+
+
+def test_hood_does_not_make_a_distant_blob_drivable():
+    from offroad_autonomy.perception.ego_mask import EgoMask
+
+    config = _config()
+    valid = EgoMask(config.camera.ego_mask).valid_roi((H, W))
+    mask = np.zeros((H, W), dtype=bool)
+    mask[240:290, 240:480] = True
+    state = _stabilized(mask)
+    state.valid_roi = valid
+    decision = PerceptionGate(config).evaluate(state)
+    assert not decision.ok
+    assert decision.reason == "no road at vehicle"
 
 
 def test_baseline_path_follows_the_road_centre():

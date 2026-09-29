@@ -1,6 +1,6 @@
 """Rolling per-stage timing: mean, p95 and loop rate.
 
-One ``RuntimeStats`` per thread of work (the control loop, the stereo
+One ``RuntimeStats`` per thread of work (the control loop, the dashboard
 worker). Samples live in bounded windows, so memory is constant however long
 a session runs, and every statistic describes recent behaviour rather than a
 whole-session average that hides a regression.
@@ -20,10 +20,8 @@ import numpy as np
 MAIN_STAGES = (
     "capture",
     "vehicle_state",
-    "stitching",
     "preprocess",
     "segmentation",
-    "fusion",
     "postprocess",
     "planning",
     "control",
@@ -32,18 +30,9 @@ MAIN_STAGES = (
     "full_loop",
 )
 
-STEREO_STAGES = (
-    "rectification",
-    "stereo_matching",
-    "depth_filtering",
-    "terrain",
-    "stereo_total",
-)
-
 #: Kept apart from ``MAIN_STAGES``: mixing them made loop latency partly a
 #: measure of how fast the window could draw.
 DISPLAY_STAGES = (
-    "display_capture",
     "dashboard_render",
     "dashboard_show",
     "dashboard_total",

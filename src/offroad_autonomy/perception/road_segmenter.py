@@ -86,9 +86,6 @@ class RoadSegmenter:
             confidences=confs,
             num_detections=len(confs),
             inference_time_ms=t_ms,
-            # Fusion replaces ``mask``; the model's own union is kept so the
-            # debug views can show what depth changed.
-            rgb_mask=mask,
             valid_roi=valid_roi,
             road_fraction=road_fraction(mask, valid_roi),
         )

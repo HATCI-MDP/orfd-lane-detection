@@ -1,16 +1,15 @@
-"""Pinhole camera models and rigid transforms for the front stereo pair.
+"""Pinhole camera models and rigid transforms for the dashcam.
 
 Two coordinate frames are in play.
 
 **Vehicle space** is BeamNG's: ``+X`` left, ``-Y`` forward, ``+Z`` up.  This
 is the frame every :class:`~offroad_autonomy.types.CameraSpec` is written in,
-and the frame terrain reasoning happens in.
+and the frame used by ground-plane path projection.
 
 **Camera space** is the usual vision convention: ``+X`` right, ``+Y`` down,
 ``+Z`` along the viewing direction.  Projection is an exact pinhole - BeamNG
 renders a rectilinear image with no lens distortion, so no undistortion step
-is needed for the simulated lens.  Rectification still accepts distortion
-coefficients so a real, calibrated GMSL2 unit drops in through the config.
+is needed for the simulated lens.
 """
 
 from __future__ import annotations
@@ -188,153 +187,3 @@ class CameraModel:
             ],
             dtype=np.float64,
         )
-
-    @classmethod
-    def from_intrinsics(
-        cls,
-        base: CameraModel,
-        name: str,
-        projection: np.ndarray,
-        rotation_to_new: np.ndarray,
-        width: int,
-        height: int,
-    ) -> CameraModel:
-        """A virtual camera sharing ``base``'s centre with new K and attitude.
-
-        This is what a rectified camera is: the same optical centre, rotated
-        by ``R1`` and re-projected with ``P1``. Modelling it as an ordinary
-        ``CameraModel`` means backprojection and vehicle-space transforms
-        work on rectified pixels with no special cases.
-        """
-        model = cls.__new__(cls)
-        model.spec = base.spec
-        model.sensor = base.sensor
-        model.name = name
-        model.width = int(width)
-        model.height = int(height)
-        model.scale = base.scale
-        projection = np.asarray(projection, dtype=np.float64)
-        # stereoRectify returns equal fx and fy for an ideal pinhole pair.
-        model.focal_px = float(projection[0, 0])
-        model.cx = float(projection[0, 2])
-        model.cy = float(projection[1, 2])
-        model.position = base.position.copy()
-        model.rotation = np.asarray(rotation_to_new, dtype=np.float64) @ base.rotation
-        return model
-
-
-class StereoRig:
-    """The front stereo pair: two mounts and the rigid transform between them.
-
-    The pair no longer has to be rectified by construction - ``StereoRectifier``
-    rectifies it properly - but it still has to be a sensible stereo pair. The
-    constructor refuses configurations that no rectification can rescue:
-    swapped sides, a zero baseline, or optical axes so far apart that the two
-    views barely overlap.
-    """
-
-    #: Beyond this the views overlap too little to match.
-    MAX_AXIS_ANGLE_DEG = 20.0
-
-    def __init__(self, left: CameraModel, right: CameraModel) -> None:
-        self.left = left
-        self.right = right
-
-        if abs(left.focal_px - right.focal_px) > 1e-6 or (
-            left.width,
-            left.height,
-        ) != (right.width, right.height):
-            raise ValueError(
-                "Stereo cameras must share resolution and field of view; check "
-                f"'{left.name}' and '{right.name}' use the same sensor."
-            )
-
-        cos_axes = float(np.clip(left.rotation[2] @ right.rotation[2], -1.0, 1.0))
-        self.axis_angle_deg = math.degrees(math.acos(cos_axes))
-        if self.axis_angle_deg > self.MAX_AXIS_ANGLE_DEG:
-            raise ValueError(
-                f"Stereo optical axes differ by {self.axis_angle_deg:.1f} deg "
-                f"(limit {self.MAX_AXIS_ANGLE_DEG:.0f}); the views would barely "
-                "overlap. Reduce stereo_rig.toe_out_deg."
-            )
-
-        self.rotation, self.translation = relative_pose(left, right)
-        self.baseline_m = float(np.linalg.norm(self.translation))
-        if self.baseline_m < 1e-3:
-            raise ValueError("Stereo baseline is effectively zero")
-
-        # The right camera must sit to the right of the left one, in the left
-        # camera's own axes (OpenCV: T = -R @ C_right_in_left, so T_x < 0).
-        offset = left.from_vehicle(right.position.reshape(1, 3))[0]
-        if float(offset[0]) < 0.0:
-            raise ValueError(
-                f"'{left.name}' is to the right of '{right.name}'. Swap the "
-                "left/right camera assignment - on this vehicle the +X axis "
-                "points to the vehicle's left."
-            )
-        self.vertical_offset_m = float(offset[1])
-
-    @property
-    def focal_px(self) -> float:
-        return self.left.focal_px
-
-    def depth_from_disparity(self, disparity: np.ndarray) -> np.ndarray:
-        disp = np.asarray(disparity, dtype=np.float32)
-        safe = np.where(disp > 1e-3, disp, np.float32(np.nan))
-        return np.float32(self.left.focal_px * self.baseline_m) / safe
-
-    def disparity_for_depth(self, depth_m: float) -> float:
-        if depth_m <= 0.0:
-            return float("inf")
-        return float(self.left.focal_px * self.baseline_m / depth_m)
-
-    def disparity_range_for(self, min_depth_m: float) -> int:
-        """Smallest SGBM search range that reaches ``min_depth_m``.
-
-        The closest depth a pair can resolve is ``f * B / numDisparities``, so
-        inverting that and rounding up to the multiple of 16 OpenCV requires
-        gives the cheapest range that still covers the near field.
-        """
-        if min_depth_m <= 0.0:
-            raise ValueError("min_depth_m must be positive")
-        needed = self.disparity_for_depth(min_depth_m)
-        return max(16, int(math.ceil(needed / 16.0)) * 16)
-
-    def describe(self) -> str:
-        return (
-            f"{self.left.sensor.model} pair  baseline={self.baseline_m:.3f} m  "
-            f"f={self.left.focal_px:.1f} px @{self.left.width}x{self.left.height}  "
-            f"hfov={self.left.horizontal_fov_deg:.0f} deg  "
-            f"axes {self.axis_angle_deg:.1f} deg apart  "
-            f"disparity@10m={self.disparity_for_depth(10.0):.1f} px"
-        )
-
-
-def relative_pose(left: CameraModel, right: CameraModel) -> tuple[np.ndarray, np.ndarray]:
-    """``(R, T)`` with ``X_right = R @ X_left + T``, the OpenCV convention.
-
-    Both come straight from the mounts: ``R = R_r R_l^T`` and
-    ``T = R_r (C_l - C_r)``. For a parallel pair ``R`` is the identity and
-    ``T`` is ``(-baseline, 0, 0)``.
-    """
-    rotation = right.rotation @ left.rotation.T
-    translation = right.rotation @ (left.position - right.position)
-    return rotation, translation
-
-
-def build_camera_models(
-    config,
-    work_width: int | None = None,
-    work_height: int | None = None,
-) -> tuple[CameraModel, CameraModel]:
-    """The only door into stereo, and it has exactly two cameras: the display
-    camera cannot reach the compute path through here."""
-    if work_width is None:
-        work_width = config.stereo_width
-    if work_height is None:
-        work_height = config.stereo_height
-    width = int(work_width)
-    height = int(work_height)
-    left = CameraModel(config.left_camera, width, height)
-    right = CameraModel(config.right_camera, width, height)
-    return left, right

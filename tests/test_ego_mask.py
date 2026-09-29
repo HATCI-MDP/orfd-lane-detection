@@ -12,19 +12,14 @@ import numpy as np
 import pytest
 
 from offroad_autonomy.main import _StuckDetector
-from offroad_autonomy.perception.camera_geometry import build_camera_models
 from offroad_autonomy.perception.ego_mask import (
     EgoMask,
     apply_roi,
     road_fraction,
     weighted_confidence,
 )
-from offroad_autonomy.perception.fusion import fuse_rgb_depth
-from offroad_autonomy.perception.stereo_depth import StereoDepthEstimator
-from offroad_autonomy.perception.terrain_analyzer import TerrainAnalyzer
 from offroad_autonomy.postprocessing.temporal_stabilizer import TemporalStabilizer
 from offroad_autonomy.types import (
-    DepthResult,
     EgoMaskSpec,
     PerceptionResult,
     PipelineConfig,
@@ -39,25 +34,7 @@ HOOD = EgoMaskSpec(
 
 
 def _config(**overrides) -> PipelineConfig:
-    overrides.setdefault("depth_roi_enabled", False)
     return PipelineConfig(model_weights="dummy.pt", **overrides)
-
-
-#: The 3-camera rig's centre-camera polygon (2 px margin, 31 px closing,
-#: 4 px simplification). Kept only as the size the new masks must beat.
-OLD_CENTRE_MASK = EgoMaskSpec(
-    enabled=True,
-    polygon=(
-        (0.1572, 1.0000),
-        (0.8442, 1.0000),
-        (0.7705, 0.8836),
-        (0.6161, 0.6918),
-        (0.5132, 0.6767),
-        (0.3853, 0.6918),
-        (0.2740, 0.8254),
-    ),
-    margin_px=2,
-)
 
 
 def _roi(shape=(465, 720)):
@@ -94,50 +71,6 @@ def test_mask_covering_the_whole_frame_is_refused():
 def test_enabled_mask_needs_a_real_polygon():
     with pytest.raises(ValueError, match="polygon"):
         EgoMaskSpec(enabled=True, polygon=((0.0, 0.0),))
-
-
-@pytest.mark.parametrize("side", ["left", "right"])
-def test_bumper_pair_needs_no_exclusion_at_all(side):
-    """The whole point of the bumper mount: there is no bodywork to exclude.
-
-    Both cameras sit ahead of the vehicle's frontmost node, so every pixel is
-    terrain and the near-field road reaches the bottom row of the frame - the
-    trapezoid the roofline pair had to throw away is simply gone.
-    """
-    config = PipelineConfig()
-    spec = config.right_camera
-    if side == "left":
-        spec = config.left_camera
-
-    assert not spec.ego_mask.enabled
-    assert EgoMask(spec.ego_mask).valid_roi((465, 720)).all()
-
-
-def test_bumper_pair_is_tighter_than_every_mask_that_came_before():
-    """Each move has cost less frame than the last; this one costs none."""
-    config = PipelineConfig()
-    old = EgoMask(OLD_CENTRE_MASK).coverage((465, 720))
-
-    for spec in (config.left_camera, config.right_camera):
-        assert EgoMask(spec.ego_mask).coverage((465, 720)) == 0.0 < old
-
-
-def test_display_camera_clip_is_a_small_bottom_region():
-    """The display camera does see the hood - but only to clip the overlay.
-
-    Its polygon is not an exclusion: nothing is computed from this camera, so
-    the only thing it changes is where the dashboard paints.
-    """
-    config = PipelineConfig()
-    spec = config.display_camera
-    shape = (spec.height, spec.width)
-    excluded = EgoMask(spec.ego_mask).excluded(shape)
-
-    assert spec.ego_mask.enabled
-    assert 0.02 <= excluded.mean() <= 0.15
-    # Entirely in the lower half, and the top row is untouched.
-    assert np.flatnonzero(excluded.any(axis=1)).min() > shape[0] // 2
-    assert not excluded[0].any()
 
 
 def test_hood_pixels_do_not_count_against_perception_confidence():
@@ -210,123 +143,10 @@ def test_stabiliser_reapplies_the_mask_after_morphology():
     assert stabilized.valid_roi is roi
 
 
-def _cast_ground(camera):
-    """Ray-cast a flat ground plane for a camera, returning along-axis depth."""
-    uu, vv = camera.pixel_grid()
-    dirs = np.stack(
-        [
-            (uu - camera.cx) / camera.focal_px,
-            (vv - camera.cy) / camera.focal_px,
-            np.ones_like(uu),
-        ],
-        axis=-1,
-    ) @ camera.rotation.astype(np.float32)
-    dirs /= np.linalg.norm(dirs, axis=-1, keepdims=True)
-    origin = camera.position.astype(np.float32)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        t = np.where(dirs[..., 2] < -1e-6, -origin[2] / dirs[..., 2], np.inf)
-    t = np.where(t > 0, t, np.inf)
-    hit = np.isfinite(t)
-    points = origin + dirs * np.where(hit, t, 0.0)[..., None]
-    depth = (points - origin) @ camera.rotation[2].astype(np.float32)
-    return np.where(hit, depth, 0.0).astype(np.float32), hit
-
-
-def _depth_result(config):
-    estimator = StereoDepthEstimator(config)
-    depth_left, hit = _cast_ground(estimator.rectified)
-    usable = (
-        hit & (depth_left >= config.stereo_min_depth_m) & (depth_left <= config.stereo_max_depth_m)
-    )
-    cloud, points, image, valid = estimator._reproject(
-        np.where(usable, depth_left, np.nan).astype(np.float32), usable
-    )
-    return DepthResult(
-        depth_m=image,
-        valid=valid,
-        points_vehicle=points,
-        cloud_vehicle=cloud,
-        coverage=float(valid.mean()),
-    )
-
-
-def test_hood_pixels_cannot_become_obstacles():
+def test_rgb_pipeline_applies_the_ego_mask():
     config = _config()
-    depth = _depth_result(config)
-    roi = _roi(depth.valid.shape)
-
-    terrain = TerrainAnalyzer(config).analyze(depth, roi)
-
-    assert not (terrain.obstacle_mask & ~roi).any()
-    assert not (terrain.traversability[~roi] > 0).any()
-
-
-def test_ground_fill_does_not_invent_terrain_behind_the_hood():
-    """We have no evidence there, so filling it would be fabrication."""
-    config = _config()
-    depth = _depth_result(config)
-    roi = _roi(depth.valid.shape)
-
-    terrain = TerrainAnalyzer(config).analyze(depth, roi)
-
-    assert not (terrain.inferred & ~roi).any()
-
-
-def test_depth_behind_the_hood_still_reaches_the_clearance_grid():
-    """The pair sees past the hood; that geometry must not be thrown away."""
-    config = _config()
-    depth = _depth_result(config)
-    roi = _roi(depth.valid.shape)
-
-    masked = TerrainAnalyzer(config).analyze(depth, roi)
-    unmasked = TerrainAnalyzer(config).analyze(depth, None)
-
-    # The vehicle-space cloud drives the BEV grid and is deliberately whole,
-    # so the corridor clearance is unchanged by an image-space exclusion.
-    assert masked.min_forward_clearance_m == unmasked.min_forward_clearance_m
-    assert masked.ground_plane == pytest.approx(unmasked.ground_plane)
-
-
-def test_stereo_fusion_ignores_excluded_pixels():
-    config = _config()
-    depth = _depth_result(config)
-    roi = _roi(depth.valid.shape)
-    terrain = TerrainAnalyzer(config).analyze(depth, roi)
-
-    # A segmenter that would happily call the hood drivable.
-    perception = PerceptionResult(
-        mask=np.ones(roi.shape, dtype=bool) & roi,
-        valid_roi=roi,
-        confidences=[0.9],
-    )
-
-    fused = fuse_rgb_depth(perception, terrain, config)
-
-    assert not fused.mask[~roi].any()
-    assert not (fused.traversability[~roi] > 0).any()
-    assert fused.valid_roi is roi
-    assert fused.road_fraction == pytest.approx(road_fraction(fused.mask, roi))
-
-
-def test_fusion_road_fraction_uses_only_valid_pixels():
-    config = _config()
-    depth = _depth_result(config)
-    roi = _roi(depth.valid.shape)
-    terrain = TerrainAnalyzer(config).analyze(depth, roi)
-
-    mask = np.zeros(roi.shape, dtype=bool)
-    mask[150:250, 250:450] = True
-    fused = fuse_rgb_depth(PerceptionResult(mask=mask & roi, valid_roi=roi), terrain, config)
-
-    assert fused.road_fraction == pytest.approx((fused.mask & roi).sum() / roi.sum())
-
-
-def test_rgb_only_fallback_still_applies_the_ego_mask():
-    """Stereo being offline must not switch the exclusion off."""
-    config = _config(depth_enabled=False)
     roi = _roi()
 
-    # No terrain at all - the appearance-only path.
     mask = np.ones(roi.shape, dtype=bool)
     perception = PerceptionResult(
         mask=apply_roi(mask, roi),
@@ -339,10 +159,10 @@ def test_rgb_only_fallback_still_applies_the_ego_mask():
     assert stabilized.road_fraction == pytest.approx(1.0, abs=1e-6)
 
 
-def test_ego_mask_is_built_even_when_depth_is_disabled():
+def test_pipeline_builds_the_ego_mask():
     from unittest.mock import patch
 
-    config = _config(depth_enabled=False)
+    config = _config()
 
     with (
         patch("offroad_autonomy.pipeline.ImagePreprocessor"),
@@ -355,11 +175,10 @@ def test_ego_mask_is_built_even_when_depth_is_disabled():
 
         pipeline = AutonomyPipeline(config)
 
-    assert pipeline.depth_estimator is None
-    # The ROI is built either way; from the bumper pair it is simply whole.
     assert pipeline.valid_roi.shape == (config.preprocess_height, config.preprocess_width)
-    assert pipeline.ego_coverage == pytest.approx(0.0)
-    assert pipeline.valid_roi.all()
+    assert 0.12 < pipeline.ego_coverage < 0.16
+    assert not pipeline.valid_roi[-1, config.preprocess_width // 2]
+    assert pipeline.valid_roi[config.preprocess_height // 2, config.preprocess_width // 2]
 
 
 def test_safe_stop_still_fires_when_the_road_really_is_gone():
@@ -411,7 +230,7 @@ def test_hood_sized_exclusion_cannot_by_itself_trigger_safe_stop():
     must read as a clear road - not as a 15% loss of confidence.
     """
     config = PipelineConfig()
-    roi = EgoMask(config.left_camera.ego_mask).valid_roi((465, 720))
+    roi = EgoMask(config.camera.ego_mask).valid_roi((465, 720))
     all_road = apply_roi(np.ones(roi.shape, dtype=bool), roi)
 
     fraction = road_fraction(all_road, roi)
@@ -436,8 +255,7 @@ def test_ego_mask_round_trips_through_yaml(tmp_path):
         "\n".join(
             [
                 "beamng:",
-                "  cameras:",
-                "    left:",
+                "  camera:",
                 "      ego_mask:",
                 "        enabled: true",
                 "        margin_px: 5",
@@ -451,7 +269,7 @@ def test_ego_mask_round_trips_through_yaml(tmp_path):
     )
 
     config = load_config(path)
-    spec = config.left_camera.ego_mask
+    spec = config.camera.ego_mask
 
     assert spec.enabled
     assert spec.margin_px == 5
@@ -459,34 +277,12 @@ def test_ego_mask_round_trips_through_yaml(tmp_path):
     assert EgoMask(spec).coverage((465, 720)) > 0.0
 
 
-def test_ego_mask_can_be_switched_on_per_camera_in_yaml(tmp_path):
-    """A rig that does see bodywork can still say so, one camera at a time."""
-    from offroad_autonomy.utils.config import load_config
-
-    path = tmp_path / "on.yaml"
-    path.write_text(
-        "beamng:\n  cameras:\n    left:\n      ego_mask:\n"
-        "        enabled: true\n        polygon:\n"
-        "          - [0.2, 1.0]\n          - [0.8, 1.0]\n          - [0.5, 0.6]\n",
-        encoding="utf-8",
-    )
-
-    config = load_config(path)
-
-    assert config.left_camera.ego_mask.enabled
-    assert EgoMask(config.left_camera.ego_mask).coverage((465, 720)) > 0.0
-    # The other camera is untouched and keeps the default: nothing to exclude.
-    assert not config.right_camera.ego_mask.enabled
-    assert EgoMask(config.right_camera.ego_mask).valid_roi((64, 64)).all()
-
-
 def test_enabled_mask_without_a_polygon_is_rejected(tmp_path):
     from offroad_autonomy.utils.config import load_config
 
     path = tmp_path / "bad.yaml"
     path.write_text(
-        "beamng:\n  cameras:\n    right:\n      ego_mask:\n"
-        "        enabled: true\n        polygon: []\n",
+        "beamng:\n  camera:\n      ego_mask:\n        enabled: true\n        polygon: []\n",
         encoding="utf-8",
     )
 
@@ -494,56 +290,23 @@ def test_enabled_mask_without_a_polygon_is_rejected(tmp_path):
         load_config(path)
 
 
-def test_neither_stereo_camera_is_masked_by_default():
-    config = PipelineConfig()
-
-    assert not config.left_camera.ego_mask.enabled
-    assert not config.right_camera.ego_mask.enabled
-
-
 def test_moving_the_camera_does_not_silently_move_the_mask():
     """The polygon belongs to a pose; changing one must not fake the other."""
     config = PipelineConfig()
-    moved = replace(config.left_camera, pos=(0.3, -0.5, 1.2))
+    moved = replace(config.camera, pos=(0.3, -0.5, 1.2))
 
     # Same polygon, because it is configuration - which is exactly why
     # scripts/derive_ego_mask.py exists and the config says to re-run it.
-    assert moved.ego_mask == config.left_camera.ego_mask
+    assert moved.ego_mask == config.camera.ego_mask
 
 
-#: Frontmost node of the Hopper's bodywork: fb1r/fb1l of hopper_bumper_F.jbeam.
-#: Forward is -Y, so anything mounted at a smaller Y is clear of the vehicle.
-HOPPER_FRONTMOST_Y = -1.78
+def test_dashcam_exclusion_covers_derived_hood_silhouette():
+    from offroad_autonomy.perception.camera_geometry import CameraModel
+    from scripts.derive_ego_mask import silhouette
 
-
-def test_stereo_pair_is_the_bumper_mount():
-    config = PipelineConfig()
-    left, right = build_camera_models(config, 720, 465)
-
-    assert config.left_camera.pos == pytest.approx((0.3, -1.95, 0.95))
-    assert config.right_camera.pos == pytest.approx((-0.3, -1.95, 0.95))
-    # Still looking slightly down, not up at the sky.
-    assert left.rotation[2][2] < 0.0
-    assert right.rotation[2][2] < 0.0
-
-
-def test_both_bumper_cameras_sit_ahead_of_all_bodywork():
-    """What makes the exclusion mask unnecessary rather than merely small.
-
-    A camera in front of the frontmost node has every part of the vehicle
-    behind its image plane, so no field of view can bring bodywork into frame.
-    """
-    config = PipelineConfig()
-
-    for spec in (config.left_camera, config.right_camera):
-        assert spec.pos[1] < HOPPER_FRONTMOST_Y
-    # And the pair stays inside the bumper's 1.60 m width.
-    assert abs(config.left_camera.pos[0] - config.right_camera.pos[0]) <= 1.60
-
-
-def test_display_camera_is_behind_the_bumper_and_above_the_pair():
-    """The two mounts are chosen for different jobs, and differ accordingly."""
-    config = PipelineConfig()
-
-    assert config.display_camera.pos[1] > HOPPER_FRONTMOST_Y
-    assert config.display_camera.pos[2] > config.left_camera.pos[2]
+    cfg = PipelineConfig()
+    body = silhouette(CameraModel(cfg.camera, cfg.preprocess_width, cfg.preprocess_height))
+    excluded = EgoMask(cfg.camera.ego_mask).excluded(body.shape)
+    assert body.any()
+    assert not (body & ~excluded).any()
+    assert 0.12 < excluded.mean() < 0.16

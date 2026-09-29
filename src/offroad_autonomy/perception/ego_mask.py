@@ -1,8 +1,7 @@
 """Exclusion of the ego vehicle's own bodywork from perception.
 
-On the shipped bumper rig this stage is a no-op. It stays because the mask
-is a property of a *pose*, not of the codebase: any mount that looks out over
-the hood needs one, and the invariants below are what make such a mount safe.
+The dashcam looks over the hood. Its exclusion polygon belongs to that
+mount and lens, so moving the camera requires regenerating the polygon.
 
 Bodywork pixels are not terrain. Treating them as non-drivable would tell the
 planner the vehicle is walled in by its own bonnet; treating them as drivable
@@ -10,7 +9,7 @@ would invite it to steer into itself. Both are wrong, because the right answer
 is that nothing can be known about them at all.
 
 So this stage produces a **validity** mask rather than a classification. Every
-downstream consumer - segmentation, confidence, terrain, planning, the safe
+downstream consumer - segmentation, confidence, planning, the safe
 stop - is restricted to the valid region, and the confidence denominator
 counts valid pixels only. A camera that sees more bodywork therefore reports
 the same confidence on the same road, which is the property that stops the
@@ -85,7 +84,7 @@ class EgoMask:
             # A polygon covering everything would starve the whole stack, and
             # silently returning an empty ROI is far worse than shouting.
             raise ValueError(
-                "Ego mask covers the entire frame - check cameras.<side>.ego_mask.polygon"
+                "Ego mask covers the entire frame - check beamng.camera.ego_mask.polygon"
             )
         return mask
 

@@ -21,7 +21,7 @@ from pathlib import Path
 
 import numpy as np
 
-from offroad_autonomy.runtime.timing import MAIN_STAGES, STEREO_STAGES, RuntimeStats
+from offroad_autonomy.runtime.timing import MAIN_STAGES, RuntimeStats
 from offroad_autonomy.types import PathPlan
 
 
@@ -75,9 +75,6 @@ class BenchmarkRecorder:
         self._primary_ms: list[float] = []
         self._full_ms: list[float] = []
         self._confidence: list[float] = []
-        self._valid_disparity: list[float] = []
-        self._depth_coverage: list[float] = []
-        self._depth_used = 0
         self._targets: list[float] = []
 
     def add(
@@ -88,9 +85,6 @@ class BenchmarkRecorder:
         confidence: float,
         mask: np.ndarray,
         plan: PathPlan | None,
-        valid_disparity: float | None,
-        depth_coverage: float | None,
-        depth_used: bool,
     ) -> None:
         if self._t_origin is None:
             self._t_origin = now
@@ -104,12 +98,6 @@ class BenchmarkRecorder:
         self._primary_ms.append(primary_ms)
         self._full_ms.append(full_ms)
         self._confidence.append(confidence)
-        if valid_disparity is not None:
-            self._valid_disparity.append(valid_disparity)
-        if depth_coverage is not None:
-            self._depth_coverage.append(depth_coverage)
-        self._depth_used += int(depth_used)
-
         if plan is not None and len(plan.centerline) >= 2:
             target = plan.centerline[max(0, len(plan.centerline) // 3)]
             self._targets.append(float(target[0]) / max(mask.shape[1], 1))
@@ -131,7 +119,7 @@ class BenchmarkRecorder:
             return None
         return float(fn(np.asarray(values)))
 
-    def report(self, main: RuntimeStats, stereo: RuntimeStats | None, worker=None) -> dict:
+    def report(self, main: RuntimeStats) -> dict:
         duration = 0.0
         if self._t_first is not None and self._t_last:
             duration = self._t_last - self._t_first
@@ -139,37 +127,9 @@ class BenchmarkRecorder:
         if len(self._targets) >= 3:
             jitter = float(np.std(np.diff(np.asarray(self._targets))) * 100.0)
 
-        stereo_block: dict = {"enabled": stereo is not None}
-        if stereo is not None:
-            total = stereo.stage("stereo_total")
-            stereo_block.update(
-                fps=round(stereo.fps(), 2),
-                latency_mean_ms=round(total.mean_ms, 2),
-                latency_p95_ms=round(total.p95_ms, 2),
-                stages={
-                    name: {"mean_ms": round(s.mean_ms, 2), "p95_ms": round(s.p95_ms, 2)}
-                    for name, s in stereo.summary(STEREO_STAGES).items()
-                },
-            )
-        if worker is not None:
-            stereo_block.update(
-                submitted=worker.submitted,
-                completed=worker.completed,
-                dropped=worker.dropped,
-                failed=worker.failed,
-            )
-
-        def pct(value: float | None) -> float | None:
-            if value is None:
-                return None
-            return round(100.0 * value, 2)
-
         main_fps = None
         if duration > 0:
             main_fps = round(self.frames / duration, 2)
-        depth_used_pct = None
-        if self.frames:
-            depth_used_pct = round(100.0 * self._depth_used / self.frames, 1)
         primary_mean = self._stat(self._primary_ms, np.mean)
         primary_p95 = self._stat(self._primary_ms, lambda a: np.percentile(a, 95))
         return {
@@ -185,12 +145,8 @@ class BenchmarkRecorder:
             "meets_20fps": bool(duration > 0 and self.frames / duration >= 20.0),
             "meets_50ms": bool(primary_p95 is not None and primary_p95 <= 50.0),
             "segmentation_confidence_mean": _round(self._stat(self._confidence, np.mean), 3),
-            "valid_disparity_pct_mean": pct(self._stat(self._valid_disparity, np.mean)),
-            "depth_coverage_pct_mean": pct(self._stat(self._depth_coverage, np.mean)),
-            "depth_used_pct": depth_used_pct,
             "path_jitter_pct": _round(jitter, 3),
             "lane_departures": self.departures,
-            "stereo": stereo_block,
             "main_stages": {
                 name: {"mean_ms": round(s.mean_ms, 2), "p95_ms": round(s.p95_ms, 2)}
                 for name, s in main.summary(MAIN_STAGES).items()

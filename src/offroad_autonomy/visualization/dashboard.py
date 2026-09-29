@@ -1,55 +1,28 @@
-"""Operator dashboard.
-
-Layout::
-
-    +---------------------------------------------+-----------------+
-    | main view: DISPLAY camera + mask + path     | VEHICLE         |
-    |   (or a debug view, keys 0-8)               | PERCEPTION      |
-    +---------------+---------------+-------------+ STEREO / DEPTH  |
-    | LEFT RECTIFIED| RIGHT RECTIFIED| STEREO DEPTH| RUNTIME         |
-    +---------------+---------------+-------------+-----------------+
-
-The bottom strip shows the bumper cameras, which produce everything the
-vehicle computes. The main panel shows the display camera, which computes
-nothing; its label says DISPLAY ONLY so a screenshot cannot be misread as
-evidence that the stack is looking through it.
-
-Everything is drawn at the working resolution and only then fitted to the
-window, so the dashboard costs a few milliseconds rather than tens.
-"""
+"""Dashcam imagery, segmentation and planned path from the same capture."""
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
 
-from offroad_autonomy.perception.stereo_rectification import draw_epipolar_pair
 from offroad_autonomy.types import (
+    DEBUG_VIEW_KEYS,
     DEBUG_VIEWS,
     DEFAULT_DASHBOARD_COLORS,
     GMSL2_CAPTURE_SENSOR,
     CameraSensor,
-    DepthResult,
     PathPlan,
     PipelineStepResult,
-    TerrainAnalysis,
 )
-from offroad_autonomy.visualization.path_projector import GroundProjector
 
 _VIEW_TITLES = {
-    "default": "PATH VISUALIZATION",
-    "raw": "RAW LEFT | RIGHT",
-    "rectified": "RECTIFIED LEFT | RIGHT",
-    "disparity": "DISPARITY (rectified left)",
-    "depth": "DEPTH (segmentation view)",
-    "stitched": "STITCHED WIDE VIEW",
-    "mask": "SEGMENTATION MASK",
-    "fused": "FUSED MASK + DEPTH",
-    "roi": "DEPTH ROI",
-    "pipeline": "PIPELINE DEBUG  raw | mask | planner input | path",
+    "default": "Path Visualization",
+    "raw": "Raw Dashcam",
+    "mask": "Segmentation Mask",
+    "pipeline": "Pipeline Debug  Raw | Mask | Planner Input | Path",
 }
 
 
@@ -68,23 +41,12 @@ class DashboardTelemetry:
     autopilot_active: bool = True
     road_fraction: float = 0.0
     ego_coverage: float = 0.0
-    segmentation_mode: str = "left"
+    segmentation_mode: str = "dashcam"
     fallback_state: str = "NONE"
-    depth_active: bool = False
-    depth_state: str = "OFF"
-    depth_coverage: float = 0.0
-    valid_disparity_fraction: float = 0.0
-    median_forward_depth_m: float = float("nan")
-    min_corridor_depth_m: float = float("nan")
-    min_clearance_m: float = float("inf")
-    depth_age_ms: float = float("inf")
-    stereo_fps: float = 0.0
-    stereo_latency_ms: float = 0.0
-    stereo_latency_p95_ms: float = 0.0
+    fallback_reason: str = ""
     #: Never an autonomy number: it can drop to single figures without the
     #: vehicle noticing.
     dashboard_fps: float = 0.0
-    sync_ok: bool = True
     timing_lines: list[str] = field(default_factory=list)
 
 
@@ -95,18 +57,12 @@ class AutonomyDashboard:
         height: int = 900,
         colors: dict[str, tuple[int, int, int]] | None = None,
         sensor: CameraSensor | None = None,
-        projector: GroundProjector | None = None,
-        display_clip: np.ndarray | None = None,
     ) -> None:
         self.width = width
         self.height = height
         if sensor is None:
             sensor = GMSL2_CAPTURE_SENSOR
         self.sensor = sensor
-        # Without a projector the main panel falls back to the perception
-        # view, so the dashboard still works on a rig with no display camera.
-        self.projector = projector
-        self.display_clip = display_clip
         self._pad = 24
         self._gap = 20
         self._header_h = 52
@@ -122,10 +78,6 @@ class AutonomyDashboard:
         # Filling a large array with a colour costs ~5 ms at 1600x900;
         # copying a cached blank costs ~1 ms, so blanks are made once.
         self._blanks: dict[tuple, np.ndarray] = {}
-        # Depth updates at the stereo rate, the dashboard at the loop rate,
-        # so the colour-mapped view is reused until a new result arrives.
-        self._depth_view_src: tuple = ()
-        self._depth_view: np.ndarray | None = None
 
     def _blank(self, height: int, width: int, fill: tuple[int, int, int]) -> np.ndarray:
         key = (height, width, tuple(fill))
@@ -145,9 +97,6 @@ class AutonomyDashboard:
         valid_roi: np.ndarray | None = None,
         debug_view: str = "default",
         timing_overlay: bool = False,
-        stitched: np.ndarray | None = None,
-        depth_roi: np.ndarray | None = None,
-        display_frame: np.ndarray | None = None,
     ) -> np.ndarray:
         """``plan`` is passed separately because it is withheld under safe
         stop: perception keeps running, but nothing should suggest the stack
@@ -177,28 +126,24 @@ class AutonomyDashboard:
         viewport_rect = (inner_x, inner_y, inner_w, inner_h - strip_h - self._gap)
         strip_rect = (inner_x, inner_y + inner_h - strip_h, inner_w, strip_h)
 
-        main_image = self._main_view(
-            debug_view, result, plan, valid_roi, stitched, depth_roi, display_frame
-        )
-        on_display_camera = debug_view == "default" and self._can_reproject(display_frame)
+        main_image = self._main_view(debug_view, result, plan, valid_roi)
         viewport = self._fit_image(
             main_image, viewport_rect[2], viewport_rect[3], fill=self._colors["PANEL_BG"]
         )
         self._blit(canvas, viewport, viewport_rect[0], viewport_rect[1])
-        self._draw_viewport_labels(canvas, viewport_rect, telemetry, debug_view, on_display_camera)
+        self._draw_viewport_labels(canvas, viewport_rect, telemetry, debug_view)
         if debug_view == "default":
             self._draw_perception_legend(
                 canvas,
                 viewport_rect,
                 has_ego=valid_roi is not None and not bool(valid_roi.all()),
-                reprojected=on_display_camera,
             )
         if timing_overlay and telemetry.timing_lines:
             self._draw_timing_overlay(canvas, viewport_rect, telemetry.timing_lines)
         if not telemetry.autopilot_active:
             self._draw_safe_stop_overlay(canvas, viewport_rect)
 
-        self._draw_camera_strip(canvas, strip_rect, result.depth, result.terrain, telemetry)
+        self._draw_camera_strip(canvas, strip_rect, result)
         self._draw_sidebar(canvas, side_rect, telemetry)
         return canvas
 
@@ -208,86 +153,20 @@ class AutonomyDashboard:
         result: PipelineStepResult,
         plan: PathPlan | None,
         valid_roi: np.ndarray | None,
-        stitched: np.ndarray | None,
-        depth_roi: np.ndarray | None,
-        display_frame: np.ndarray | None = None,
     ) -> np.ndarray:
         frame = result.frame.preprocessed
-        depth = result.depth
-        pair = result.frames
-
         if view == "raw":
-            if pair is not None and pair.left is not None and pair.right is not None:
-                return np.hstack([self._ensure_bgr(pair.left), self._ensure_bgr(pair.right)])
-            return self._placeholder(frame, "PAIR INCOMPLETE")
-        if view == "rectified":
-            if depth is not None and depth.rectified_left is not None:
-                return draw_epipolar_pair(depth.rectified_left, depth.rectified_right)
-            return self._placeholder(frame, "NO STEREO RESULT")
-        if view == "disparity":
-            image = self._render_disparity(depth)
-            if image is None:
-                return self._placeholder(frame, "NO STEREO RESULT")
-            return image
-        if view == "depth":
-            image = self._render_depth_view(depth, result.terrain)
-            if image is None:
-                return self._placeholder(frame, "NO DEPTH")
-            return image
-        if view == "stitched":
-            if stitched is not None:
-                return stitched
-            return self._placeholder(frame, "STITCHING DISABLED (stitching.enabled)")
+            return self._ensure_bgr(result.frame.raw)
         if view == "mask":
             return self._render_mask_view(result)
-        if view == "fused":
-            return self._render_fused_view(result)
-        if view == "roi":
-            return self._render_roi_view(frame, depth_roi, depth)
         if view == "pipeline":
             return self._render_pipeline_view(result)
-
-        if self._can_reproject(display_frame):
-            return self._build_display_overlay(display_frame, result, plan)
 
         mask = self._ensure_mask(result.stabilized.mask, frame.shape[:2])
         ego = None
         if valid_roi is not None and not bool(valid_roi.all()):
             ego = ~self._ensure_mask(valid_roi, frame.shape[:2])
         return self._build_overlay(frame, mask, plan, result.stabilized.mask.shape[:2], ego)
-
-    def _can_reproject(self, display_frame: np.ndarray | None) -> bool:
-        return display_frame is not None and self.projector is not None
-
-    def _build_display_overlay(
-        self,
-        display_frame: np.ndarray,
-        result: PipelineStepResult,
-        plan: PathPlan | None,
-    ) -> np.ndarray:
-        """Only a redraw of results that already exist, so the large view
-        costs the same whether or not anyone is watching it."""
-        assert self.projector is not None
-        target = self._ensure_bgr(display_frame)
-        projector = self.projector
-        if target.shape[:2] != (projector.target.height, projector.target.width):
-            target = cv2.resize(
-                target,
-                (projector.target.width, projector.target.height),
-                interpolation=cv2.INTER_AREA,
-            )
-
-        mask = projector.warp_mask(result.stabilized.mask)
-        if self.display_clip is not None and self.display_clip.shape == mask.shape:
-            mask = mask & ~self.display_clip
-
-        projected = None
-        if plan is not None and len(plan.centerline) >= 2:
-            points = projector.project_points(plan.centerline)
-            if len(points) >= 2:
-                projected = replace(plan, centerline=points)
-
-        return self._build_overlay(target, mask, projected, target.shape[:2], ego=None)
 
     def _placeholder(self, like: np.ndarray, text: str) -> np.ndarray:
         image = np.full(like.shape[:2] + (3,), self._colors["CARD_BG"], dtype=np.uint8)
@@ -303,19 +182,6 @@ class AutonomyDashboard:
             cv2.LINE_AA,
         )
         return image
-
-    def _render_disparity(self, depth: DepthResult | None) -> np.ndarray | None:
-        if depth is None or depth.disparity is None:
-            return None
-        disparity = depth.disparity
-        valid = disparity > 0.0
-        if not valid.any():
-            return None
-        top = max(float(np.percentile(disparity[valid], 99)), 1.0)
-        indexed = (np.clip(disparity / top, 0.0, 1.0) * 255.0).astype(np.uint8)
-        coloured = cv2.applyColorMap(indexed, cv2.COLORMAP_TURBO)
-        coloured[~valid] = self._colors["CARD_BG"]
-        return coloured
 
     def _render_mask_view(self, result: PipelineStepResult) -> np.ndarray:
         stable = result.stabilized.mask
@@ -443,6 +309,11 @@ class AutonomyDashboard:
                 f"target {dbg.target_speed_mps:.1f} m/s ({dbg.speed_reason})",
                 lookahead_line,
             ]
+        if dbg is not None and dbg.controller == "mpc":
+            lines += [
+                f"MPC {dbg.mpc_solve_ms:.1f} ms  cost {dbg.mpc_cost:.2f}  ok {dbg.solver_success}",
+                f"fallback {dbg.controller_fallback}: {dbg.controller_fallback_reason}",
+            ]
         traj = caption(traj, lines)
 
         top = np.hstack([caption(raw, ["1 RAW RGB"]), seg])
@@ -454,65 +325,19 @@ class AutonomyDashboard:
         header = np.full((80, grid.shape[1], 3), self._colors["PANEL_BG"], dtype=np.uint8)
         return np.vstack([header, grid])
 
-    def _render_fused_view(self, result: PipelineStepResult) -> np.ndarray:
-        frame = result.frame.preprocessed.copy()
-        trav = result.traversability
-        if trav is None:
-            return self._placeholder(frame, "NO FUSED DEPTH (appearance only)")
-        conf = np.clip(trav.confidence_map, 0.0, 1.0)
-        coloured = cv2.applyColorMap((conf * 255.0).astype(np.uint8), cv2.COLORMAP_VIRIDIS)
-        road = trav.binary_mask
-        frame[road] = cv2.addWeighted(frame, 0.35, coloured, 0.65, 0)[road]
-        frame[trav.obstacle_mask] = self._colors["BAD"]
-        edges = cv2.Canny(trav.valid_depth_mask.astype(np.uint8) * 255, 50, 150) > 0
-        frame[edges] = self._colors["WARN"]
-        return frame
-
-    def _render_roi_view(
-        self,
-        frame: np.ndarray,
-        depth_roi: np.ndarray | None,
-        depth: DepthResult | None,
-    ) -> np.ndarray:
-        if depth_roi is None or depth_roi.shape != frame.shape[:2]:
-            return self._placeholder(frame, "DEPTH ROI DISABLED")
-        image = (frame * 0.25).astype(np.uint8)
-        image[depth_roi] = frame[depth_roi]
-        if depth is not None and depth.valid.shape == depth_roi.shape:
-            hits = depth.valid & depth_roi
-            image[hits] = cv2.addWeighted(
-                image, 0.5, np.full_like(image, self._colors["WARN"]), 0.5, 0
-            )[hits]
-        return image
-
     def _draw_camera_strip(
         self,
         canvas: np.ndarray,
         rect: tuple[int, int, int, int],
-        depth: DepthResult | None,
-        terrain: TerrainAnalysis | None,
-        telemetry: DashboardTelemetry,
+        result: PipelineStepResult,
     ) -> None:
         x, y, w, h = rect
         gap = 12
-        tile_w = (w - gap * 2) // 3
-
-        age = ""
-        if math.isfinite(telemetry.depth_age_ms):
-            age = f"  {telemetry.depth_age_ms:.0f} ms old"
-        rect_left = None
-        rect_right = None
-        if depth is not None:
-            rect_left = depth.rectified_left
-            rect_right = depth.rectified_right
+        tile_w = (w - gap) // 2
         tiles = (
-            ("LEFT RECTIFIED", rect_left),
-            ("RIGHT RECTIFIED", rect_right),
-            ("STEREO DEPTH" + age, self._render_depth_view(depth, terrain)),
+            ("Dashcam", result.frame.raw),
+            ("Segmentation Mask", self._render_mask_view(result)),
         )
-        placeholder = telemetry.depth_state
-        if telemetry.depth_state == "OFF":
-            placeholder = "NO SIGNAL"
 
         for index, (title, image) in enumerate(tiles):
             tile_x = x + index * (tile_w + gap)
@@ -522,7 +347,7 @@ class AutonomyDashboard:
             if body_rect[2] <= 0 or body_rect[3] <= 0:
                 continue
             if image is None:
-                self._draw_tile_placeholder(canvas, body_rect, placeholder)
+                self._draw_tile_placeholder(canvas, body_rect, "No Signal")
                 continue
             fitted = self._fit_image(
                 self._ensure_bgr(image), body_rect[2], body_rect[3], fill=self._colors["CARD_BG"]
@@ -548,65 +373,6 @@ class AutonomyDashboard:
             1,
             cv2.LINE_AA,
         )
-
-    def _render_depth_view(
-        self,
-        depth: DepthResult | None,
-        terrain: TerrainAnalysis | None,
-    ) -> np.ndarray | None:
-        """Inferred pixels are dimmed so it stays obvious at a glance how much
-        of the frame is measurement rather than an assumption about the
-        ground."""
-        if depth is None:
-            return None
-        # Keyed on array identity: the pipeline passes an age-corrected copy
-        # of terrain every frame, but the maps inside it are shared until
-        # stereo publishes a new result.
-        range_m = None
-        if terrain is not None:
-            range_m = terrain.range_m
-        source = (depth.depth_m, range_m)
-        cached = self._depth_view_src
-        if cached and all(a is b for a, b in zip(source, cached)):
-            return self._depth_view
-        view = self._colour_depth(depth, terrain)
-        self._depth_view_src, self._depth_view = source, view
-        return view
-
-    def _colour_depth(
-        self,
-        depth: DepthResult,
-        terrain: TerrainAnalysis | None,
-    ) -> np.ndarray | None:
-        # Prefer the terrain range map: it covers the ground-plane fill too.
-        if terrain is not None and terrain.range_m is not None:
-            depth_m, coverage = terrain.range_m, terrain.valid
-        else:
-            depth_m, coverage = depth.depth_m, depth.valid
-
-        finite = coverage & np.isfinite(depth_m) & (depth_m > 0.0)
-        if not finite.any():
-            return None
-
-        # Scale by inverse depth, not depth: a linear ramp spends its range on
-        # ground the vehicle will not reach for seconds and crushes the near
-        # field into one hue. Inverse depth is also what stereo measures.
-        near, far = 2.0, 40.0
-        inverse = np.divide(1.0, depth_m, out=np.zeros_like(depth_m), where=depth_m > 1e-3)
-        span = (1.0 / near) - (1.0 / far)
-        normalised = np.clip((inverse - 1.0 / far) / span, 0.0, 1.0)
-        indexed = (normalised * 255.0).astype(np.uint8)
-        coloured = cv2.applyColorMap(indexed, cv2.COLORMAP_TURBO)
-        coloured[~finite] = self._colors["CARD_BG"]
-
-        if terrain is not None:
-            if terrain.inferred is not None and terrain.inferred.any():
-                inferred = terrain.inferred & finite
-                coloured[inferred] = (coloured[inferred] * 0.45).astype(np.uint8)
-            if terrain.obstacle_mask.any():
-                coloured[terrain.obstacle_mask] = self._colors["BAD"]
-
-        return coloured
 
     @staticmethod
     def _ensure_bgr(image: np.ndarray) -> np.ndarray:
@@ -728,17 +494,12 @@ class AutonomyDashboard:
         canvas: np.ndarray,
         rect: tuple[int, int, int, int],
         has_ego: bool,
-        reprojected: bool = False,
     ) -> None:
         x, y, w, h = rect
-        suffix = ""
         box_w = 214
-        if reprojected:
-            suffix = " (from bumper pair)"
-            box_w = 320
         entries = [
-            (f"Traversable mask{suffix}", self._colors["MASK_FILL"]),
-            (f"Planned path{suffix}", self._colors["PATH_CORE"]),
+            ("Traversable Mask", self._colors["MASK_FILL"]),
+            ("Planned Path", self._colors["PATH_CORE"]),
         ]
         if has_ego:
             entries.append(("Ego vehicle (excluded)", self._colors["EGO_EXCLUDED"]))
@@ -865,36 +626,19 @@ class AutonomyDashboard:
         rect: tuple[int, int, int, int],
         telemetry: DashboardTelemetry,
         debug_view: str,
-        on_display_camera: bool = False,
     ) -> None:
         x, y, _, _ = rect
-        source = telemetry.segmentation_mode.upper()
-        # The label has to answer "is the stack looking through this?" at a
-        # glance; on the display camera the answer is always no.
-        if on_display_camera:
-            label = "PATH VISUALIZATION  -  DISPLAY ONLY"
-        elif source == "STITCHED":
-            label = "STITCHED WIDE VIEW  (PERCEPTION)"
-        else:
-            label = f"{source} {self.sensor.model}  {self.sensor.fov_x_deg:.0f} deg  (PERCEPTION)"
+        label = f"Dashcam {self.sensor.model}  {self.sensor.fov_x_deg:.0f} deg  (Perception)"
         if debug_view == "default":
             self._draw_chip(canvas, x + 18, y + 18, label, self._colors["WARN"])
         else:
-            index = DEBUG_VIEWS.index(debug_view)
+            index = next(key for key, view in DEBUG_VIEW_KEYS.items() if view == debug_view)
             self._draw_chip(
                 canvas,
                 x + 18,
                 y + 18,
                 f"[{index}] {_VIEW_TITLES[debug_view]}   (0 = back)",
                 self._colors["PATH_CORE"],
-            )
-        if not telemetry.sync_ok:
-            self._draw_chip(
-                canvas,
-                x + 18,
-                y + 48,
-                "PAIR NOT SYNCHRONISED - STEREO SKIPPED",
-                self._colors["BAD"],
             )
 
     def _draw_sidebar(
@@ -909,18 +653,15 @@ class AutonomyDashboard:
         inner_w = w - 32
         gap = 14
 
-        available_h = h - 32 - gap * 3
-        vehicle_h = int(round(available_h * 0.23))
-        perception_h = int(round(available_h * 0.23))
-        runtime_h = int(round(available_h * 0.21))
-        stereo_h = available_h - vehicle_h - perception_h - runtime_h
+        available_h = h - 32 - gap * 2
+        vehicle_h = int(round(available_h / 3.0))
+        perception_h = int(round(available_h / 3.0))
+        runtime_h = available_h - vehicle_h - perception_h
 
         self._draw_vehicle_card(canvas, (inner_x, inner_y, inner_w, vehicle_h), telemetry)
         inner_y += vehicle_h + gap
         self._draw_perception_card(canvas, (inner_x, inner_y, inner_w, perception_h), telemetry)
         inner_y += perception_h + gap
-        self._draw_stereo_card(canvas, (inner_x, inner_y, inner_w, stereo_h), telemetry)
-        inner_y += stereo_h + gap
         self._draw_runtime_card(canvas, (inner_x, inner_y, inner_w, runtime_h), telemetry)
 
     def _draw_vehicle_card(
@@ -974,7 +715,7 @@ class AutonomyDashboard:
         self._draw_value_row(
             canvas,
             x + 18,
-            y + h - 40,
+            y + h - 64,
             w - 36,
             "Valid ROI / ego",
             f"{(1.0 - telemetry.ego_coverage) * 100:.0f}%  /  {telemetry.ego_coverage * 100:.0f}%",
@@ -984,85 +725,26 @@ class AutonomyDashboard:
         if fallback == "NONE":
             fallback_color = self._colors["GOOD"]
         self._draw_value_row(
-            canvas, x + 18, y + h - 16, w - 36, "Fallback", fallback, value_color=fallback_color
+            canvas, x + 18, y + h - 40, w - 36, "Fallback", fallback, value_color=fallback_color
         )
-
-    def _draw_stereo_card(
-        self,
-        canvas: np.ndarray,
-        rect: tuple[int, int, int, int],
-        telemetry: DashboardTelemetry,
-    ) -> None:
-        x, y, w, h = rect
-        self._draw_card(canvas, rect, "STEREO / DEPTH")
-        state_color = {
-            "LIVE": self._colors["GOOD"],
-            "WARMING UP": self._colors["WARN"],
-        }.get(telemetry.depth_state, self._colors["BAD"])
-        self._draw_value_row(
-            canvas, x + 18, y + 42, w - 36, "Depth state", telemetry.depth_state, state_color
-        )
-        if not telemetry.depth_active:
-            return
-
-        rows = np.linspace(y + 76, y + h - 14, 6).astype(int)
-        self._draw_progress_row(
-            canvas,
-            x + 18,
-            int(rows[0]),
-            w - 36,
-            "Depth coverage",
-            telemetry.depth_coverage,
-            self._colors["WARN"],
-        )
-        self._draw_progress_row(
-            canvas,
-            x + 18,
-            int(rows[1]),
-            w - 36,
-            "Valid disparity",
-            telemetry.valid_disparity_fraction,
-            self._colors["GOOD"],
-        )
+        reason = telemetry.fallback_reason.split(" - ", 1)[0]
+        available = max(1, w - 36 - 75)
+        if cv2.getTextSize(reason, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)[0][0] > available:
+            while (
+                reason
+                and cv2.getTextSize(reason + "...", cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)[0][0]
+                > available
+            ):
+                reason = reason[:-1]
+            reason += "..."
         self._draw_value_row(
             canvas,
             x + 18,
-            int(rows[2]),
+            y + h - 16,
             w - 36,
-            "Median forward depth",
-            _metres(telemetry.median_forward_depth_m),
-        )
-        self._draw_value_row(
-            canvas,
-            x + 18,
-            int(rows[3]),
-            w - 36,
-            "Min corridor depth",
-            _metres(telemetry.min_corridor_depth_m),
-        )
-        clear = telemetry.min_clearance_m
-        clear_text = "CLEAR"
-        clear_color = self._colors["GOOD"]
-        if math.isfinite(clear):
-            clear_text = f"{clear:.1f} m"
-            if clear < 2.5:
-                clear_color = self._colors["BAD"]
-        self._draw_value_row(
-            canvas,
-            x + 18,
-            int(rows[4]),
-            w - 36,
-            "Obstacle clearance",
-            clear_text,
-            clear_color,
-        )
-        self._draw_value_row(
-            canvas,
-            x + 18,
-            int(rows[5]),
-            w - 36,
-            "Stereo update rate",
-            f"{telemetry.stereo_fps:.1f} Hz",
+            "Reason",
+            reason,
+            value_color=fallback_color,
         )
 
     def _draw_runtime_card(
@@ -1075,7 +757,7 @@ class AutonomyDashboard:
         self._draw_card(canvas, rect, "RUNTIME")
         # Separate rows for separate threads: the autonomy numbers contain no
         # drawing or GUI time, so a slow window cannot pose as a slow vehicle.
-        rows = np.linspace(y + 42, y + h - 14, 5).astype(int)
+        rows = np.linspace(y + 42, y + h - 14, 3).astype(int)
         fps_color = self._colors["BAD"]
         if telemetry.fps >= 20.0:
             fps_color = self._colors["GOOD"]
@@ -1095,20 +777,9 @@ class AutonomyDashboard:
             latency_color,
         )
         self._draw_value_row(
-            canvas, x + 18, int(rows[2]), w - 36, "Stereo FPS", f"{telemetry.stereo_fps:.1f}"
-        )
-        self._draw_value_row(
             canvas,
             x + 18,
-            int(rows[3]),
-            w - 36,
-            "Stereo latency (mean/p95)",
-            f"{telemetry.stereo_latency_ms:.0f} / {telemetry.stereo_latency_p95_ms:.0f} ms",
-        )
-        self._draw_value_row(
-            canvas,
-            x + 18,
-            int(rows[4]),
+            int(rows[2]),
             w - 36,
             "Dashboard FPS",
             f"{telemetry.dashboard_fps:.1f}",
@@ -1270,16 +941,8 @@ class AutonomyDashboard:
         )
 
 
-def _metres(value: float) -> str:
-    if not math.isfinite(value):
-        return "--"
-    return f"{value:.1f} m"
-
-
 def _model_mask(result: PipelineStepResult) -> np.ndarray:
-    """The segmenter's own mask, before depth carved anything out of it."""
-    if result.perception.rgb_mask is not None:
-        return result.perception.rgb_mask
+    """The segmenter's mask before temporal stabilisation."""
     return result.perception.mask
 
 

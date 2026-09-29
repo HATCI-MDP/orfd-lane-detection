@@ -19,7 +19,6 @@ from offroad_autonomy.types import (
     PathPlan,
     PipelineConfig,
     StabilizedResult,
-    TerrainAnalysis,
     VehicleState,
 )
 
@@ -75,8 +74,6 @@ class _PlannerScene:
     lateral_prior_px: float
     heading_prior: float
     ego_heading_rad: float
-    clearance_m: np.ndarray | None = None
-    min_clearance_m: float = float("inf")
 
 
 class _PlannerBackend(Protocol):
@@ -240,12 +237,6 @@ class CenterlinePlanner:
         self._straight_heading_threshold = float(
             max(config.planner_straight_heading_threshold, 0.0)
         )
-        self._depth_clearance_weight = float(
-            np.clip(config.planner_depth_clearance_weight, 0.0, 1.0)
-        )
-        self._min_clearance_m = float(max(config.planner_min_clearance_m, 0.0))
-        self._obstacle_penalty = float(np.clip(config.planner_obstacle_penalty, 0.0, 1.0))
-        self._vehicle_half_width_m = float(max(config.vehicle_half_width_m, 1e-3))
         self._backend = _build_backend(config)
 
         self._kf = _KalmanTracker(
@@ -268,13 +259,18 @@ class CenterlinePlanner:
         self,
         stabilized: StabilizedResult,
         vehicle_state: VehicleState | None = None,
-        terrain: TerrainAnalysis | None = None,
     ) -> PathPlan:
         """A frame that fails the gate never produces a new path: driving a
         path no perception supports is how the vehicle used to leave the
         trail. The last good path is held briefly at reduced speed instead.
         """
         decision = self._gate.evaluate(stabilized)
+        valid = stabilized.valid_roi
+        if valid is not None and valid.shape == decision.component.shape:
+            # A hood-cut row exposes only fragments of the road width. Using
+            # their centre would steer around the hood as if it were an obstacle.
+            decision.component[~valid.all(axis=1)] = False
+
         if not decision.ok:
             return self._hold(decision)
 
@@ -283,8 +279,6 @@ class CenterlinePlanner:
             if len(centerline) < 2:
                 decision.reason = "centerline too short"
                 return self._hold(decision)
-            # No clearance term: the baseline must not be slowed or steered
-            # by depth until perception is verified on its own.
             plan = PathPlan(
                 centerline=centerline,
                 heading_rad=self._estimate_heading(centerline),
@@ -292,7 +286,7 @@ class CenterlinePlanner:
                 road_width_px=self._estimate_road_width(decision.component, centerline),
             )
         else:
-            plan = self._plan_advanced(stabilized, vehicle_state, terrain)
+            plan = self._plan_advanced(replace(stabilized, mask=decision.component), vehicle_state)
             if plan.kalman_active:
                 # A predicted path is not a perceived one; never drive it at
                 # full speed or remember it as the last good path.
@@ -307,6 +301,8 @@ class CenterlinePlanner:
 
     def _hold(self, decision: GateDecision) -> PathPlan:
         self._held += 1
+        if self._held == 1:
+            logger.warning("Perception gate: %s - holding previous path", decision.reason)
         if self._held == self._hold_frames + 1:
             logger.warning("Perception gate: %s - no valid path, braking", decision.reason)
 
@@ -337,38 +333,28 @@ class CenterlinePlanner:
         self,
         stabilized: StabilizedResult,
         vehicle_state: VehicleState | None = None,
-        terrain: TerrainAnalysis | None = None,
     ) -> PathPlan:
-        """With ``terrain`` the scene gains a metric clearance channel, so the
-        planner prefers gaps the vehicle actually fits through rather than the
-        widest patch of road-coloured pixels."""
         mask = stabilized.mask
         h, w = mask.shape[:2]
         road_px = int(mask.sum())
         prior_state = self._kf.predict()
 
-        min_clearance = float("inf")
-        if terrain is not None:
-            min_clearance = float(terrain.min_forward_clearance_m)
-
         if road_px < self._min_road_px:
-            return self._fallback(h, w, prior_state, min_clearance)
+            return self._fallback(h, w, prior_state)
 
         scene = self._build_scene(
             mask,
             stabilized.stability_score,
             prior_state,
             vehicle_state,
-            stabilized.traversability,
-            terrain,
         )
         waypoints, confidence = self._backend.infer(scene)
         if len(waypoints) < 2 or confidence < self._min_confidence:
-            return self._fallback(h, w, prior_state, min_clearance)
+            return self._fallback(h, w, prior_state)
 
         centerline = self._postprocess_trajectory(waypoints, h, w)
         if len(centerline) < 2:
-            return self._fallback(h, w, prior_state, min_clearance)
+            return self._fallback(h, w, prior_state)
         centerline = self._stabilize_trajectory(centerline, w)
         centerline = self._straighten_trajectory(centerline, w)
 
@@ -388,7 +374,6 @@ class CenterlinePlanner:
             curvature=self._estimate_curvature(centerline),
             road_width_px=road_width,
             kalman_active=False,
-            min_clearance_m=self._path_clearance(centerline, scene, min_clearance),
         )
 
     def _build_scene(
@@ -397,34 +382,18 @@ class CenterlinePlanner:
         stability_score: float,
         prior_state: np.ndarray,
         vehicle_state: VehicleState | None,
-        fused_traversability: np.ndarray | None = None,
-        terrain: TerrainAnalysis | None = None,
     ) -> _PlannerScene:
         mask_u8 = mask.astype(np.uint8)
 
-        if fused_traversability is not None and fused_traversability.shape == mask.shape:
-            # The fused field already encodes geometry; blur only to soften
-            # per-pixel stereo noise, not to reshape the corridor.
-            traversability = cv2.GaussianBlur(
-                fused_traversability.astype(np.float32), (0, 0), sigmaX=1.6, sigmaY=1.6
-            )
-        else:
-            traversability = cv2.GaussianBlur(
-                mask_u8.astype(np.float32), (0, 0), sigmaX=2.4, sigmaY=2.4
-            )
+        traversability = cv2.GaussianBlur(
+            mask_u8.astype(np.float32), (0, 0), sigmaX=2.4, sigmaY=2.4
+        )
         if float(traversability.max()) > 0.0:
             traversability /= float(traversability.max())
 
         clearance = cv2.distanceTransform(mask_u8, cv2.DIST_L2, 5)
         if float(clearance.max()) > 0.0:
             clearance /= float(clearance.max())
-
-        clearance_m: np.ndarray | None = None
-        min_clearance = float("inf")
-        if terrain is not None and terrain.clearance_m.shape == mask.shape:
-            clearance_m = terrain.clearance_m
-            min_clearance = float(terrain.min_forward_clearance_m)
-            clearance = self._blend_metric_clearance(clearance, clearance_m, terrain)
 
         ego_heading = 0.0
         if vehicle_state is not None:
@@ -438,56 +407,7 @@ class CenterlinePlanner:
             lateral_prior_px=float(prior_state[0]),
             heading_prior=float(prior_state[1]),
             ego_heading_rad=ego_heading,
-            clearance_m=clearance_m,
-            min_clearance_m=min_clearance,
         )
-
-    def _blend_metric_clearance(
-        self,
-        pixel_clearance: np.ndarray,
-        clearance_m: np.ndarray,
-        terrain: TerrainAnalysis,
-    ) -> np.ndarray:
-        """Pixel distance shrinks with range purely because of perspective,
-        biasing the planner toward the bottom of the frame; the metric channel
-        makes a far gap comparable to a near one."""
-        if self._depth_clearance_weight <= 0.0:
-            return pixel_clearance
-
-        # One vehicle width of room is "as clear as it needs to be".
-        full_clearance = max(2.0 * self._vehicle_half_width_m, 1e-3)
-        metric = np.clip(clearance_m / full_clearance, 0.0, 1.0).astype(np.float32)
-        metric = np.where(terrain.valid, metric, pixel_clearance)
-
-        blended = (
-            1.0 - self._depth_clearance_weight
-        ) * pixel_clearance + self._depth_clearance_weight * metric
-
-        # Anything too narrow to drive through is pushed down hard rather
-        # than merely scored lower, so the planner routes around it.
-        too_narrow = terrain.valid & (clearance_m < self._min_clearance_m)
-        blended[too_narrow] *= 1.0 - self._obstacle_penalty
-        return blended.astype(np.float32)
-
-    def _path_clearance(
-        self,
-        centerline: np.ndarray,
-        scene: _PlannerScene,
-        fallback: float,
-    ) -> float:
-        if scene.clearance_m is None or len(centerline) == 0:
-            return fallback
-
-        h, w = scene.clearance_m.shape[:2]
-        xs = np.clip(np.round(centerline[:, 0]).astype(int), 0, w - 1)
-        ys = np.clip(np.round(centerline[:, 1]).astype(int), 0, h - 1)
-        sampled = scene.clearance_m[ys, xs]
-        on_road = scene.mask[ys, xs]
-        if on_road.any():
-            sampled = sampled[on_road]
-        if sampled.size == 0:
-            return fallback
-        return float(min(float(sampled.min()), fallback))
 
     def _postprocess_trajectory(self, waypoints: np.ndarray, h: int, w: int) -> np.ndarray:
         if len(waypoints) < 2:

@@ -9,8 +9,8 @@ the thing to fall back to whenever perception itself is in question.
 
 Why the fit is done on the ground
 ---------------------------------
-On the bumper camera 6-40 m of road sits in ~28 image rows. Rows are
-therefore sampled densely toward the top of the ROI (quadratic spacing), or
+Far road occupies very few image rows. Rows are
+sampled densely toward the top of the ROI (quadratic spacing), or
 the lookahead region would hold one or two samples. And a quadratic in
 *image* coordinates is the wrong model for a road seen in perspective - a
 straight road is a line converging on the vanishing point and a curve bends
@@ -32,7 +32,7 @@ _OUTPUT_POINTS = 24
 #: step means the walk hopped to a different patch of road.
 _MAX_LATERAL_SLOPE = 1.0
 _SLACK_M = 0.25
-#: Stones and depth-vetoed specks must not split the road and move its
+#: Stones and segmentation specks must not split the road and move its
 #: centre by half its width.
 _MERGE_GAP_M = 0.6
 _MIN_ON_ROAD = 0.9
@@ -45,7 +45,7 @@ class BaselinePlanner:
         self._temporal_blend = float(np.clip(config.baseline_temporal_blend, 0.0, 1.0))
         self._max_shift_m = float(max(config.baseline_max_shift_m, 0.0))
         self._camera = camera or CameraModel(
-            config.segmentation_camera, config.preprocess_width, config.preprocess_height
+            config.camera, config.preprocess_width, config.preprocess_height
         )
         self._prev: np.ndarray | None = None
 

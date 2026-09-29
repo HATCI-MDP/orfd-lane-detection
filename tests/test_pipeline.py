@@ -2,34 +2,27 @@
 
 import time
 from contextlib import ExitStack
-from dataclasses import replace
 from unittest.mock import patch
 
 import numpy as np
 import pytest
 
 from offroad_autonomy.types import (
+    CameraFrame,
     ControlCommand,
-    DepthResult,
     FramePacket,
     PathPlan,
     PerceptionResult,
     PipelineConfig,
     PipelineStepResult,
     StabilizedResult,
-    StereoFramePair,
-    TerrainAnalysis,
     VehicleState,
 )
 
-H, W = 360, 640
+H, W = 465, 720
 
 
 def _make_config(**overrides) -> PipelineConfig:
-    # Inline stereo keeps these tests deterministic; the async worker has
-    # its own tests below and in test_stereo_worker.py.
-    overrides.setdefault("stereo_async", False)
-    overrides.setdefault("stereo_rate_hz", 0.0)
     return PipelineConfig(
         model_weights="dummy.pt",
         preprocess_width=W,
@@ -74,63 +67,29 @@ def _wire(mocks):
     return packet, perception, stabilized, plan, command
 
 
-def _pair(**overrides) -> StereoFramePair:
+def _capture(**overrides) -> CameraFrame:
     frame = np.zeros((620, 960, 3), dtype=np.uint8)
     fields = {
-        "left": frame,
-        "right": frame.copy(),
+        "image": frame,
         "timestamp": time.perf_counter(),
         "frame_id": 1,
-        "synchronized": True,
         "is_new": True,
     }
     fields.update(overrides)
-    return StereoFramePair(**fields)
+    return CameraFrame(**fields)
 
 
-def _depth_result() -> DepthResult:
-    return DepthResult(
-        depth_m=np.ones((H, W), dtype=np.float32),
-        valid=np.ones((H, W), dtype=bool),
-        points_vehicle=np.zeros((H, W, 3), dtype=np.float32),
-        cloud_vehicle=np.zeros((10, 3), dtype=np.float32),
-    )
-
-
-def _terrain(clearance: float = 5.0) -> TerrainAnalysis:
-    zeros = np.zeros((H, W), dtype=np.float32)
-    return TerrainAnalysis(
-        height_above_ground=zeros,
-        slope_rad=zeros,
-        obstacle_mask=np.zeros((H, W), dtype=bool),
-        clearance_m=zeros,
-        traversability=zeros,
-        valid=np.zeros((H, W), dtype=bool),
-        min_forward_clearance_m=clearance,
-    )
-
-
-def _pipeline_with_stereo(stack, config, depth=None, terrain=None):
-    """Build a pipeline with mocked stages and mocked stereo/terrain."""
+def _pipeline(stack, config):
     mocks = [stack.enter_context(patch(target)) for target in _STAGE_PATCHES]
-    MockDepth = stack.enter_context(patch("offroad_autonomy.pipeline.StereoDepthEstimator"))
-    MockTerrain = stack.enter_context(patch("offroad_autonomy.pipeline.TerrainAnalyzer"))
     outputs = _wire(mocks)
-    if depth is None:
-        depth = _depth_result()
-    if terrain is None:
-        terrain = _terrain()
-    MockDepth.return_value.compute.return_value = depth
-    MockTerrain.return_value.analyze.return_value = terrain
-
     from offroad_autonomy.pipeline import AutonomyPipeline
 
-    return AutonomyPipeline(config), mocks, MockDepth, MockTerrain, outputs
+    return AutonomyPipeline(config), mocks, outputs
 
 
 def test_pipeline_step_produces_control_command():
     with ExitStack() as stack:
-        pipeline, mocks, _, _, _ = _pipeline_with_stereo(stack, _make_config())
+        pipeline, mocks, _ = _pipeline(stack, _make_config())
         command = pipeline.step(np.zeros((620, 960, 3), dtype=np.uint8), VehicleState())
 
         assert isinstance(command, ControlCommand)
@@ -141,10 +100,10 @@ def test_pipeline_step_produces_control_command():
 
 def test_pipeline_step_result_exposes_stage_outputs():
     with ExitStack() as stack:
-        pipeline, _, _, _, outputs = _pipeline_with_stereo(stack, _make_config())
+        pipeline, _, outputs = _pipeline(stack, _make_config())
         packet, _, stabilized, plan, command = outputs
 
-        result = pipeline.step_result(_pair(), VehicleState())
+        result = pipeline.step_result(_capture(), VehicleState())
 
         assert isinstance(result, PipelineStepResult)
         assert result.frame is packet
@@ -155,212 +114,129 @@ def test_pipeline_step_result_exposes_stage_outputs():
         assert "planning" in result.timings_ms
 
 
-def test_segmentation_runs_on_the_configured_camera():
-    """Mode 'right' must hand the right frame - not the left - to perception."""
+@pytest.mark.parametrize(
+    "capture_kwargs",
+    [
+        {},
+        {"is_new": False},
+    ],
+)
+def test_rgb_stage_outputs_reach_control_without_depth(capture_kwargs):
     with ExitStack() as stack:
-        pipeline, mocks, _, _, _ = _pipeline_with_stereo(
-            stack, _make_config(segmentation_mode="right", depth_enabled=False)
-        )
-        left = np.zeros((620, 960, 3), dtype=np.uint8)
-        right = np.full((620, 960, 3), 7, dtype=np.uint8)
+        matcher = stack.enter_context(patch("cv2.StereoSGBM_create"))
+        pipeline, mocks, outputs = _pipeline(stack, _make_config())
+        packet, perception, stabilized, plan, command = outputs
+        capture = _capture(**capture_kwargs)
+        state = VehicleState(speed_mps=4.0)
 
-        pipeline.step_result(_pair(left=left, right=right), VehicleState())
+        assert pipeline.has_input(capture)
+        result = pipeline.step_result(capture, state)
 
-        assert mocks[0].return_value.process.call_args.args[0] is right
+        matcher.assert_not_called()
+        mocks[0].return_value.process.assert_called_once_with(capture.image)
+        mocks[1].return_value.predict.assert_called_once_with(packet, pipeline.valid_roi)
+        mocks[2].return_value.stabilize.assert_called_once_with(perception)
+        mocks[3].return_value.plan.assert_called_once_with(stabilized, vehicle_state=state)
+        mocks[4].return_value.compute.assert_called_once_with(plan, state)
+        assert result.perception is perception
+        assert result.command is command
+        assert set(result.timings_ms) == {
+            "preprocess",
+            "segmentation",
+            "postprocess",
+            "planning",
+            "control",
+        }
+        assert not hasattr(result, "depth")
+        assert not hasattr(pipeline, "stereo_worker")
 
 
-def test_pipeline_runs_depth_when_a_synchronised_pair_is_present():
-    config = _make_config()
+def test_reset_clears_the_remaining_stateful_stages():
     with ExitStack() as stack:
-        mock_fuse = stack.enter_context(patch("offroad_autonomy.pipeline.fuse_rgb_depth"))
-        pipeline, mocks, MockDepth, MockTerrain, outputs = _pipeline_with_stereo(stack, config)
-        mock_fuse.return_value = outputs[1]
-
-        result = pipeline.step_result(_pair(), VehicleState())
-
-        MockDepth.return_value.compute.assert_called_once()
-        MockTerrain.return_value.analyze.assert_called_once()
-        assert MockTerrain.return_value.analyze.call_args.args[0] is result.depth
-        mock_fuse.assert_called_once()
-        assert result.depth_fallback == ""
-        assert result.traversability is not None
-        # The planner must be told about the terrain it is planning over.
-        planner = mocks[3]
-        assert planner.return_value.plan.call_args.kwargs["terrain"] is result.terrain
+        pipeline, mocks, _ = _pipeline(stack, _make_config())
+        pipeline.reset()
+        for mock in mocks[2:]:
+            mock.return_value.reset.assert_called_once_with()
 
 
-def test_stereo_receives_the_original_frames_not_a_derivative():
+def test_missing_dashcam_is_not_accepted():
     with ExitStack() as stack:
-        pipeline, _, MockDepth, _, _ = _pipeline_with_stereo(stack, _make_config())
-        pair = _pair()
-
-        pipeline.step_result(pair, VehicleState())
-
-        args = MockDepth.return_value.compute.call_args.args
-        assert args[0] is pair.left
-        assert args[1] is pair.right
+        pipeline, _, _ = _pipeline(stack, _make_config())
+        capture = _capture(image=None)
+        assert not pipeline.has_input(capture)
+        with pytest.raises(ValueError, match="No frame available"):
+            pipeline.step_result(capture, VehicleState())
 
 
-def test_unsynchronised_pair_skips_stereo_but_not_control():
-    with ExitStack() as stack:
-        pipeline, _, MockDepth, MockTerrain, outputs = _pipeline_with_stereo(stack, _make_config())
+@pytest.mark.parametrize("planner_mode", ["baseline", "advanced"])
+@pytest.mark.parametrize("road_half_width", [120, 300])
+def test_rgb_pipeline_plans_and_controls_in_every_mode(planner_mode, road_half_width):
+    from offroad_autonomy.pipeline import AutonomyPipeline
 
-        result = pipeline.step_result(
-            _pair(synchronized=False, sync_note="only left updated"), VehicleState()
-        )
+    config = _make_config(planner_mode=planner_mode)
 
-        MockDepth.return_value.compute.assert_not_called()
-        MockTerrain.return_value.analyze.assert_not_called()
-        assert result.depth is None
-        assert result.depth_fallback == "warming up"
-        assert result.command is outputs[4]
-
-
-def test_missing_right_frame_still_segments_the_left():
-    with ExitStack() as stack:
-        pipeline, _, MockDepth, _, outputs = _pipeline_with_stereo(stack, _make_config())
-        pair = _pair(right=None, synchronized=False, sync_note="camera missing")
-
-        assert pipeline.has_input(pair)
-        result = pipeline.step_result(pair, VehicleState())
-
-        MockDepth.return_value.compute.assert_not_called()
-        assert result.command is outputs[4]
-
-
-def test_repeated_frames_are_not_matched_again():
-    with ExitStack() as stack:
-        pipeline, _, MockDepth, _, _ = _pipeline_with_stereo(stack, _make_config())
-
-        pipeline.step_result(_pair(), VehicleState())
-        pipeline.step_result(_pair(is_new=False), VehicleState())
-
-        assert MockDepth.return_value.compute.call_count == 1
-
-
-def test_pipeline_skips_geometry_when_stereo_returns_nothing():
-    with ExitStack() as stack:
-        pipeline, _, MockDepth, MockTerrain, outputs = _pipeline_with_stereo(stack, _make_config())
-        MockDepth.return_value.compute.return_value = None
-
-        result = pipeline.step_result(_pair(), VehicleState())
-
-        MockTerrain.return_value.analyze.assert_not_called()
-        assert result.terrain is None
-        assert result.command is outputs[4]
-
-
-def test_stale_depth_is_not_used():
-    with ExitStack() as stack:
-        pipeline, mocks, _, _, _ = _pipeline_with_stereo(stack, _make_config(stereo_max_age_s=0.05))
-        old = _pair(timestamp=time.perf_counter() - 1.0)
-
-        result = pipeline.step_result(old, VehicleState())
-
-        assert result.depth is None
-        assert result.depth_fallback == "stale"
-        assert mocks[3].return_value.plan.call_args.kwargs["terrain"] is None
-
-
-def test_clearance_is_discounted_by_distance_driven_since_capture():
-    with ExitStack() as stack:
-        pipeline, mocks, _, _, _ = _pipeline_with_stereo(
-            stack, _make_config(stereo_max_age_s=1.0), terrain=_terrain(clearance=10.0)
-        )
-        pair = _pair(timestamp=time.perf_counter() - 0.2)
-
-        result = pipeline.step_result(pair, VehicleState(speed_mps=10.0))
-
-        planned = mocks[3].return_value.plan.call_args.kwargs["terrain"]
-        # ~0.2 s at 10 m/s = ~2 m closer than the stereo frame reported.
-        assert planned.min_forward_clearance_m == pytest.approx(8.0, abs=0.3)
-        assert result.traversability.forward_clearance_m == pytest.approx(
-            planned.min_forward_clearance_m
+    def segment(frame, valid_roi):
+        mask = np.zeros((frame.height, frame.width), dtype=bool)
+        middle = frame.width // 2
+        mask[frame.height // 2 :, middle - road_half_width : middle + road_half_width] = True
+        mask &= valid_roi
+        return PerceptionResult(
+            mask=mask,
+            confidences=[0.9],
+            num_detections=1,
+            valid_roi=valid_roi,
+            road_fraction=float(mask.sum() / valid_roi.sum()),
         )
 
-
-def test_async_stereo_never_blocks_the_control_loop():
-    """A slow stereo computation must not add to the loop's latency."""
-    config = _make_config(stereo_async=True)
-    with ExitStack() as stack:
-        pipeline, _, MockDepth, _, outputs = _pipeline_with_stereo(stack, config)
-
-        def slow_compute(*args, **kwargs):
-            time.sleep(0.3)
-            return _depth_result()
-
-        MockDepth.return_value.compute.side_effect = slow_compute
-        try:
-            t0 = time.perf_counter()
-            first = pipeline.step_result(_pair(frame_id=1), VehicleState())
-            elapsed = time.perf_counter() - t0
-
-            assert elapsed < 0.1
-            assert first.depth is None
-            assert first.depth_fallback == "warming up"
-            assert first.command is outputs[4]
-
-            deadline = time.perf_counter() + 3.0
-            while pipeline.stereo_worker.latest() is None and time.perf_counter() < deadline:
-                time.sleep(0.01)
-            later = pipeline.step_result(_pair(frame_id=2), VehicleState())
-            assert later.depth is not None
-        finally:
-            pipeline.close()
-
-
-def test_depth_disabled_config_skips_the_stereo_stage_entirely():
-    config = _make_config(depth_enabled=False)
-
-    with ExitStack() as stack:
-        for target in _STAGE_PATCHES:
-            stack.enter_context(patch(target))
-        MockDepth = stack.enter_context(patch("offroad_autonomy.pipeline.StereoDepthEstimator"))
-
-        from offroad_autonomy.pipeline import AutonomyPipeline
-
+    with patch("offroad_autonomy.pipeline.RoadSegmenter") as segmenter:
+        segmenter.return_value.predict.side_effect = segment
         pipeline = AutonomyPipeline(config)
+        result = pipeline.step_result(_capture(), VehicleState(speed_mps=1.0))
 
-        MockDepth.assert_not_called()
-        assert pipeline.depth_estimator is None
-        assert pipeline.stereo_worker is None
+    assert not result.plan.fallback_active, result.plan.fallback_reason
+    assert len(result.plan.centerline) >= 2
+    assert result.plan.min_clearance_m == float("inf")
+    assert np.isfinite(result.command.steering)
+    assert result.command.throttle > 0.0
+    assert result.command.debug is not None
+    assert result.stabilized.mask.shape == pipeline.valid_roi.shape
+    # A symmetric road must not produce a turn around the hood's silhouette.
+    np.testing.assert_allclose(result.plan.centerline[:, 0], W / 2, atol=8)
+    assert abs(result.command.steering) < 0.1
 
 
-def test_invalid_rig_disables_depth_without_killing_the_pipeline():
-    """A bad camera config must degrade to mono, not crash on start-up."""
-    config = _make_config()
+def test_dashboard_telemetry_uses_only_rgb_and_display_runtime():
+    from offroad_autonomy.main import _build_dashboard_telemetry, _log_runtime
+    from offroad_autonomy.runtime.display_worker import DisplayWorker
 
     with ExitStack() as stack:
-        for target in _STAGE_PATCHES:
-            stack.enter_context(patch(target))
-        stack.enter_context(
-            patch(
-                "offroad_autonomy.pipeline.StereoDepthEstimator",
-                side_effect=ValueError("optical axes"),
-            )
+        pipeline, _, _ = _pipeline(stack, _make_config())
+        state = VehicleState(speed_mps=1.0)
+        result = pipeline.step_result(_capture(), state)
+        display = DisplayWorker(
+            render=lambda state: state.result.frame.raw,
+            show=lambda frame: True,
+            read_key=lambda: -1,
         )
+        telemetry = _build_dashboard_telemetry(
+            state, result.command, result, result.plan, pipeline, True, True, display
+        )
+        _log_runtime(pipeline, display)
 
-        from offroad_autonomy.pipeline import AutonomyPipeline
-
-        pipeline = AutonomyPipeline(config)
-
-        assert pipeline.depth_estimator is None
-        assert pipeline.terrain_analyzer is None
-        assert pipeline.stereo_worker is None
+    assert telemetry.fallback_state == "NONE"
+    assert "AUTONOMY LOOP" in telemetry.timing_lines
+    assert "DASHBOARD" in telemetry.timing_lines
+    assert all("stereo" not in line.lower() for line in telemetry.timing_lines)
 
 
-def test_stitched_mode_needs_both_frames():
-    config = _make_config(segmentation_mode="stitched", depth_enabled=False)
+def test_dashcam_geometry_and_capture_reach_all_stages():
     with ExitStack() as stack:
-        pipeline, _, _, _, _ = _pipeline_with_stereo(stack, config)
-
-        assert pipeline.has_input(_pair())
-        assert not pipeline.has_input(_pair(right=None))
-        # The stitched view is wider than one camera, never narrower.
-        assert pipeline.view.size[0] >= W
-        assert pipeline.valid_roi.shape == (pipeline.view.size[1], pipeline.view.size[0])
-
-
-def test_invalid_segmentation_mode_is_refused():
-    with ExitStack() as stack, pytest.raises(ValueError, match="segmentation"):
-        _pipeline_with_stereo(stack, replace(_make_config(), segmentation_mode="center"))
+        cfg = _make_config()
+        pipeline, mocks, _ = _pipeline(stack, cfg)
+        capture = _capture()
+        result = pipeline.step_result(capture, VehicleState())
+        assert result.capture is capture
+        assert pipeline.view.camera.spec is cfg.camera
+        assert mocks[3].call_args.kwargs["camera"] is pipeline.view.camera
+        assert mocks[4].call_args.kwargs["camera"] is pipeline.view.camera
+        assert mocks[0].return_value.process.call_args.args[0] is capture.image

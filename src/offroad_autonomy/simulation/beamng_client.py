@@ -15,10 +15,10 @@ import cv2
 import numpy as np
 
 from offroad_autonomy.types import (
+    CameraFrame,
     CameraSpec,
     ControlCommand,
     PipelineConfig,
-    StereoFramePair,
     VehicleState,
 )
 
@@ -35,7 +35,7 @@ class BeamNGClient:
         self._vehicle = None
         self._cameras: dict[str, object] = {}
         self._frame_id = 0
-        self._last_signatures: tuple[int | None, int | None] = (None, None)
+        self._last_signature: int | None = None
         self._shared_memory = config.beamng_camera_transport == "shared_memory"
 
     def connect(self) -> None:
@@ -67,45 +67,28 @@ class BeamNGClient:
         self._bng.scenario.load(scenario)
         self._bng.scenario.start()
         vehicle.connect(self._bng)
+        self._vehicle = vehicle
+        # Hold the spawn while sensors settle. In arcade mode the service
+        # brake doubles as reverse, so use only the parking brake here.
+        vehicle.control(throttle=0, brake=0, parkingbrake=1)
 
         # Cameras attached while the vehicle is still dropping onto the terrain
         # render a bouncing horizon that the first plans would steer on.
         time.sleep(_PHYSICS_SETTLE_S)
 
-        sensor = cfg.left_camera.sensor
-        rig = cfg.stereo_rig
+        spec = cfg.camera
+        self._cameras["dashcam"] = self._attach_camera(Camera, vehicle, spec)
         logger.info(
-            "Attaching stereo pair (%s): %s  baseline=%.2f m  pitch=%.1f deg  toe-out=%.1f deg",
-            cfg.beamng_camera_transport,
-            sensor.describe(),
-            rig.baseline_m,
-            rig.pitch_deg,
-            rig.toe_out_deg,
+            "Attaching dashcam (%s): %s", cfg.beamng_camera_transport, spec.sensor.describe()
         )
-        for role, spec in (("left", cfg.left_camera), ("right", cfg.right_camera)):
-            self._cameras[role] = self._attach_camera(Camera, vehicle, spec)
-            logger.info(
-                "  %-7s %-12s pos=%s dir=%s",
-                role,
-                spec.name,
-                tuple(round(v, 3) for v in spec.pos),
-                tuple(round(v, 3) for v in spec.dir),
-            )
-
-        # Attached last and never read by capture_pair(), so nothing in the
-        # perception path can reach it even by accident.
-        if cfg.display_rig.enabled and not cfg.ui_headless:
-            spec = cfg.display_camera
-            self._cameras["display"] = self._attach_camera(Camera, vehicle, spec)
-            logger.info("Attaching display-only camera: %s", spec.sensor.describe())
         time.sleep(_SENSOR_WARMUP_S)
 
-        self._vehicle = vehicle
+        self.release_park()
         logger.info("BeamNG session ready")
 
     def _attach_camera(self, camera_cls, vehicle, spec: CameraSpec):
         # beamngpy takes the vertical field of view; handing it the
-        # horizontal one would silently widen the lens and skew every depth.
+        # horizontal one would silently widen the lens and skew path projection.
         # Streaming is only available over shared memory, which a remote
         # client cannot map, so socket transport polls instead.
         return camera_cls(
@@ -127,62 +110,22 @@ class BeamNGClient:
             is_streaming=self._shared_memory,
         )
 
-    def capture_pair(self) -> StereoFramePair | None:
-        """One left/right capture, judged for synchronisation.
-
-        BeamNG exposes no per-frame timestamp, so "same simulation step" is
-        enforced from this side: both cameras share update time and priority,
-        both buffers are read back to back, and a signature of each live
-        buffer before and after the reads catches a render landing mid-read.
-        Such a pair is re-read once, then flagged. A flagged pair still drives
-        segmentation; only stereo skips it.
-        """
-        pair = self._read_pair()
-        if pair is not None and pair.sync_note == "changed during read":
-            pair = self._read_pair()
-        return pair
-
-    def capture_display(self) -> np.ndarray | None:
-        """Called only from the dashboard thread, and deliberately separate
-        from ``capture_pair`` so no code path can hand this frame to
-        perception."""
-        if "display" not in self._cameras:
+    def capture_frame(self) -> CameraFrame | None:
+        # Copy shared memory before decoding so display and inference keep
+        # the same immutable snapshot even when BeamNG renders again.
+        buffer = self._live_buffer("dashcam")
+        if buffer is None:
             return None
-        return self._decode(self._live_buffer("display"), self._config.display_camera)
-
-    def _read_pair(self) -> StereoFramePair | None:
-        cfg = self._config
-        left_buf = self._live_buffer("left")
-        right_buf = self._live_buffer("right")
-        if left_buf is None and right_buf is None:
+        timestamp = time.perf_counter()
+        snapshot = bytes(buffer)
+        image = self._decode(snapshot, self._config.camera)
+        if image is None:
             return None
-
-        t0 = time.perf_counter()
-        sig_l0 = frame_signature(left_buf)
-        sig_r0 = frame_signature(right_buf)
-        left = self._decode(left_buf, cfg.left_camera)
-        right = self._decode(right_buf, cfg.right_camera)
-        sig_l1 = frame_signature(left_buf)
-        sig_r1 = frame_signature(right_buf)
-        t1 = time.perf_counter()
-
+        signature = frame_signature(snapshot)
+        is_new = signature != self._last_signature
+        self._last_signature = signature
         self._frame_id += 1
-        return judge_pair_sync(
-            left,
-            right,
-            before=(sig_l0, sig_r0),
-            after=(sig_l1, sig_r1),
-            previous=self._last_signatures,
-            read_skew_ms=(t1 - t0) * 1000.0,
-            max_skew_ms=cfg.sync_max_read_skew_ms,
-            require_both_new=cfg.sync_require_both_new,
-            frame_id=self._frame_id,
-            timestamp=t0,
-            on_accept=self._accept_signatures,
-        )
-
-    def _accept_signatures(self, signatures: tuple[int | None, int | None]) -> None:
-        self._last_signatures = signatures
+        return CameraFrame(image=image, timestamp=timestamp, frame_id=self._frame_id, is_new=is_new)
 
     def _live_buffer(self, role: str):
         camera = self._cameras.get(role)
@@ -216,11 +159,13 @@ class BeamNGClient:
 
     def get_vehicle_state(self) -> VehicleState:
         if self._vehicle is None:
-            return VehicleState()
+            return VehicleState(valid=False)
 
         try:
             self._vehicle.sensors.poll()
             st = self._vehicle.state
+            if not all(key in st for key in ("pos", "vel", "rotation")):
+                return VehicleState(valid=False)
             pos = tuple(st.get("pos", (0, 0, 0)))
             rot = tuple(st.get("rotation", (0, 0, 0, 1)))
             vel = tuple(st.get("vel", (0, 0, 0)))
@@ -234,10 +179,9 @@ class BeamNGClient:
                 heading_rad=yaw,
             )
         except Exception as exc:
-            # A zero state reads as "stopped", which makes the controller
-            # cautious rather than letting one dropped poll end the session.
+            # Do not let a failed poll masquerade as a stationary vehicle.
             logger.debug("State poll failed: %s", exc)
-            return VehicleState()
+            return VehicleState(valid=False)
 
     def send_controls(self, cmd: ControlCommand) -> None:
         if self._vehicle is None:
@@ -252,6 +196,24 @@ class BeamNGClient:
     def release_park(self) -> None:
         if self._vehicle is None:
             return
+        # This stack only plans forward motion. Arcade shifting turns a held
+        # brake into reverse throttle at standstill, including a gate stop.
+        # Configure on every resume as well, since an operator may have used R.
+        self._vehicle.control(throttle=0, brake=0, parkingbrake=1)
+        self._vehicle.set_shift_mode("realistic_automatic")
+        gearbox_type = self._vehicle.queue_lua_command(
+            'return powertrain.getDevice("gearbox").type',
+            response=True,
+        )
+        # These are shifter positions: 1 selects first on a manual but P on
+        # an automatic; 2 selects D. Direct selection also works from R.
+        if gearbox_type in ("manualGearbox", "sequentialGearbox"):
+            forward_gear = 1
+        elif gearbox_type in ("automaticGearbox", "dctGearbox", "cvtGearbox"):
+            forward_gear = 2
+        else:
+            raise RuntimeError(f"Unsupported forward-drive gearbox: {gearbox_type!r}")
+        self._vehicle.control(gear=forward_gear)
         self._vehicle.control(steering=0, throttle=0, brake=0, parkingbrake=0)
         # control() alone leaves the Lua input filter holding the parking
         # brake that park() set through it.
@@ -264,11 +226,10 @@ class BeamNGClient:
         if self._vehicle is None:
             return
         self._vehicle.control(steering=0, throttle=0, brake=1, parkingbrake=1)
-        # Brakes alone let the vehicle roll on a slope for seconds; zeroing
-        # the velocity makes a safe stop immediate.
+        # Apply the stop through the input filter too. The old self:setVelocity
+        # call is invalid in vehicle Lua and prevented these inputs executing.
         try:
             self._vehicle.queue_lua_command(
-                "self:setVelocity(vec3(0,0,0)); "
                 'input.event("throttle", 0, FILTER_DIRECT, 0); '
                 'input.event("brake", 1, FILTER_DIRECT, 0); '
                 'input.event("parkingbrake", 1, FILTER_DIRECT, 0)'
@@ -347,53 +308,3 @@ def frame_signature(buffer) -> int | None:
         return None
     sample = np.frombuffer(buffer, dtype=np.uint8)[::997]
     return zlib.crc32(sample.tobytes())
-
-
-def judge_pair_sync(
-    left: np.ndarray | None,
-    right: np.ndarray | None,
-    before: tuple[int | None, int | None],
-    after: tuple[int | None, int | None],
-    previous: tuple[int | None, int | None],
-    read_skew_ms: float,
-    max_skew_ms: float,
-    require_both_new: bool,
-    frame_id: int,
-    timestamp: float,
-    on_accept=None,
-) -> StereoFramePair:
-    """Free of simulator objects so the sync rules are unit-testable."""
-    new_left = before[0] != previous[0]
-    new_right = before[1] != previous[1]
-
-    synchronized = True
-    note = ""
-    if left is None or right is None:
-        synchronized = False
-        note = "camera missing"
-    elif before != after:
-        synchronized = False
-        note = "changed during read"
-    elif read_skew_ms > max_skew_ms:
-        synchronized = False
-        note = f"read skew {read_skew_ms:.1f} ms"
-    elif require_both_new and new_left != new_right:
-        synchronized = False
-        if new_left:
-            note = "only left updated"
-        else:
-            note = "only right updated"
-
-    if synchronized and on_accept is not None:
-        on_accept(before)
-
-    return StereoFramePair(
-        left=left,
-        right=right,
-        timestamp=timestamp,
-        frame_id=frame_id,
-        synchronized=synchronized,
-        read_skew_ms=read_skew_ms,
-        is_new=new_left or new_right,
-        sync_note=note,
-    )

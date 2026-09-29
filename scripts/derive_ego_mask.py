@@ -1,34 +1,8 @@
 #!/usr/bin/env python3
-"""Derive each camera's ego-vehicle silhouette from the vehicle's own geometry.
+"""Derive the dashcam ego exclusion from the Hopper body geometry.
 
-The polygons in ``configs/default.yaml`` are not hand-drawn: they come from
-ray-casting the Hopper's front bumper and hood deck through each configured
-camera and simplifying the silhouette. That makes them reproducible, and it
-makes them *wrong* the moment a camera moves - so re-run this after changing
-``beamng.cameras.stereo_rig`` or ``beamng.cameras.visualization`` and paste
-the result back.
-
-    python scripts/derive_ego_mask.py [--config configs/default.yaml]         [--camera left|right|display|pair|all]
-
-The two kinds of camera use the answer differently:
-
-* **left / right** are the perception pair. A silhouette here is a genuine
-  exclusion - those pixels are not terrain and nothing may be concluded from
-  them. From the front-bumper mount there is no silhouette at all, which is
-  the point of that mount, and the script says so instead of failing.
-* **display** is the visualization camera, which computes nothing. Its
-  silhouette is only a drawing clip, so the reprojected road mask is not
-  painted over the bonnet. It goes under ``visualization.overlay_clip``.
-
-The fit is deliberately tight: a 1 px margin, a small closing kernel and a
-fine simplification tolerance, then a check that the polygon still covers
-the whole silhouette. The earlier 2 px margin, 31 px closing and 4 px
-tolerance rounded the hood outline outward and threw away road beside it.
-
-The body model is the h1..h4 node rows of ``hopper_hood.jbeam`` (the ant*
-nodes there are a whip antenna, not bodywork) plus the cowl running back to
-the windshield base, and the front bumper's fb1/fb3 rows from
-``hopper_bumper_F.jbeam`` - which is what a low forward mount has to clear.
+Re-run after changing beamng.camera mount or sensor settings and put the
+polygon under beamng.camera.ego_mask in configs/default.yaml.
 """
 
 from __future__ import annotations
@@ -151,9 +125,7 @@ def derive(spec, width: int, height: int, args, key: str) -> None:
 
     polygon = to_polygon(mask, args.margin_px, args.epsilon, args.close_px)
     if len(polygon) < 3:
-        # The mount clears the vehicle entirely. For the perception pair this
-        # is the desired outcome, not a failure: there is nothing to exclude,
-        # so every pixel is valid and the near-field road is kept whole.
+        # A mount ahead of the body may need no exclusion.
         print("#   -> no bodywork in frame; nothing to exclude")
         print(f"      {key}:")
         print("        enabled: false")
@@ -176,47 +148,16 @@ def derive(spec, width: int, height: int, args, key: str) -> None:
     print()
 
 
-#: Which config key each camera's polygon belongs under. The display camera's
-#: is an overlay clip, not an exclusion, and the name keeps that straight.
-_KEYS = {"left": "ego_mask", "right": "ego_mask", "display": "overlay_clip"}
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/default.yaml")
-    parser.add_argument(
-        "--camera",
-        choices=("left", "right", "display", "pair", "all", "both"),
-        default="all",
-    )
     parser.add_argument("--margin-px", type=int, default=1)
     parser.add_argument("--epsilon", type=float, default=2.0)
     parser.add_argument("--close-px", type=int, default=5)
     args = parser.parse_args()
 
     config = load_config(args.config)
-    groups = {
-        "all": ("left", "right", "display"),
-        "pair": ("left", "right"),
-        "both": ("left", "right"),
-    }
-    sides = groups.get(args.camera, (args.camera,))
-    specs = {
-        "left": config.left_camera,
-        "right": config.right_camera,
-        "display": config.display_camera,
-    }
-    for side in sides:
-        spec = specs[side]
-        # Each camera is evaluated on its own grid: the pair on the perception
-        # working size, the display camera on its own, since a polygon is
-        # normalised to the frame it was derived in.
-        if side == "display":
-            width, height = spec.width, spec.height
-        else:
-            width, height = config.preprocess_width, config.preprocess_height
-        print(f"# --- {side} ---")
-        derive(spec, width, height, args, _KEYS[side])
+    derive(config.camera, config.preprocess_width, config.preprocess_height, args, "ego_mask")
 
 
 if __name__ == "__main__":

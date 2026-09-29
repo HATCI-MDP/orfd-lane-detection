@@ -1,20 +1,19 @@
 # Off-Road Autonomy
 
 Autonomous off-road driving in BeamNG.tech: a YOLOE-26 model segments the drivable trail,
-stereo depth vetoes obstacles, a planner fits a centreline on the ground, and a Stanley
-controller steers. The single idea behind the design is that the control loop never waits
-for anything slow: stereo and the dashboard run on their own threads, and missing depth
-costs accuracy, never control.
+a planner fits a centreline on the ground, and a Stanley controller steers. The single
+idea behind the design is that the control loop never waits for anything slow: the
+dashboard runs on its own thread. Perception uses RGB only.
 
 ## Architecture
 
 Keep these boundaries clear:
 
 - `simulation/`: all BeamNG I/O. The only package that imports `beamngpy`.
-- `perception/`: segmentation, stereo rectification and depth, terrain, fusion.
+- `perception/`: segmentation, camera geometry, ego masking.
 - `planning/`: the perception gate, then the baseline or advanced planner.
 - `control/`: Stanley steering and the speed law, all computed in metres on the ground.
-- `runtime/`: the stereo and dashboard worker threads, timing, benchmarks.
+- `runtime/`: the dashboard worker thread, timing, benchmarks.
 - `visualization/`: the operator dashboard and window.
 - `pipeline.py` orders the stages; `main.py` owns the loop, safe stop and shutdown.
 
@@ -22,12 +21,11 @@ Rules that carry weight:
 
 - Nothing outside `simulation/` may import `beamngpy`, so the stack stays testable without
   a simulator.
-- The display camera must never reach `AutonomyPipeline`, `PerceptionView` or
-  `build_camera_models`; it is drawn on, never computed from.
+- The single GMSL2 dashcam supplies every stage. The dashboard consumes the same
+  inference snapshot and never captures a separate image.
 - `perception/__init__.py` must never import `RoadSegmenter`, because that pulls in Torch
   and Ultralytics for code that only needs geometry.
-- The control loop must never block on the stereo worker or the dashboard.
-- Only triangulated pixels may raise an obstacle; ground-plane-inferred pixels never can.
+- The control loop must never block on the dashboard.
 - Every tuning value lives in `configs/default.yaml` with its reason next to it, not as a
   literal in code.
 

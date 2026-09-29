@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import math
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -26,6 +27,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from offroad_autonomy.control.mpc_controller import MPCController
 from offroad_autonomy.control.stanley_controller import StanleyController
 from offroad_autonomy.perception.camera_geometry import CameraModel
 from offroad_autonomy.types import PathPlan, PipelineConfig, VehicleState
@@ -119,7 +121,7 @@ def trail_mask(
     poly = np.vstack([edges[0], edges[1][::-1]])
     cv2.fillPoly(mask, [np.round(poly).astype(np.int32)], 1)
     mask[:roi_top] = 0
-    # Real masks are full of small holes (depth vetoes, specks); an edge
+    # Real masks are full of small holes (segmentation misses, specks); an edge
     # estimator that reads a hole as the trail edge fails in BeamNG.
     if rng is not None:
         for _ in range(holes):
@@ -145,6 +147,8 @@ def simulate(
     delay_frames: int = 2,
     steer_rate_per_s: float = 0.9,
     trail_width: float = 6.0,
+    completion_margin_m: float = 0.0,
+    start_lateral_m: float = 0.0,
 ) -> SimResult:
     """Closed loop on an S-bend.
 
@@ -154,10 +158,9 @@ def simulate(
     redone on a new mask every frame), not just per-point noise.
     """
     rng = np.random.default_rng(seed)
-    camera = CameraModel(
-        config.segmentation_camera, config.preprocess_width, config.preprocess_height
-    )
-    controller = StanleyController(config, camera=camera)
+    camera = CameraModel(config.camera, config.preprocess_width, config.preprocess_height)
+    cls = MPCController if config.controller == "mpc" else StanleyController
+    controller = cls(config, camera=camera)
     road = s_bend(radius)
     tangent = np.gradient(road, axis=0)
     tangent /= np.linalg.norm(tangent, axis=1, keepdims=True)
@@ -168,7 +171,7 @@ def simulate(
     max_wheel = math.radians(config.max_wheel_angle_deg)
     cam_ahead = 1.4  # camera ahead of the rear-axle reference point (m)
 
-    x, y, yaw, v = 0.0, 0.0, start_yaw, start_speed
+    x, y, yaw, v = 0.0, start_lateral_m, start_yaw, start_speed
     # Commands reach the wheel `delay_frames` late (capture -> actuation), then
     # BeamNG slews steering_input at ~0.9/s (measured on the Hopper: 0 -> 0.6
     # in ~0.7 s, with <0.1 s of pure delay).
@@ -183,8 +186,9 @@ def simulate(
         r = d[:, 0] * math.sin(yaw) - d[:, 1] * math.cos(yaw)
         nearest = int(np.argmin(np.hypot(d[:, 0], d[:, 1])))
         err_now = float(np.hypot(d[nearest, 0], d[nearest, 1]))
+        heading_error_now = float(math.atan2(tangent[nearest, 1], tangent[nearest, 0]) - yaw)
         max_err = max(max_err, err_now)
-        if nearest >= len(road) - 5:
+        if nearest >= len(road) - 5 - int(completion_margin_m / 0.1):
             return _finish(log, max_err, lock_frames, True, trail_width)
         ahead = np.arange(nearest, len(road))
         vis = ahead[(f[ahead] > 1.0) & (f[ahead] < visible_m)]
@@ -209,7 +213,12 @@ def simulate(
                 )
                 plan.roi_top = roi_top
 
+        if isinstance(controller, MPCController):
+            # Simulation time advances even though this loop runs faster than real time.
+            controller.last_time = time.perf_counter() - dt
+        control_started = time.perf_counter()
         cmd = controller.compute(plan, VehicleState(speed_mps=v))
+        control_ms = (time.perf_counter() - control_started) * 1000
         # Bicycle model with the PREVIOUS command (latency), + = right.
         step = steer_rate_per_s * dt
         wheel_cmd += float(np.clip(pending[0] - wheel_cmd, -step, step))
@@ -238,6 +247,11 @@ def simulate(
                 "la": dbg.lookahead_m,
                 "sat": dbg.saturation,
                 "reason": dbg.speed_reason,
+                "heading_truth": heading_error_now,
+                "control_ms": control_ms,
+                "solve_ms": dbg.mpc_solve_ms,
+                "fallback": dbg.controller_fallback,
+                "solver_success": dbg.solver_success,
             }
         )
     return _finish(log, max_err, lock_frames, False, trail_width)

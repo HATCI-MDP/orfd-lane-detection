@@ -1,7 +1,6 @@
 """Entry point: connect to BeamNG and run the autonomy loop until stopped.
 
-Stereo depth and the dashboard each run on their own thread, so this loop
-never waits for either.
+The dashboard runs on its own thread, so this loop never waits for it.
 """
 
 from __future__ import annotations
@@ -15,18 +14,15 @@ from pathlib import Path
 
 import numpy as np
 
-from offroad_autonomy.perception.camera_geometry import CameraModel
-from offroad_autonomy.perception.ego_mask import EgoMask
 from offroad_autonomy.pipeline import AutonomyPipeline
 from offroad_autonomy.runtime.benchmark import BenchmarkRecorder
 from offroad_autonomy.runtime.display_worker import DisplayState, DisplayWorker
-from offroad_autonomy.runtime.timing import DISPLAY_STAGES, MAIN_STAGES, STEREO_STAGES
+from offroad_autonomy.runtime.timing import DISPLAY_STAGES, MAIN_STAGES
 from offroad_autonomy.simulation.beamng_client import BeamNGClient
 from offroad_autonomy.types import (
-    DEBUG_VIEWS,
+    DEBUG_VIEW_KEYS,
     ControlCommand,
     PathPlan,
-    PipelineConfig,
     PipelineStepResult,
     VehicleState,
 )
@@ -36,7 +32,6 @@ from offroad_autonomy.visualization import (
     AutonomyDashboard,
     DashboardTelemetry,
     DashboardWindow,
-    GroundProjector,
 )
 
 logger = logging.getLogger("offroad_autonomy.main")
@@ -52,8 +47,6 @@ _STUCK_TIME_S = 3.0
 _MANUAL_STEER = 0.4
 _MANUAL_THROTTLE = 0.25
 _MANUAL_BRAKE = 0.35
-
-_DEPTH_STATES = {"": "LIVE", "stale": "STALE", "warming up": "WARMING UP", "off": "OFF"}
 
 _SAFE_STOP_COMMAND = ControlCommand(steering=0.0, throttle=0.0, brake=0.0, parkingbrake=1.0)
 
@@ -172,11 +165,9 @@ def _build_dashboard_telemetry(
     display: DisplayWorker,
 ) -> DashboardTelemetry:
     main_stats = pipeline.stats
-    stereo_stats = pipeline.stereo_stats
     primary = main_stats.stage("primary_loop")
     kalman = bool(plan is not None and plan.kalman_active)
 
-    depth_state = _DEPTH_STATES.get(result.depth_fallback, result.depth_fallback.upper())
     # Read the gate off the pipeline's own plan, not ``plan``: that one is
     # withheld under safe stop, which would hide the gate exactly when the
     # stack has given up.
@@ -190,15 +181,11 @@ def _build_dashboard_telemetry(
             fallback.append("GATE STOP")
     if kalman:
         fallback.append("KALMAN")
-    if depth_state in ("STALE", "WARMING UP"):
-        fallback.append("NO DEPTH")
+    if command.debug is not None and command.debug.controller_fallback:
+        fallback.append("MPC FALLBACK")
     fallback_state = "NONE"
     if fallback:
         fallback_state = " + ".join(fallback)
-
-    sync_ok = True
-    if result.frames is not None:
-        sync_ok = result.frames.synchronized
 
     telemetry = DashboardTelemetry(
         speed_mph=state.speed_mps * _MPH_PER_MPS,
@@ -216,33 +203,14 @@ def _build_dashboard_telemetry(
         ego_coverage=pipeline.ego_coverage,
         segmentation_mode=pipeline.view.mode,
         fallback_state=fallback_state,
-        depth_active=result.depth is not None,
-        depth_state=depth_state,
-        depth_age_ms=result.depth_age_s * 1000.0,
-        sync_ok=sync_ok,
+        fallback_reason=result.plan.fallback_reason,
         dashboard_fps=display.fps(),
     )
-
-    depth = result.depth
-    if depth is not None:
-        telemetry.depth_coverage = depth.coverage
-        telemetry.valid_disparity_fraction = depth.valid_disparity_fraction
-        telemetry.median_forward_depth_m = depth.median_forward_depth_m
-        telemetry.min_corridor_depth_m = depth.min_corridor_depth_m
-    if result.terrain is not None:
-        telemetry.min_clearance_m = result.terrain.min_forward_clearance_m
-    if stereo_stats is not None:
-        total = stereo_stats.stage("stereo_total")
-        telemetry.stereo_fps = stereo_stats.fps()
-        telemetry.stereo_latency_ms = total.mean_ms
-        telemetry.stereo_latency_p95_ms = total.p95_ms
 
     if timing_overlay:
         # One heading per thread, so a slow dashboard can never be mistaken
         # for a slow vehicle.
         lines = ["AUTONOMY LOOP"] + main_stats.format_lines(MAIN_STAGES)
-        if stereo_stats is not None:
-            lines += ["", "STEREO WORKER"] + stereo_stats.format_lines(STEREO_STAGES)
         lines += ["", "DASHBOARD"] + display.stats.format_lines(DISPLAY_STAGES)
         telemetry.timing_lines = lines
     return telemetry
@@ -254,14 +222,6 @@ def _log_runtime(pipeline: AutonomyPipeline, display: DisplayWorker | None = Non
         f"autonomy {pipeline.stats.fps():.1f} FPS  primary {primary.mean_ms:.1f}/"
         f"{primary.p95_ms:.1f} ms (mean/p95)"
     )
-    stereo = pipeline.stereo_stats
-    worker = pipeline.stereo_worker
-    if stereo is not None and worker is not None:
-        total = stereo.stage("stereo_total")
-        message += (
-            f" | stereo {stereo.fps():.1f} Hz  {total.mean_ms:.1f}/{total.p95_ms:.1f} ms"
-            f"  (done {worker.completed}, superseded {worker.dropped}, failed {worker.failed})"
-        )
     if display is not None:
         total = display.stats.stage("dashboard_total")
         message += (
@@ -271,9 +231,6 @@ def _log_runtime(pipeline: AutonomyPipeline, display: DisplayWorker | None = Non
     logger.info(message)
     for line in pipeline.stats.format_lines(MAIN_STAGES):
         logger.debug("  %s", line)
-    if stereo is not None:
-        for line in stereo.format_lines(STEREO_STAGES):
-            logger.debug("  %s", line)
     if display is not None:
         for line in display.stats.format_lines(DISPLAY_STAGES):
             logger.debug("  %s", line)
@@ -296,33 +253,6 @@ def _manual_command(held: set[str]) -> ControlCommand:
     if "s" in held:
         return ControlCommand(steering=steer, throttle=0.0, brake=_MANUAL_BRAKE, parkingbrake=0.0)
     return ControlCommand(steering=steer, throttle=0.0, brake=0.0, parkingbrake=0.0)
-
-
-def _build_projector(
-    config: PipelineConfig,
-    pipeline: AutonomyPipeline,
-) -> tuple[GroundProjector | None, np.ndarray | None]:
-    """Homography and overlay clip for drawing on the display camera.
-
-    The display camera is never passed to ``AutonomyPipeline``,
-    ``PerceptionView`` or ``build_camera_models``, so no dashboard setting can
-    put it on the compute path.
-    """
-    if not config.display_rig.enabled:
-        return None, None
-
-    spec = config.display_camera
-    target = CameraModel(spec, spec.width, spec.height)
-    try:
-        projector = GroundProjector(pipeline.view.camera, target)
-    except ValueError as exc:
-        # A display camera aimed at the sky is cosmetic, not a reason to
-        # refuse to drive.
-        logger.error("Display reprojection unavailable: %s", exc)
-        return None, None
-
-    clip = EgoMask(spec.ego_mask).excluded((target.height, target.width))
-    return projector, clip
 
 
 def _open_window(width: int, height: int) -> DashboardWindow | None:
@@ -406,21 +336,18 @@ def main() -> None:
         client.connect()
 
         if not config.ui_headless:
-            projector, display_clip = _build_projector(config, pipeline)
             dashboard = AutonomyDashboard(
                 width=1600,
                 height=900,
                 colors=config.dashboard_colors,
-                sensor=config.left_camera.sensor,
-                projector=projector,
-                display_clip=display_clip,
+                sensor=config.camera.sensor,
             )
             dashboard_window = _open_window(dashboard.width, dashboard.height)
 
         if dashboard_window is not None:
             window = dashboard_window
 
-            def _render(state: DisplayState, frame) -> np.ndarray:
+            def _render(state: DisplayState) -> np.ndarray:
                 return dashboard.render(
                     state.result,
                     state.telemetry,
@@ -428,21 +355,14 @@ def main() -> None:
                     valid_roi=state.valid_roi,
                     debug_view=state.debug_view,
                     timing_overlay=state.timing_overlay,
-                    stitched=state.stitched,
-                    depth_roi=state.depth_roi,
-                    display_frame=frame,
                 )
 
-            capture = None
-            if config.display_rig.enabled:
-                capture = client.capture_display
             # Tkinter's event loop belongs to the thread that built the root
             # window, so only the OpenCV backend can be driven off-thread.
             display = DisplayWorker(
                 render=_render,
                 show=window.show,
                 read_key=lambda: window.last_key,
-                capture=capture,
                 rate_hz=config.ui_display_rate_hz,
                 asynchronous=config.ui_display_async and window.backend == "opencv",
             )
@@ -454,8 +374,8 @@ def main() -> None:
                 )
             display.start()
             logger.info(
-                "Keys: E safe stop, P resume, 0-9 debug view (%s), T timing overlay",
-                " ".join(f"{i}={name}" for i, name in enumerate(DEBUG_VIEWS)),
+                "Keys: E safe stop, P resume, 0/1/6/9 debug view (%s), T timing overlay",
+                " ".join(f"{i}={name}" for i, name in DEBUG_VIEW_KEYS.items()),
             )
         else:
             logger.info("Headless: no dashboard; manual control is unavailable")
@@ -467,21 +387,34 @@ def main() -> None:
         )
         logger.info("Entering main loop - Ctrl+C or SIGTERM to stop")
         t_start = time.perf_counter()
+        last_fresh_capture = t_start
 
         while not _shutdown:
             t_iter = time.perf_counter()
             with stats.time("capture"):
-                pair = client.capture_pair()
-            if pair is None or not pipeline.has_input(pair):
+                capture = client.capture_frame()
+            stale_mpc_frame = (
+                config.controller == "mpc" and capture is not None and not capture.is_new
+            )
+            if capture is None or not pipeline.has_input(capture) or stale_mpc_frame:
+                if (
+                    config.controller == "mpc"
+                    and autopilot_active
+                    and time.perf_counter() - last_fresh_capture > config.safety_no_road_time_s
+                ):
+                    client.park()
+                    autopilot_active = False
+                    logger.warning("MPC camera watchdog: no fresh trajectory input, parked")
                 time.sleep(0.005)
                 continue
+            last_fresh_capture = time.perf_counter()
 
             with stats.time("vehicle_state"):
                 state = client.get_vehicle_state()
 
             # Perception keeps running under safe stop so the operator can see
             # the road come back before handing control over again.
-            result = pipeline.step_result(pair, state)
+            result = pipeline.step_result(capture, state)
             plan = result.plan
 
             if autopilot_active:
@@ -495,6 +428,8 @@ def main() -> None:
                 if triggered:
                     autopilot_active = False
                     client.park()
+                    command = _SAFE_STOP_COMMAND
+                    plan = None
                     logger.warning("Safe stop triggered automatically: %s", reason)
             else:
                 held: set[str] = set()
@@ -523,14 +458,6 @@ def main() -> None:
                     timing_overlay,
                     display,
                 )
-                stitched = None
-                if debug_view == "stitched":
-                    stitched = pipeline.view.stitched(pair)
-                depth_roi = None
-                if debug_view == "roi" and pipeline.depth_estimator is not None:
-                    depth_roi = pipeline.depth_estimator.roi_preview(
-                        result.stabilized.mask, pipeline.valid_roi
-                    )
                 display.publish(
                     DisplayState(
                         result=result,
@@ -539,8 +466,6 @@ def main() -> None:
                         valid_roi=pipeline.valid_roi,
                         debug_view=debug_view,
                         timing_overlay=timing_overlay,
-                        stitched=stitched,
-                        depth_roi=depth_roi,
                     )
                 )
 
@@ -550,8 +475,8 @@ def main() -> None:
                 for key in display.drain_keys():
                     if key in (ord("t"), ord("T")):
                         timing_overlay = not timing_overlay
-                    elif ord("0") <= key <= ord("9") and key - ord("0") < len(DEBUG_VIEWS):
-                        debug_view = DEBUG_VIEWS[key - ord("0")]
+                    elif ord("0") <= key <= ord("9") and key - ord("0") in DEBUG_VIEW_KEYS:
+                        debug_view = DEBUG_VIEW_KEYS[key - ord("0")]
                         logger.info("Debug view: %s", debug_view)
                     else:
                         autopilot_active = _handle_key(
@@ -564,11 +489,6 @@ def main() -> None:
             frame_count += 1
 
             if recorder is not None:
-                valid_disparity = None
-                depth_coverage = None
-                if result.depth is not None:
-                    valid_disparity = result.depth.valid_disparity_fraction
-                    depth_coverage = result.depth.coverage
                 recorder.add(
                     now=time.perf_counter(),
                     primary_ms=primary_ms,
@@ -576,9 +496,6 @@ def main() -> None:
                     confidence=_mean_confidence(result.perception.confidences),
                     mask=result.stabilized.mask,
                     plan=result.plan,
-                    valid_disparity=valid_disparity,
-                    depth_coverage=depth_coverage,
-                    depth_used=result.depth is not None,
                 )
 
             now = time.perf_counter()
@@ -592,9 +509,7 @@ def main() -> None:
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
     finally:
-        pipeline.close()
-        # The dashboard thread reads the display camera and draws into the
-        # window, so it stops before either is torn down.
+        # Stop drawing before the window is torn down.
         if display is not None:
             display.stop()
         if dashboard_window is not None:
@@ -604,19 +519,15 @@ def main() -> None:
         logger.info("Session complete - %d frames in %.1f s", frame_count, elapsed)
         _log_runtime(pipeline, display)
         if recorder is not None:
-            report = recorder.report(stats, pipeline.stereo_stats, pipeline.stereo_worker)
+            report = recorder.report(stats)
             out = args.benchmark_out or f"output/benchmarks/{recorder.label}.json"
             path = recorder.save(out, report)
             logger.info("Benchmark report written to %s", path)
             logger.info(
-                "  %.1f FPS  primary %s/%s ms  stereo %s Hz  valid disparity %s%%  "
-                "coverage %s%%  jitter %s  departures %d",
+                "  %.1f FPS  primary %s/%s ms  jitter %s  departures %d",
                 report["main_fps"] or 0.0,
                 report["primary_latency_mean_ms"],
                 report["primary_latency_p95_ms"],
-                report["stereo"].get("fps"),
-                report["valid_disparity_pct_mean"],
-                report["depth_coverage_pct_mean"],
                 report["path_jitter_pct"],
                 report["lane_departures"],
             )

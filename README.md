@@ -2,9 +2,13 @@
 
 ## Introduction
 
-Off-Road Autonomy drives a vehicle along unmarked dirt trails in BeamNG.tech using two front cameras. It segments the drivable trail with a YOLOE-26 model, measures obstacles with stereo depth, plans a centreline and steers with a Stanley controller.
+Off-Road Autonomy drives a vehicle along unmarked dirt trails in BeamNG.tech using one dashcam. It segments the drivable trail with a YOLOE-26 model, plans a centreline and steers with configurable Stanley or MPC control.
+
+Perception uses RGB segmentation only. There is no depth estimation, terrain fusion or depth-based obstacle veto. One GMSL2 dashcam with 120° horizontal FOV supplies segmentation, planning, control and the dashboard. It retains the previous dashcam mount: height 1.85 m, forward offset -0.30 m, pitch -8°. Capture is 960x620 at 30 FPS, processed at 720x465. The dashboard draws the same captured frame and its results; it does not poll another camera. Debug views are `0` path, `1` raw dashcam, `6` mask and `9` pipeline. Configure the sensor, mount and hood exclusion under `beamng.camera`. Ground distances still use a flat-ground assumption. Old `beamng.cameras`, `segmentation_mode` and `stitching` settings must be removed.
 
 It runs on a Windows workstation next to the simulator, or in a Docker container on an NVIDIA Jetson that connects to the simulator over the network.
+
+When the hood hides the nearest part of the path, steering joins a visible lookahead point with a geometric pursuit arc. It does not extrapolate the path backward under the hood, which could reverse the commanded turn. Stanley tracking resumes when the predicted vehicle position lies within the observed path.
 
 ## Development Setup
 
@@ -26,8 +30,20 @@ Set `beamng.home` in `configs/default.yaml` to your BeamNG.tech folder, or expor
 offroad-autonomy --config configs/default.yaml
 ```
 
+For MPC with Stanley fallback, run `offroad-autonomy --config configs/mpc.yaml`.
+Select `control.controller: stanley` or `mpc` in YAML. Stanley remains the default
+baseline while MPC is evaluated.
+
+The BeamNG client selects realistic shifting and forward drive on startup and
+resume, so holding the brake cannot engage arcade reverse. Manual gearboxes use
+first gear for low-speed off-road operation; automatics select Drive. Gate holds
+show their reason in the dashboard and console. The default gate accepts a
+connected road at confidence 0.18 or above and still rejects insufficient or
+disconnected road masks. Run `python scripts/check_brake_hold.py --reproduce-arcade`
+to reproduce the former reversal and verify the brake-hold/forward-restart fix.
+
 - Launches BeamNG.tech if it is not already running, then spawns the vehicle and opens the dashboard
-- `E` safe stop, `P` resume, `0`-`9` debug views, `T` timing overlay, `Q` quit
+- `E` safe stop, `P` resume, `0`, `1`, `6`, `9` debug views, `T` timing overlay, `Q` quit
 - `--headless` runs without a window
 
 ## Run On Jetson (Docker)
@@ -88,8 +104,8 @@ BEAMNG_HOST=192.168.1.50 docker compose up
 - Only `simulation/beamng_client.py` imports `beamngpy`
 - `configs/default.yaml` holds every tuning value, with the reason for it next to the key; `configs/jetson.yaml` overrides it through `extends:`
 - `BEAMNG_HOST`, `BEAMNG_PORT`, `BEAMNG_HOME` and `BEAMNG_LAUNCH` override the `beamng:` block
-- Stereo and the dashboard run on their own threads, and the control loop never waits for either
-- After moving a camera in `beamng.cameras`, re-run `scripts/derive_ego_mask.py` and re-check `planning.roi_height` and `depth.min_depth_m`
+- The dashboard runs on its own thread, and the control loop never waits for it
+- After changing the mount or lens in `beamng.camera`, re-run `scripts/derive_ego_mask.py` and re-check `planning.roi_height`
 - Manual driving (W/A/S/D under safe stop) reads the OS key state and works only on Windows
 - CI (`.github/workflows/ci.yml`) runs lint, format, the S-bend check, tests with coverage and the build on Python 3.10; CodeQL scans weekly and on every pull request; Dependabot watches pip, the Docker base image and the Actions
 
