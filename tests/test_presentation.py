@@ -5,7 +5,7 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from offroad_autonomy.main import parse_args
+from offroad_autonomy.main import build_parser, video_paths
 from offroad_autonomy.types import (
     DEFAULT_DASHBOARD_COLORS,
     ControlCommand,
@@ -199,6 +199,27 @@ def test_static_layer_is_built_once_and_never_drawn_on(monkeypatch):
     assert np.array_equal(renderer._static, before)
 
 
-def test_presentation_implies_recording():
-    assert parse_args(["--presentation"]).record_video is True
-    assert parse_args([]).record_video is False
+def test_presentation_is_recorded_apart_from_the_dashboard():
+    args = build_parser().parse_args(["--record-video", "--presentation"])
+
+    dashboard, presentation = video_paths(args, "run")
+
+    assert dashboard.parent.as_posix() == "output/videos"
+    assert presentation.parent.as_posix() == "output/presentations"
+
+
+def test_presentation_alone_does_not_record_the_dashboard():
+    args = build_parser().parse_args(["--presentation"])
+
+    assert args.presentation is True
+    assert args.record_video is False
+
+
+def test_one_path_for_both_recordings_is_refused(tmp_path):
+    out = str(tmp_path / "run.mp4")
+    args = build_parser().parse_args(
+        ["--record-video", "--presentation", "--record-video-out", out, "--presentation-out", out]
+    )
+
+    with pytest.raises(SystemExit):
+        video_paths(args, "run")

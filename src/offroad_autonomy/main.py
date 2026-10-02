@@ -24,6 +24,7 @@ from offroad_autonomy.types import (
     DEBUG_VIEW_KEYS,
     ControlCommand,
     PathPlan,
+    PipelineConfig,
     PipelineStepResult,
     VehicleState,
 )
@@ -46,6 +47,9 @@ _shutdown = False
 _WINDOW_TITLE = "Off-Road Autonomy Dashboard"
 _DASHBOARD_WIDTH = 1600
 _DASHBOARD_HEIGHT = 900
+# Apart from output/videos, so presentations are not lost among the many
+# dashboard recordings made while tuning.
+_PRESENTATION_DIR = "output/presentations"
 _MPH_PER_MPS = 2.2369362920544
 
 _STUCK_SPEED_MPS = 0.4
@@ -120,20 +124,31 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Record a 1920x1080 presentation video (orbit camera, dashcam overlay, key stats) "
-            "instead of the dashboard. Implies --record-video; the window still shows the "
-            "operator dashboard."
+            "to its own mp4 (needs ffmpeg on PATH). Combine with --record-video to also "
+            "record the dashboard, to a separate file."
         ),
+    )
+    parser.add_argument(
+        "--presentation-out",
+        default="",
+        help=f"Presentation path (default: {_PRESENTATION_DIR}/<label>_<timestamp>.mp4).",
     )
     return parser
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    args = build_parser().parse_args(argv)
-    # A presentation exists only as a recording, so asking for one is asking
-    # to record.
-    if args.presentation:
-        args.record_video = True
-    return args
+def _open_video(path: str | Path, width: int, height: int, config: PipelineConfig) -> VideoRecorder:
+    try:
+        return VideoRecorder(
+            path,
+            width,
+            height,
+            fps=config.recording_fps,
+            crf=config.recording_crf,
+            preset=config.recording_preset,
+            queue_frames=config.recording_queue_frames,
+        )
+    except (RuntimeError, OSError) as exc:
+        sys.exit(f"Cannot record video: {exc}")
 
 
 class _StuckDetector:
@@ -333,6 +348,19 @@ def _handle_key(
     return autopilot_active
 
 
+def video_paths(args: argparse.Namespace, label: str) -> tuple[Path, Path]:
+    """Where the dashboard and the presentation recordings go.
+
+    Two encoders writing one file would corrupt it, so a run that asks for
+    both at the same path is stopped before anything is recorded.
+    """
+    dashboard = Path(args.record_video_out or default_video_path(label))
+    presentation = Path(args.presentation_out or default_video_path(label, _PRESENTATION_DIR))
+    if args.record_video and args.presentation and dashboard.resolve() == presentation.resolve():
+        sys.exit("--record-video-out and --presentation-out must name different files")
+    return dashboard, presentation
+
+
 def _log_video(video: VideoRecorder) -> None:
     if video.failed:
         logger.error("Video recording failed; %s may be incomplete", video.path)
@@ -349,7 +377,7 @@ def _log_video(video: VideoRecorder) -> None:
 def main() -> None:
     global _shutdown
     _shutdown = False
-    args = parse_args()
+    args = build_parser().parse_args()
 
     setup_logger(level=getattr(logging, args.log_level))
 
@@ -373,6 +401,7 @@ def main() -> None:
     display: DisplayWorker | None = None
     presentation_display: DisplayWorker | None = None
     video: VideoRecorder | None = None
+    presentation_video: VideoRecorder | None = None
     stats = pipeline.stats
 
     debug_view = config.ui_debug_view
@@ -399,36 +428,21 @@ def main() -> None:
 
     # Opened before connecting so a missing ffmpeg stops the run before a map
     # is loaded and a vehicle spawned for nothing.
+    label = args.label or config_path.stem
+    video_path, presentation_path = video_paths(args, label)
     if args.record_video:
-        video_path = args.record_video_out or default_video_path(args.label or config_path.stem)
-        video_width = _DASHBOARD_WIDTH
-        video_height = _DASHBOARD_HEIGHT
-        if args.presentation:
-            video_width = PRESENTATION_WIDTH
-            video_height = PRESENTATION_HEIGHT
-        try:
-            video = VideoRecorder(
-                video_path,
-                video_width,
-                video_height,
-                fps=config.recording_fps,
-                crf=config.recording_crf,
-                preset=config.recording_preset,
-                queue_frames=config.recording_queue_frames,
-            )
-        except (RuntimeError, OSError) as exc:
-            sys.exit(f"Cannot record video: {exc}")
-        if args.presentation:
-            logger.info("Recording the presentation video to %s", video.path)
-        else:
-            logger.info("Recording the dashboard to %s", video.path)
+        video = _open_video(video_path, _DASHBOARD_WIDTH, _DASHBOARD_HEIGHT, config)
+        logger.info("Recording the dashboard to %s", video.path)
+    if args.presentation:
+        presentation_video = _open_video(
+            presentation_path, PRESENTATION_WIDTH, PRESENTATION_HEIGHT, config
+        )
+        logger.info("Recording the presentation video to %s", presentation_video.path)
 
     try:
         client.connect()
 
-        # A presentation is recorded by a worker of its own, so the operator
-        # dashboard only records itself when no presentation is asked for.
-        record_dashboard = video is not None and not args.presentation
+        record_dashboard = video is not None
         record = None
         if record_dashboard:
             record = video.write
@@ -515,7 +529,7 @@ def main() -> None:
                 render=_render_presentation,
                 show=lambda canvas: True,
                 read_key=lambda: -1,
-                record=video.write,
+                record=presentation_video.write,
                 rate_hz=config.ui_display_rate_hz,
                 asynchronous=True,
             )
@@ -669,9 +683,10 @@ def main() -> None:
             display.stop()
         if presentation_display is not None:
             presentation_display.stop()
-        if video is not None:
-            video.close()
-            _log_video(video)
+        for recording in (video, presentation_video):
+            if recording is not None:
+                recording.close()
+                _log_video(recording)
         if dashboard_window is not None:
             dashboard_window.close()
         client.disconnect()

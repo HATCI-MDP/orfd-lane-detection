@@ -117,12 +117,16 @@ front, so it plays in the VS Code media preview and in browsers.
 
 ```bash
 offroad-autonomy --presentation
-offroad-autonomy --presentation --headless --record-video-out ~/videos/demo.mp4
+offroad-autonomy --presentation --headless --presentation-out ~/videos/demo.mp4
+offroad-autonomy --presentation --record-video
 ```
 
-`--presentation` implies `--record-video` and uses the same ffmpeg recorder, output path and
-`recording` settings, but the video holds a 1920 x 1080 "Split Story" frame instead of the dashboard.
-The window, if there is one, still shows the operator dashboard, unchanged.
+`--presentation` records a 1920 x 1080 "Split Story" video to
+`output/presentations/<label>_<timestamp>.mp4` (or the path given with `--presentation-out`), apart
+from the dashboard recordings in `output/videos/`. It uses the same ffmpeg recorder and `recording`
+settings as `--record-video`. Add `--record-video` to record the dashboard as well, to its own
+file. The two paths must differ. The window, if there is one, still shows the operator dashboard,
+unchanged.
 
 - **Left:** a chase camera behind and above the vehicle, labelled Orbit Camera. Until its first
   frame arrives the view reads No Orbit Signal.
@@ -195,7 +199,7 @@ BEAMNG_HOST=192.168.1.50 docker compose up
 | --------------------------------------------------------------- | ------------------------------------------------------- |
 | `offroad-autonomy --config <file>`                              | Run the stack with a config                             |
 | `offroad-autonomy --record-video`                               | Run and save the dashboard to `output/videos/` as mp4   |
-| `offroad-autonomy --presentation`                               | Run and save a 1920 x 1080 presentation video           |
+| `offroad-autonomy --presentation`                               | Run and save a presentation to `output/presentations/`  |
 | `ruff check src tests scripts`                                  | Lint                                                    |
 | `ruff format src tests scripts`                                 | Format (CI runs it with `--check`)                      |
 | `python -m build`                                               | Build the wheel and sdist                               |

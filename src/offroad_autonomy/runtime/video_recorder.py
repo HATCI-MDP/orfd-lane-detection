@@ -38,9 +38,9 @@ X264_PRESETS = (
 _STOP = object()
 
 
-def default_video_path(label: str) -> Path:
+def default_video_path(label: str, folder: str = "output/videos") -> Path:
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    return Path("output/videos") / f"{label}_{timestamp}.mp4"
+    return Path(folder) / f"{label}_{timestamp}.mp4"
 
 
 def build_ffmpeg_command(
