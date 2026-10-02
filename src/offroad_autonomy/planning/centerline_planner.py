@@ -1,10 +1,11 @@
-"""Planning entry point: the perception gate, then the baseline or the
-advanced (ViPlanner-style) planner."""
+"""Planning entry point: the perception gate, then the baseline, the
+advanced (ViPlanner-style) or the bird's-eye grid planner."""
 
 from __future__ import annotations
 
 import logging
 import math
+import time
 from dataclasses import dataclass, replace
 from typing import Protocol
 
@@ -13,7 +14,9 @@ import numpy as np
 from scipy.signal import savgol_filter
 
 from offroad_autonomy.perception.camera_geometry import CameraModel
+from offroad_autonomy.planning.arc_planner import ArcPlanner
 from offroad_autonomy.planning.baseline_planner import BaselinePlanner
+from offroad_autonomy.planning.bev_grid import TraversabilityGrid, ground_pose
 from offroad_autonomy.planning.perception_gate import GateDecision, PerceptionGate
 from offroad_autonomy.types import (
     PathPlan,
@@ -253,6 +256,21 @@ class CenterlinePlanner:
         self._hold_speed_scale = float(np.clip(config.gate_hold_speed_scale, 0.0, 1.0))
         self._last_good: PathPlan | None = None
         self._held = 0
+
+        self._camera = self._baseline._camera
+        self._grid_config = config.grid
+        # Built on the first frame, once the mask size and ego exclusion are known.
+        self._grid: TraversabilityGrid | None = None
+        self._grid_time: float | None = None
+        self._direction_warned = False
+        self._arcs = ArcPlanner(
+            config.grid,
+            wheelbase_m=config.wheelbase_m,
+            max_wheel_angle_deg=config.max_wheel_angle_deg,
+            vehicle_half_width_m=config.vehicle_half_width_m,
+            # The MPC owns this measurement; one value keeps the two from disagreeing.
+            rear_axle_behind_camera_m=config.mpc.camera_ahead_of_rear_axle_m,
+        )
         logger.info("Planning mode: %s (advanced backend %s)", self._mode, self._backend.name)
 
     def plan(
@@ -270,6 +288,9 @@ class CenterlinePlanner:
             # A hood-cut row exposes only fragments of the road width. Using
             # their centre would steer around the hood as if it were an obstacle.
             decision.component[~valid.all(axis=1)] = False
+
+        if self._mode == "grid":
+            return self._plan_grid(stabilized, decision, vehicle_state)
 
         if not decision.ok:
             return self._hold(decision)
@@ -298,6 +319,76 @@ class CenterlinePlanner:
         self._last_good = plan
         self._held = 0
         return plan
+
+    def _plan_grid(
+        self,
+        stabilized: StabilizedResult,
+        decision: GateDecision,
+        vehicle_state: VehicleState | None,
+    ) -> PathPlan:
+        """The grid keeps tracking the vehicle on every frame, but only a
+        frame that passed the gate adds evidence: a rejected mask must not
+        teach the grid road that perception itself did not trust."""
+        mask = stabilized.mask.astype(bool)
+        if self._grid is None:
+            self._grid = TraversabilityGrid(
+                self._grid_config,
+                self._camera,
+                stabilized.valid_roi,
+                self._gate.roi_top(mask.shape[0]),
+            )
+        now = time.perf_counter()
+        dt = 0.0
+        if self._grid_time is not None:
+            dt = now - self._grid_time
+        self._grid_time = now
+
+        self._check_direction(vehicle_state)
+        observation = None
+        if decision.ok:
+            observation = mask
+        self._grid.update(observation, ground_pose(vehicle_state, self._camera), dt)
+
+        if not decision.ok:
+            return self._hold(decision)
+
+        choice = self._arcs.choose(self._grid)
+        if choice is None:
+            decision.reason = "no drivable arc in the grid"
+            return self._hold(decision)
+
+        # Pixels far -> near, the order every planner hands the controllers.
+        centerline = self._camera.ground_to_image(choice.forward_m, choice.right_m)[::-1].copy()
+        plan = PathPlan(
+            centerline=centerline,
+            heading_rad=self._estimate_heading(centerline),
+            curvature=self._estimate_curvature(centerline),
+            road_width_px=self._estimate_road_width(decision.component, centerline),
+        )
+        plan.planner_mask = decision.component
+        plan.roi_top = decision.roi_top
+        self._last_good = plan
+        self._held = 0
+        return plan
+
+    def _check_direction(self, vehicle_state: VehicleState | None) -> None:
+        """Driving forward, velocity and the simulator's direction vector must
+        agree; if they do not, the grid would shift its memory the wrong way."""
+        if self._direction_warned or vehicle_state is None or vehicle_state.direction is None:
+            return
+        if vehicle_state.speed_mps < 2.0:
+            return
+        vx, vy = vehicle_state.velocity[0], vehicle_state.velocity[1]
+        dx, dy = vehicle_state.direction[0], vehicle_state.direction[1]
+        if vx * dx + vy * dy < 0.0:
+            logger.warning(
+                "Vehicle direction points against its velocity; grid memory may be mirrored"
+            )
+            self._direction_warned = True
+
+    @property
+    def grid(self) -> TraversabilityGrid | None:
+        return self._grid
 
     def _hold(self, decision: GateDecision) -> PathPlan:
         self._held += 1
@@ -624,3 +715,7 @@ class CenterlinePlanner:
         self._baseline.reset()
         self._last_good = None
         self._held = 0
+        if self._grid is not None:
+            self._grid.reset()
+        self._grid_time = None
+        self._arcs.reset()

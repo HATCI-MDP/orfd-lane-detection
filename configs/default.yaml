@@ -142,6 +142,8 @@ planning:
   #           sampled row -> one quadratic fit. No scoring, clearance, Kalman
   #           or straightening.
   # advanced: the scoring / clearance / Kalman planner configured below.
+  # grid:     bird's-eye traversability grid with memory + arc planner, see
+  #           planning.grid. configs/grid.yaml switches to it.
   mode: baseline
   # ROI_HEIGHT: share of the frame, up from the bottom edge, the planner reads.
   # Dashcam at 1.85 m, pitch -8 deg, 120 deg horizontal FOV:
@@ -178,6 +180,57 @@ planning:
   kalman_measurement_noise: 1.0e-1
   fallback_after_n_misses: 3
   min_road_pixels: 2000         # valid traversable pixels inside the ROI
+  # --- grid mode only: bird's-eye traversability grid + arc ("tentacle") planner.
+  # The road mask is projected onto flat ground, fused over time with the
+  # vehicle's motion, and a fan of steerable arcs is scored on it. Cells the
+  # camera cannot see (under the hood, off the image sides) are unknown, never
+  # "not road", and memory carries the road the hood now hides. Values below
+  # were checked on one recorded run only; judge them on a multi-map set.
+  grid:
+    # 0.1 m cells: a 1.9 m wide vehicle spans 19 cells. A 200 x 200 grid
+    # planned in about 3 ms per frame on an i9-12900K in an offline replay.
+    cell_m: 0.10
+    # The gate ROI ends ~13.4 m ahead, so 16 m holds every observed cell.
+    ahead_m: 16.0
+    # Behind the camera: the rear axle (control.mpc.camera_ahead_of_rear_axle_m)
+    # plus the road the vehicle has just driven over.
+    behind_m: 4.0
+    # Wider than any trail; a full-lock arc (4.2 m radius) stays within 8.4 m sideways.
+    half_width_m: 10.0
+    # Evidence fades with this time constant. At 4 m/s the 3 m hidden by the
+    # hood was in view 0.75 s earlier, well inside the memory.
+    memory_s: 2.0
+    # Log-odds added per frame for road / not road. One frame is enough to
+    # mark a cell; the stabilizer's EMA has already smoothed the mask.
+    road_logodds: 0.85
+    offroad_logodds: -0.85
+    logodds_limit: 4.0
+    # A cell is road above road_threshold and an obstacle below
+    # blocked_threshold; between them it is unknown.
+    road_threshold: 0.5
+    blocked_threshold: -0.5
+    # Odd so the straight arc is a candidate. 41 arcs over full lock is a
+    # 0.012 /m curvature step, ~0.5 m sideways at 8 m; finer sets flipped
+    # between near-equal arcs more often on the recorded run.
+    arc_count: 41
+    lookahead_m: 14.0
+    # Under a third of the vehicle width, so an arc cannot step over an edge.
+    step_m: 0.25
+    # The path starts 1 m ahead of the camera; nearer points are under the car.
+    start_m: 1.0
+    # A supported arc shorter than this is not a path: the gate holds, then stops.
+    min_path_m: 4.0
+    # Required clearance = control.vehicle_half_width_m + this margin.
+    clearance_margin_m: 0.1
+    # Clearance counts up to half a wide trail. A 2 m cap saturated on wide
+    # roads and the planner stopped centring.
+    clearance_cap_m: 4.0
+    # Score = length seen as road + clearance - change from last arc - bend.
+    weight_length: 1.0
+    weight_clearance: 1.0
+    # Only breaks near-ties; at 0.4 it locked onto the first arc it picked.
+    weight_consistency: 0.2
+    weight_curvature: 0.1
 
 control:
   controller: stanley         # use configs/mpc.yaml for MPC with Stanley fallback

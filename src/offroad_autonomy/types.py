@@ -12,6 +12,7 @@ from dataclasses import dataclass, field, replace
 import numpy as np
 
 from offroad_autonomy.control.controller_config import MPCConfig
+from offroad_autonomy.planning.grid_config import GridPlannerConfig
 
 DEFAULT_PERCEPTION_PROMPTS = [
     "traversable road",
@@ -296,6 +297,9 @@ class VehicleState:
     speed_mps: float = 0.0
     heading_rad: float = 0.0
     valid: bool = True
+    #: World-frame forward vector from the simulator. Kept separate from the
+    #: quaternion so frame-to-frame motion never depends on its convention.
+    direction: tuple[float, float, float] | None = None
 
 
 @dataclass
@@ -428,6 +432,7 @@ class PipelineConfig:
 
     controller: str = "stanley"
     mpc: MPCConfig = field(default_factory=MPCConfig)
+    grid: GridPlannerConfig = field(default_factory=GridPlannerConfig)
     stanley_gain_k: float = 1.5
     stanley_softening: float = 2.4
     stanley_heading_gain: float = 0.85

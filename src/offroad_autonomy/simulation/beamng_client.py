@@ -176,12 +176,16 @@ class BeamNGClient:
             vel = tuple(st.get("vel", (0, 0, 0)))
             speed = math.sqrt(sum(v**2 for v in vel))
             _, _, yaw = self._quat_to_euler(rot)
+            direction = None
+            if "dir" in st:
+                direction = tuple(st["dir"])
             return VehicleState(
                 position=pos,
                 rotation=rot,
                 velocity=vel,
                 speed_mps=speed,
                 heading_rad=yaw,
+                direction=direction,
             )
         except Exception as exc:
             # Do not let a failed poll masquerade as a stationary vehicle.

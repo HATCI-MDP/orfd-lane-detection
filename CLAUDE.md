@@ -11,7 +11,7 @@ Keep these boundaries clear:
 
 - `simulation/`: all BeamNG I/O. The only package that imports `beamngpy`.
 - `perception/`: segmentation, camera geometry, ego masking.
-- `planning/`: the perception gate, then the baseline or advanced planner.
+- `planning/`: the perception gate, then the baseline, advanced or bird's-eye grid planner.
 - `control/`: Stanley steering and the speed law, all computed in metres on the ground.
 - `runtime/`: the dashboard worker thread, timing, benchmarks.
 - `visualization/`: the operator dashboard and window.

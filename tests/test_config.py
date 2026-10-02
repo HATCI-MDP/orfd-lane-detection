@@ -179,3 +179,22 @@ def test_invalid_recording_settings_are_refused(tmp_path, block):
 
     with pytest.raises(ValueError, match="recording"):
         load_config(config_path)
+
+
+def test_grid_profile_selects_the_grid_planner():
+    config = load_config(REPO / "configs" / "grid.yaml")
+
+    assert config.planner_mode == "grid"
+    assert config.grid.arc_count == PipelineConfig().grid.arc_count
+
+
+@pytest.mark.parametrize(
+    ("block", "match"),
+    [("    arc_size: 3", "arc_size"), ("    arc_count: 40", "odd"), ("    cell_m: 0", "cell_m")],
+)
+def test_invalid_grid_settings_are_refused(tmp_path, block, match):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("planning:\n  grid:\n" + block + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=match):
+        load_config(config_path)

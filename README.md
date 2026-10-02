@@ -54,6 +54,28 @@ For MPC with Stanley fallback, run `offroad-autonomy --config configs/mpc.yaml`.
 Select `control.controller: stanley` or `mpc` in YAML. Stanley remains the default
 baseline while MPC is evaluated.
 
+For the bird's-eye grid planner, run `offroad-autonomy --config configs/grid.yaml`.
+
+### Grid Planner
+
+`planning.mode: grid` projects the road mask onto flat ground, fuses it over time using the
+vehicle's own motion, and picks the best of a fan of steerable arcs on that grid
+(`planning/bev_grid.py`, `planning/arc_planner.py`). It was built for the roof-mounted dashcam,
+whose hood hides the first ~3 m of ground and whose image edges cut wide trails:
+
+- Ground the camera cannot see is unknown, never "not road", so a trail running off the side of
+  the image does not pull the path toward the visible part.
+- Memory carries the road the hood now hides, using the simulator's direction vector to follow
+  the vehicle's motion. Without a valid pose the grid forgets rather than smearing.
+- Frames the perception gate rejects move the grid with the vehicle but add no evidence.
+- Arcs end where the vehicle's body would leave the road, and the path only extends as far as
+  the grid has seen road, so the path-end speed law still applies.
+- The projection assumes flat ground: on crests and in dips far cells are misplaced, and the
+  grid has no height information, so obstacles the segmenter labels as road are not seen.
+
+Settings, with reasons, are in `planning.grid` in `configs/default.yaml`. The baseline planner
+stays the default until the grid planner has been compared on several maps.
+
 The BeamNG client selects realistic shifting and forward drive on startup and
 resume, so holding the brake cannot engage arcade reverse. Manual gearboxes use
 first gear for low-speed off-road operation; automatics select Drive. Gate holds

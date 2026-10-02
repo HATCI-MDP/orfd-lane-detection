@@ -9,6 +9,7 @@ from pathlib import Path
 import yaml
 
 from offroad_autonomy.control.controller_config import MPCConfig
+from offroad_autonomy.planning.grid_config import GridPlannerConfig
 from offroad_autonomy.runtime.video_recorder import X264_PRESETS
 from offroad_autonomy.types import (
     CAMERA_TRANSPORTS,
@@ -196,8 +197,8 @@ def _section(raw: dict, key: str) -> dict:
 
 def _planner_mode(raw: object) -> str:
     mode = str(raw).lower()
-    if mode not in ("baseline", "advanced"):
-        raise ValueError(f"planning.mode must be 'baseline' or 'advanced', got {mode!r}")
+    if mode not in ("baseline", "advanced", "grid"):
+        raise ValueError(f"planning.mode must be 'baseline', 'advanced' or 'grid', got {mode!r}")
     return mode
 
 
@@ -229,6 +230,14 @@ def _load_recording(raw: dict) -> dict:
         "recording_preset": preset,
         "recording_queue_frames": queue_frames,
     }
+
+
+def _load_grid(raw: dict) -> GridPlannerConfig:
+    try:
+        return GridPlannerConfig(**raw)
+    except TypeError as exc:
+        # A misspelled key would otherwise surface as a bare dataclass error.
+        raise ValueError(f"planning.grid: {exc}") from exc
 
 
 def _apply_env_overrides(bng: dict) -> dict:
@@ -354,6 +363,7 @@ def load_config(path: str | Path) -> PipelineConfig:
         min_road_pixels=plan.get("min_road_pixels", 500),
         controller=controller,
         mpc=MPCConfig(**_section(ctrl, "mpc")),
+        grid=_load_grid(_section(plan, "grid")),
         stanley_gain_k=ctrl.get("stanley_gain_k", 1.5),
         stanley_softening=ctrl.get("stanley_softening", 2.4),
         stanley_heading_gain=ctrl.get("stanley_heading_gain", 0.85),
