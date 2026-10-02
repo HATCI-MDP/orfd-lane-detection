@@ -55,6 +55,7 @@ Select `control.controller: stanley` or `mpc` in YAML. Stanley remains the defau
 baseline while MPC is evaluated.
 
 For the bird's-eye grid planner, run `offroad-autonomy --config configs/grid.yaml`.
+To pair it with MPC, run `offroad-autonomy --config configs/grid-mpc.yaml`.
 
 ### Grid Planner
 

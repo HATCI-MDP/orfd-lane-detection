@@ -198,3 +198,12 @@ def test_invalid_grid_settings_are_refused(tmp_path, block, match):
 
     with pytest.raises(ValueError, match=match):
         load_config(config_path)
+
+
+def test_grid_mpc_profile_combines_the_grid_planner_with_mpc():
+    config = load_config(REPO / "configs" / "grid-mpc.yaml")
+    mpc_only = load_config(REPO / "configs" / "mpc.yaml")
+
+    assert config.planner_mode == "grid"
+    assert config.controller == "mpc"
+    assert config.mpc == mpc_only.mpc
