@@ -29,8 +29,11 @@ _SENSOR_WARMUP_S = 1.0
 
 
 class BeamNGClient:
-    def __init__(self, config: PipelineConfig) -> None:
+    def __init__(self, config: PipelineConfig, orbit: bool = False) -> None:
         self._config = config
+        # A flag rather than a config switch: the orbit camera costs capture
+        # time in the loop, so only a run recording a presentation pays it.
+        self._orbit = orbit
         self._bng = None
         self._vehicle = None
         self._cameras: dict[str, object] = {}
@@ -86,6 +89,10 @@ class BeamNGClient:
         logger.info(
             "Attaching dashcam (%s): %s", cfg.beamng_camera_transport, spec.sensor.describe()
         )
+        if self._orbit:
+            orbit = cfg.orbit_camera
+            self._cameras["orbit"] = self._attach_camera(Camera, vehicle, orbit)
+            logger.info("Attaching orbit camera for the presentation: %s", orbit.sensor.describe())
         time.sleep(_SENSOR_WARMUP_S)
 
         self.release_park()
@@ -131,6 +138,15 @@ class BeamNGClient:
         self._last_signature = signature
         self._frame_id += 1
         return CameraFrame(image=image, timestamp=timestamp, frame_id=self._frame_id, is_new=is_new)
+
+    def capture_orbit(self) -> np.ndarray | None:
+        """For the presentation video only; no pipeline stage reads it.
+
+        Called from the main loop, never the dashboard thread: the socket
+        transport is not thread safe."""
+        if "orbit" not in self._cameras:
+            return None
+        return self._decode(self._live_buffer("orbit"), self._config.orbit_camera)
 
     def _live_buffer(self, role: str):
         camera = self._cameras.get(role)

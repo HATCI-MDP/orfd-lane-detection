@@ -29,6 +29,9 @@ _CACHE_LIMIT = 1024
 class TextStyle(NamedTuple):
     font: str
     size: int
+    #: Extra pixels between letters. Spaced runs are drawn letter by letter,
+    #: which loses kerning, so it is kept to short capitalised labels.
+    tracking: int = 0
 
 
 DISPLAY = TextStyle(MONO, 80)
@@ -43,6 +46,14 @@ BODY_STRONG = TextStyle(SANS_SEMIBOLD, 16)
 LABEL = TextStyle(SANS_SEMIBOLD, 13)
 CAPTION = TextStyle(SANS, 13)
 CAPTION_MONO = TextStyle(MONO, 13)
+# Presentation video: sized for a 1920 x 1080 frame watched on a shared screen.
+SPEED = TextStyle(MONO, 92)
+METRIC = TextStyle(MONO, 34)
+UNIT = TextStyle(SANS, 26)
+HEADLINE = TextStyle(SANS_SEMIBOLD, 24, tracking=1)
+SUBTITLE = TextStyle(SANS, 17)
+PLATE = TextStyle(SANS_SEMIBOLD, 14, tracking=1)
+LABEL_SPACED = TextStyle(SANS_SEMIBOLD, 13, tracking=1)
 
 
 class _Run(NamedTuple):
@@ -53,11 +64,12 @@ class _Run(NamedTuple):
 class TextRenderer:
     def __init__(self, font_dir: Path = FONT_DIR) -> None:
         self._font_dir = font_dir
-        self._fonts: dict[TextStyle, ImageFont.FreeTypeFont] = {}
+        self._fonts: dict[tuple[str, int], ImageFont.FreeTypeFont] = {}
         self._runs: dict[tuple[str, TextStyle], _Run] = {}
 
     def _font(self, style: TextStyle) -> ImageFont.FreeTypeFont:
-        font = self._fonts.get(style)
+        key = (style.font, style.size)
+        font = self._fonts.get(key)
         if font is None:
             path = self._font_dir / style.font
             # A missing face must stop startup: a silent fallback would change
@@ -65,7 +77,7 @@ class TextRenderer:
             if not path.is_file():
                 raise FileNotFoundError(f"Dashboard font is missing: {path}")
             font = ImageFont.truetype(str(path), style.size)
-            self._fonts[style] = font
+            self._fonts[key] = font
         return font
 
     def preload(self, styles: tuple[TextStyle, ...]) -> None:
@@ -80,15 +92,26 @@ class TextRenderer:
                 self._runs.clear()
             font = self._font(style)
             ascent, descent = font.getmetrics()
-            width = max(1, math.ceil(font.getlength(text)) + 2)
+            width = max(1, self.width(text, style) + 2)
             image = Image.new("L", (width, ascent + descent), 0)
-            ImageDraw.Draw(image).text((0, ascent), text, fill=255, font=font, anchor="ls")
+            draw = ImageDraw.Draw(image)
+            if style.tracking:
+                x = 0.0
+                for letter in text:
+                    draw.text((x, ascent), letter, fill=255, font=font, anchor="ls")
+                    x += font.getlength(letter) + style.tracking
+            else:
+                draw.text((0, ascent), text, fill=255, font=font, anchor="ls")
             run = _Run(np.asarray(image), ascent)
             self._runs[key] = run
         return run
 
     def width(self, text: str, style: TextStyle) -> int:
-        return math.ceil(self._font(style).getlength(text))
+        font = self._font(style)
+        if not style.tracking:
+            return math.ceil(font.getlength(text))
+        letters = sum(font.getlength(letter) for letter in text)
+        return math.ceil(letters + style.tracking * max(len(text) - 1, 0))
 
     def cap_height(self, style: TextStyle) -> int:
         return -self._font(style).getbbox("H", anchor="ls")[1]

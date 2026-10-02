@@ -34,6 +34,11 @@ from offroad_autonomy.visualization import (
     DashboardTelemetry,
     DashboardWindow,
 )
+from offroad_autonomy.visualization.presentation import (
+    PRESENTATION_HEIGHT,
+    PRESENTATION_WIDTH,
+    PresentationRenderer,
+)
 
 logger = logging.getLogger("offroad_autonomy.main")
 
@@ -110,7 +115,25 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="Video path (default: output/videos/<label>_<timestamp>.mp4).",
     )
+    parser.add_argument(
+        "--presentation",
+        action="store_true",
+        help=(
+            "Record a 1920x1080 presentation video (orbit camera, dashcam overlay, key stats) "
+            "instead of the dashboard. Implies --record-video; the window still shows the "
+            "operator dashboard."
+        ),
+    )
     return parser
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    args = build_parser().parse_args(argv)
+    # A presentation exists only as a recording, so asking for one is asking
+    # to record.
+    if args.presentation:
+        args.record_video = True
+    return args
 
 
 class _StuckDetector:
@@ -232,7 +255,11 @@ def _build_dashboard_telemetry(
     return telemetry
 
 
-def _log_runtime(pipeline: AutonomyPipeline, display: DisplayWorker | None = None) -> None:
+def _log_runtime(
+    pipeline: AutonomyPipeline,
+    display: DisplayWorker | None = None,
+    presentation: DisplayWorker | None = None,
+) -> None:
     primary = pipeline.stats.stage("primary_loop")
     message = (
         f"autonomy {pipeline.stats.fps():.1f} FPS  primary {primary.mean_ms:.1f}/"
@@ -243,6 +270,13 @@ def _log_runtime(pipeline: AutonomyPipeline, display: DisplayWorker | None = Non
         message += (
             f" | dashboard {display.fps():.1f} Hz  {total.mean_ms:.1f} ms"
             f"  (drawn {display.rendered}, superseded {display.dropped})"
+        )
+    if presentation is not None:
+        render = presentation.stats.stage("dashboard_render")
+        message += (
+            f" | presentation {presentation.fps():.1f} Hz  render {render.mean_ms:.1f}/"
+            f"{render.p95_ms:.1f} ms (drawn {presentation.rendered}, "
+            f"superseded {presentation.dropped})"
         )
     logger.info(message)
     for line in pipeline.stats.format_lines(MAIN_STAGES):
@@ -315,7 +349,7 @@ def _log_video(video: VideoRecorder) -> None:
 def main() -> None:
     global _shutdown
     _shutdown = False
-    args = build_parser().parse_args()
+    args = parse_args()
 
     setup_logger(level=getattr(logging, args.log_level))
 
@@ -333,10 +367,11 @@ def main() -> None:
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
-    client = BeamNGClient(config)
+    client = BeamNGClient(config, orbit=args.presentation)
     pipeline = AutonomyPipeline(config)
     dashboard_window: DashboardWindow | None = None
     display: DisplayWorker | None = None
+    presentation_display: DisplayWorker | None = None
     video: VideoRecorder | None = None
     stats = pipeline.stats
 
@@ -366,11 +401,16 @@ def main() -> None:
     # is loaded and a vehicle spawned for nothing.
     if args.record_video:
         video_path = args.record_video_out or default_video_path(args.label or config_path.stem)
+        video_width = _DASHBOARD_WIDTH
+        video_height = _DASHBOARD_HEIGHT
+        if args.presentation:
+            video_width = PRESENTATION_WIDTH
+            video_height = PRESENTATION_HEIGHT
         try:
             video = VideoRecorder(
                 video_path,
-                _DASHBOARD_WIDTH,
-                _DASHBOARD_HEIGHT,
+                video_width,
+                video_height,
                 fps=config.recording_fps,
                 crf=config.recording_crf,
                 preset=config.recording_preset,
@@ -378,16 +418,22 @@ def main() -> None:
             )
         except (RuntimeError, OSError) as exc:
             sys.exit(f"Cannot record video: {exc}")
-        logger.info("Recording the dashboard to %s", video.path)
+        if args.presentation:
+            logger.info("Recording the presentation video to %s", video.path)
+        else:
+            logger.info("Recording the dashboard to %s", video.path)
 
     try:
         client.connect()
 
+        # A presentation is recorded by a worker of its own, so the operator
+        # dashboard only records itself when no presentation is asked for.
+        record_dashboard = video is not None and not args.presentation
         record = None
-        if video is not None:
+        if record_dashboard:
             record = video.write
 
-        if not config.ui_headless or video is not None:
+        if not config.ui_headless or record_dashboard:
             dashboard = AutonomyDashboard(
                 width=_DASHBOARD_WIDTH,
                 height=_DASHBOARD_HEIGHT,
@@ -431,7 +477,7 @@ def main() -> None:
                 "Keys: E safe stop, P resume, 0/1/6/9 debug view (%s), T timing overlay",
                 " ".join(f"{i}={name}" for i, name in DEBUG_VIEW_KEYS.items()),
             )
-        elif video is not None:
+        elif record_dashboard:
             # No window to keep on its own thread, so the off-screen dashboard
             # always renders asynchronously, whatever ui.display_async says.
             display = DisplayWorker(
@@ -447,6 +493,35 @@ def main() -> None:
         else:
             logger.info("Headless: no dashboard; manual control is unavailable")
 
+        if args.presentation:
+            presentation = PresentationRenderer(
+                colors=config.dashboard_colors,
+                sensor=config.camera.sensor,
+                thresholds=config.dashboard_thresholds,
+            )
+
+            def _render_presentation(state: DisplayState) -> np.ndarray:
+                return presentation.render(
+                    state.result,
+                    state.telemetry,
+                    state.orbit,
+                    state.plan,
+                    state.valid_roi,
+                )
+
+            # Always on its own thread, even when the window's dashboard has
+            # to run inline, so the larger frame never adds to the loop period.
+            presentation_display = DisplayWorker(
+                render=_render_presentation,
+                show=lambda canvas: True,
+                read_key=lambda: -1,
+                record=video.write,
+                rate_hz=config.ui_display_rate_hz,
+                asynchronous=True,
+            )
+            presentation_display.start()
+            logger.info("Presentation video drawn off screen for the recording only")
+
         logger.info(
             "Perception on the '%s' camera; ego-vehicle exclusion %.1f%% of that view",
             pipeline.view.mode,
@@ -455,6 +530,7 @@ def main() -> None:
         logger.info("Entering main loop - Ctrl+C or SIGTERM to stop")
         t_start = time.perf_counter()
         last_fresh_capture = t_start
+        orbit_image: np.ndarray | None = None
 
         while not _shutdown:
             t_iter = time.perf_counter()
@@ -475,6 +551,15 @@ def main() -> None:
                 time.sleep(0.005)
                 continue
             last_fresh_capture = time.perf_counter()
+
+            # Polled here, not on the dashboard thread, because the socket
+            # transport is not thread safe. A missed read keeps the last
+            # image so the video does not flash the placeholder.
+            if args.presentation:
+                with stats.time("orbit_capture"):
+                    latest_orbit = client.capture_orbit()
+                if latest_orbit is not None:
+                    orbit_image = latest_orbit
 
             with stats.time("vehicle_state"):
                 state = client.get_vehicle_state()
@@ -514,7 +599,8 @@ def main() -> None:
 
             # The command has already gone out and primary_loop is recorded,
             # so nothing below counts as autonomy latency.
-            if display is not None and frame_count % render_every == 0:
+            workers = [worker for worker in (display, presentation_display) if worker is not None]
+            if workers and frame_count % render_every == 0:
                 telemetry = _build_dashboard_telemetry(
                     state,
                     command,
@@ -523,18 +609,20 @@ def main() -> None:
                     pipeline,
                     autopilot_active,
                     timing_overlay,
-                    display,
+                    workers[0],
                 )
-                display.publish(
-                    DisplayState(
-                        result=result,
-                        telemetry=telemetry,
-                        plan=plan,
-                        valid_roi=pipeline.valid_roi,
-                        debug_view=debug_view,
-                        timing_overlay=timing_overlay,
-                    )
+                # One snapshot for both: each worker only reads it.
+                snapshot = DisplayState(
+                    result=result,
+                    telemetry=telemetry,
+                    plan=plan,
+                    valid_roi=pipeline.valid_roi,
+                    debug_view=debug_view,
+                    timing_overlay=timing_overlay,
+                    orbit=orbit_image,
                 )
+                for worker in workers:
+                    worker.publish(snapshot)
 
             if display is not None:
                 if display.closed:
@@ -567,7 +655,7 @@ def main() -> None:
 
             now = time.perf_counter()
             if now - t_last_log >= config.runtime_log_interval_s:
-                _log_runtime(pipeline, display)
+                _log_runtime(pipeline, display, presentation_display)
                 t_last_log = now
             if args.benchmark_seconds > 0 and now - t_start >= args.benchmark_seconds:
                 logger.info("Benchmark duration reached")
@@ -579,6 +667,8 @@ def main() -> None:
         # Stop drawing before the window is torn down and the video is closed.
         if display is not None:
             display.stop()
+        if presentation_display is not None:
+            presentation_display.stop()
         if video is not None:
             video.close()
             _log_video(video)
@@ -587,7 +677,7 @@ def main() -> None:
         client.disconnect()
         elapsed = time.perf_counter() - t_start
         logger.info("Session complete - %d frames in %.1f s", frame_count, elapsed)
-        _log_runtime(pipeline, display)
+        _log_runtime(pipeline, display, presentation_display)
         if recorder is not None:
             report = recorder.report(stats)
             out = args.benchmark_out or f"output/benchmarks/{recorder.label}.json"

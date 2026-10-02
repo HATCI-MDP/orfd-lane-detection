@@ -7,10 +7,13 @@ import math
 import cv2
 import numpy as np
 
-from offroad_autonomy.visualization.layout import Rect
+from offroad_autonomy.visualization.layout import COVER_CROP_ANCHOR, Rect
 from offroad_autonomy.visualization.text import BODY_STRONG, TextRenderer, TextStyle
 
 Color = tuple[int, int, int]
+
+#: Scale on each axis and crop offsets from ``blit_cover``.
+CoverTransform = tuple[float, float, int, int]
 
 
 def fill_rect(canvas: np.ndarray, rect: Rect, color: Color) -> None:
@@ -26,6 +29,30 @@ def blend_rect(canvas: np.ndarray, rect: Rect, color: Color, alpha: float) -> No
     if roi.size == 0:
         return
     cv2.addWeighted(np.full_like(roi, color), alpha, roi, 1.0 - alpha, 0, roi)
+
+
+def blit_cover(canvas: np.ndarray, image: np.ndarray, rect: Rect) -> CoverTransform:
+    """Fills ``rect`` with the image scaled to cover it, cropping the overflow.
+
+    Returns the transform, so points in the source can be mapped onto the
+    canvas with ``cover_point``.
+    """
+    src_h, src_w = image.shape[:2]
+    scale = max(rect.w / src_w, rect.h / src_h)
+    new_w = max(rect.w, int(round(src_w * scale)))
+    new_h = max(rect.h, int(round(src_h * scale)))
+    resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    off_x = (new_w - rect.w) // 2
+    off_y = int(round((new_h - rect.h) * COVER_CROP_ANCHOR))
+    canvas[rect.y : rect.bottom, rect.x : rect.right] = resized[
+        off_y : off_y + rect.h, off_x : off_x + rect.w
+    ]
+    return new_w / src_w, new_h / src_h, off_x - rect.x, off_y - rect.y
+
+
+def cover_point(transform: CoverTransform, point: tuple[int, int]) -> tuple[int, int]:
+    scale_x, scale_y, off_x, off_y = transform
+    return int(round(point[0] * scale_x)) - off_x, int(round(point[1] * scale_y)) - off_y
 
 
 def draw_bar(

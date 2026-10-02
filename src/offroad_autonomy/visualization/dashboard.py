@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 import cv2
 import numpy as np
@@ -19,7 +20,7 @@ from offroad_autonomy.types import (
     PipelineStepResult,
 )
 from offroad_autonomy.visualization import bands
-from offroad_autonomy.visualization.layout import COVER_CROP_ANCHOR, Rect, build_layout
+from offroad_autonomy.visualization.layout import Rect, build_layout
 from offroad_autonomy.visualization.text import (
     BODY,
     BODY_STRONG,
@@ -37,9 +38,12 @@ from offroad_autonomy.visualization.text import (
     TextStyle,
 )
 from offroad_autonomy.visualization.widgets import (
+    CoverTransform,
     blend_rect,
+    blit_cover,
     chip_height,
     chip_width,
+    cover_point,
     draw_bar,
     draw_centered_bar,
     draw_chip,
@@ -100,9 +104,22 @@ _DASHBOARD_TILE_NOTE_BASELINE = 94
 
 # Frame pixels below the hood's top edge.
 _EGO_LABEL_DROP_PX = 22
+EGO_LABEL = "EGO - EXCLUDED"
 
 _PIPELINE_READOUT_W = 330
 _READOUT_ROW_H = 22
+
+
+class DashcamOverlay(NamedTuple):
+    """The dashcam frame with perception and plan drawn on, before scaling.
+
+    ``ego_label_px`` is where the hood label goes, in frame pixels. The label
+    is left to whoever scales the image, since text drawn here would be
+    scaled with it.
+    """
+
+    image: np.ndarray
+    ego_label_px: tuple[int, int] | None
 
 
 @dataclass
@@ -190,9 +207,9 @@ class AutonomyDashboard:
             self._draw_pipeline_view(canvas, viewport, result)
         else:
             image = self._main_view(debug_view, result, plan, valid_roi)
-            transform = self._blit_cover(canvas, image, viewport)
+            transform = blit_cover(canvas, image, viewport)
             if self._ego_label_px is not None:
-                self._draw_ego_label(canvas, transform)
+                self._draw_ego_label(canvas, transform, self._ego_label_px)
         self._draw_viewport_labels(canvas, viewport, debug_view)
         if debug_view in ("default", "raw"):
             self._draw_mask_inset(canvas, viewport, result)
@@ -228,6 +245,20 @@ class AutonomyDashboard:
         if valid_roi is not None and not bool(valid_roi.all()):
             ego = ~self._ensure_mask(valid_roi, frame.shape[:2])
         return self._build_overlay(frame, mask, plan, result.stabilized.mask.shape[:2], ego)
+
+    def dashcam_overlay(
+        self,
+        result: PipelineStepResult,
+        plan: PathPlan | None,
+        valid_roi: np.ndarray | None,
+    ) -> DashcamOverlay:
+        """The image the default view shows, for other layouts to scale.
+
+        ``plan`` is None under safe stop, which leaves the path and its
+        lookahead dot off, as on the dashboard."""
+        self._ego_label_px = None
+        image = self._main_view("default", result, plan, valid_roi)
+        return DashcamOverlay(image, self._ego_label_px)
 
     # ----------------------------------------------------------- static layer
 
@@ -379,26 +410,6 @@ class AutonomyDashboard:
 
     # --------------------------------------------------------------- viewport
 
-    def _blit_cover(
-        self, canvas: np.ndarray, image: np.ndarray, rect: Rect
-    ) -> tuple[float, float, int, int]:
-        """Fills ``rect`` with the image scaled to cover it, cropping the overflow.
-
-        Returns the scale on each axis and the crop offsets, so points in the
-        source can be mapped onto the canvas.
-        """
-        src_h, src_w = image.shape[:2]
-        scale = max(rect.w / src_w, rect.h / src_h)
-        new_w = max(rect.w, int(round(src_w * scale)))
-        new_h = max(rect.h, int(round(src_h * scale)))
-        resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-        off_x = (new_w - rect.w) // 2
-        off_y = int(round((new_h - rect.h) * COVER_CROP_ANCHOR))
-        canvas[rect.y : rect.bottom, rect.x : rect.right] = resized[
-            off_y : off_y + rect.h, off_x : off_x + rect.w
-        ]
-        return new_w / src_w, new_h / src_h, off_x - rect.x, off_y - rect.y
-
     def _draw_viewport_labels(self, canvas: np.ndarray, rect: Rect, debug_view: str) -> None:
         if debug_view == "default":
             text = f"Dashcam {self.sensor.model} {self.sensor.fov_x_deg:.0f} Deg"
@@ -501,14 +512,13 @@ class AutonomyDashboard:
             solid=True,
         )
 
-    def _draw_ego_label(self, canvas: np.ndarray, transform: tuple[float, float, int, int]) -> None:
-        scale_x, scale_y, off_x, off_y = transform
-        cx, cy = self._ego_label_px
-        x = int(round(cx * scale_x)) - off_x
-        y = int(round(cy * scale_y)) - off_y
+    def _draw_ego_label(
+        self, canvas: np.ndarray, transform: CoverTransform, anchor: tuple[int, int]
+    ) -> None:
+        x, y = cover_point(transform, anchor)
         self._text.draw(
             canvas,
-            "EGO - EXCLUDED",
+            EGO_LABEL,
             x,
             y,
             BODY_STRONG,

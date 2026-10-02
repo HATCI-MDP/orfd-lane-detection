@@ -89,6 +89,7 @@ to reproduce the former reversal and verify the brake-hold/forward-restart fix.
 - `E` safe stop, `P` resume, `0`, `1`, `6`, `9` debug views, `T` timing overlay, `Q` quit
 - `--headless` runs without a window
 - `--record-video` saves the dashboard to an mp4 (see Record The Dashboard below)
+- `--presentation` saves a 1920 x 1080 video for an audience outside the team (see Record A Presentation below)
 
 ### Record The Dashboard
 
@@ -111,6 +112,38 @@ front, so it plays in the VS Code media preview and in browsers.
   when the dashboard stalls.
 - With `--headless` the dashboard is drawn off screen for the recording only.
 - Quality, preset and queue length are in the `recording` section of `configs/default.yaml`.
+
+### Record A Presentation
+
+```bash
+offroad-autonomy --presentation
+offroad-autonomy --presentation --headless --record-video-out ~/videos/demo.mp4
+```
+
+`--presentation` implies `--record-video` and uses the same ffmpeg recorder, output path and
+`recording` settings, but the video holds a 1920 x 1080 "Split Story" frame instead of the dashboard.
+The window, if there is one, still shows the operator dashboard, unchanged.
+
+- **Left:** a chase camera behind and above the vehicle, labelled Orbit Camera. Until its first
+  frame arrives the view reads No Orbit Signal.
+- **Top right:** the dashcam image with the traversable mask, planned path and ego exclusion, drawn
+  by the same code as the dashboard's view.
+- **Bottom right:** speed, steering, Autonomy FPS, latency mean / p95, Road / Valid Px and
+  segmentation confidence, coloured by the dashboard's rules and thresholds.
+- **Safe stop:** the header chip turns solid red, the orbit view gets a red wash and border, and no
+  path is drawn on the dashcam image.
+
+The orbit camera is attached only with this flag, and no pipeline stage reads it. Its pose,
+resolution and field of view are in the `presentation` section of `configs/default.yaml`. The main
+loop polls it right after each dashcam frame, because the socket transport cannot be read from the
+dashboard thread. That poll is logged as the `orbit_capture` stage and is part of the measured
+primary loop, so the Autonomy FPS in the video is the real rate of the loop with the camera
+attached. It has not yet been measured against BeamNG, so expect a lower FPS than without the flag
+until it has.
+
+The presentation frame is drawn on a thread of its own, separate from the window's, so it never
+adds to the loop period, even when the window has to be drawn inline. Its render time is in the
+periodic runtime log line.
 
 ### Dashboard
 
@@ -162,6 +195,7 @@ BEAMNG_HOST=192.168.1.50 docker compose up
 | --------------------------------------------------------------- | ------------------------------------------------------- |
 | `offroad-autonomy --config <file>`                              | Run the stack with a config                             |
 | `offroad-autonomy --record-video`                               | Run and save the dashboard to `output/videos/` as mp4   |
+| `offroad-autonomy --presentation`                               | Run and save a 1920 x 1080 presentation video           |
 | `ruff check src tests scripts`                                  | Lint                                                    |
 | `ruff format src tests scripts`                                 | Format (CI runs it with `--check`)                      |
 | `python -m build`                                               | Build the wheel and sdist                               |

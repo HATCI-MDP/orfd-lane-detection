@@ -1,5 +1,6 @@
 """Unit tests for configuration loading."""
 
+import math
 from pathlib import Path
 from unittest.mock import patch
 
@@ -207,3 +208,51 @@ def test_grid_mpc_profile_combines_the_grid_planner_with_mpc():
     assert config.planner_mode == "grid"
     assert config.controller == "mpc"
     assert config.mpc == mpc_only.mpc
+
+
+def test_orbit_camera_defaults_match_the_shipped_config():
+    config = load_config(DEFAULT_YAML)
+    defaults = PipelineConfig().orbit_camera
+
+    assert config.orbit_camera.pos == pytest.approx(defaults.pos)
+    assert config.orbit_camera.dir == pytest.approx(defaults.dir)
+    assert config.orbit_camera.sensor == defaults.sensor
+
+
+def test_orbit_camera_pose_and_sensor_are_configurable(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "presentation:\n"
+        "  orbit_camera:\n"
+        "    pos: [0.0, 8.0, 3.0]\n"
+        "    pitch_deg: -20.0\n"
+        "    sensor:\n"
+        "      width: 640\n"
+        "      height: 480\n"
+        "      fov_h: 80.0\n",
+        encoding="utf-8",
+    )
+
+    orbit = load_config(config_path).orbit_camera
+
+    assert orbit.pos == (0.0, 8.0, 3.0)
+    assert orbit.dir[2] == pytest.approx(-math.sin(math.radians(20.0)))
+    assert (orbit.width, orbit.height, orbit.fov_x_deg) == (640, 480, 80.0)
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        "    pos: [0.0, 6.0]",
+        "    pitch_deg: 95",
+        "    sensor:\n      width: 0",
+        "    sensor:\n      fov_h: 180",
+        "    sensor:\n      target_fps: 0",
+    ],
+)
+def test_invalid_orbit_camera_settings_are_refused(tmp_path, block):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("presentation:\n  orbit_camera:\n" + block + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="presentation.orbit_camera"):
+        load_config(config_path)

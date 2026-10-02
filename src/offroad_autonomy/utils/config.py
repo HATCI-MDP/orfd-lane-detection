@@ -16,6 +16,7 @@ from offroad_autonomy.types import (
     DEBUG_VIEWS,
     DEFAULT_CAMERA,
     DEFAULT_DASHBOARD_COLORS,
+    DEFAULT_ORBIT_CAMERA,
     DEFAULT_PERCEPTION_PROMPTS,
     GMSL2_CAPTURE_SENSOR,
     CameraSensor,
@@ -160,6 +161,28 @@ def _load_camera(raw: dict) -> CameraSpec:
         sensor=_load_sensor(raw.get("sensor")),
         ego_mask=_load_ego_mask(raw.get("ego_mask"), default.ego_mask),
     )
+
+
+def _load_orbit_camera(raw: dict) -> CameraSpec:
+    """A bad pose fails at load time, before a run is recorded with the
+    vehicle out of frame."""
+    default = DEFAULT_ORBIT_CAMERA
+    raw_pos = raw.get("pos", list(default.pos))
+    if not isinstance(raw_pos, (list, tuple)) or len(raw_pos) != 3:
+        raise ValueError("presentation.orbit_camera.pos must be a list of 3 numbers")
+    pos = tuple(float(value) for value in raw_pos)
+    pitch = float(raw.get("pitch_deg", -12.0))
+    if not -90.0 < pitch < 90.0:
+        raise ValueError("presentation.orbit_camera.pitch_deg must be between -90 and 90")
+    sensor = _load_sensor(raw.get("sensor"), default.sensor)
+    if sensor.width < 1 or sensor.height < 1:
+        raise ValueError("presentation.orbit_camera.sensor width and height must be positive")
+    if not 0.0 < sensor.fov_x_deg < 180.0:
+        raise ValueError("presentation.orbit_camera.sensor.fov_h must be between 0 and 180")
+    if sensor.target_fps <= 0.0:
+        raise ValueError("presentation.orbit_camera.sensor.target_fps must be > 0")
+    direction, up = mount_pose(pitch)
+    return CameraSpec(name=default.name, pos=pos, dir=direction, up=up, sensor=sensor)
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -319,6 +342,7 @@ def load_config(path: str | Path) -> PipelineConfig:
         beamng_vehicle=bng.get("vehicle", "pickup"),
         beamng_spawn_index=bng.get("spawn_index", 0),
         camera=camera,
+        orbit_camera=_load_orbit_camera(_section(_section(raw, "presentation"), "orbit_camera")),
         map_spawns=bng.get("maps", {}),
         model_weights=perc.get("model_weights", "models/yoloe-26x-seg.pt"),
         confidence_threshold=perc.get("segmentation_threshold", 0.25),

@@ -5,7 +5,7 @@ import pytest
 
 from offroad_autonomy.visualization import bands
 from offroad_autonomy.visualization.layout import Rect, build_layout
-from offroad_autonomy.visualization.text import BODY, DISPLAY, TextRenderer
+from offroad_autonomy.visualization.text import BODY, DISPLAY, LABEL, LABEL_SPACED, TextRenderer
 from offroad_autonomy.visualization.widgets import (
     draw_bar,
     draw_centered_bar,
@@ -145,3 +145,24 @@ def test_centered_bar_fills_outwards_from_the_middle():
 
     assert tuple(canvas[10, 35]) == (255, 255, 255)
     assert tuple(canvas[10, 70]) == (40, 40, 40)
+
+
+def test_letter_spacing_widens_the_run_by_the_gaps():
+    text = TextRenderer()
+    word = "AUTONOMY"
+
+    plain = text.width(word, LABEL)
+    spaced = text.width(word, LABEL_SPACED)
+
+    assert spaced - plain == pytest.approx(LABEL_SPACED.tracking * (len(word) - 1), abs=1)
+
+
+def test_spaced_text_draws_inside_its_measured_width():
+    text = TextRenderer()
+    canvas = np.zeros((40, 200, 3), dtype=np.uint8)
+
+    drawn = text.draw(canvas, "ORBIT", 10, 30, LABEL_SPACED, (255, 255, 255))
+
+    columns = np.flatnonzero(canvas.any(axis=(0, 2)))
+    assert columns.min() >= 10
+    assert columns.max() < 10 + drawn

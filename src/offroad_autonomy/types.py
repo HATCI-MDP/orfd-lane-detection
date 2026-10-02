@@ -229,6 +229,18 @@ DEFAULT_CAMERA = CameraSpec(
 )
 
 
+# A chase camera for the presentation video only. No pipeline stage reads it,
+# so it needs no ego mask and its pose does not affect perception.
+_ORBIT_DIR, _ORBIT_UP = mount_pose(-12.0)
+DEFAULT_ORBIT_CAMERA = CameraSpec(
+    name="orbit",
+    pos=(0.0, 6.0, 2.6),
+    dir=_ORBIT_DIR,
+    up=_ORBIT_UP,
+    sensor=CameraSensor(model="Orbit", width=960, height=728, fov_x_deg=95.0, target_fps=20.0),
+)
+
+
 @dataclass
 class CameraFrame:
     """One dashcam capture shared by inference and display."""
@@ -381,6 +393,8 @@ class PipelineConfig:
     beamng_vehicle: str = "pickup"
     beamng_spawn_index: int = 0
     camera: CameraSpec = field(default_factory=lambda: replace(DEFAULT_CAMERA))
+    #: Attached only with --presentation.
+    orbit_camera: CameraSpec = field(default_factory=lambda: replace(DEFAULT_ORBIT_CAMERA))
     map_spawns: dict = field(default_factory=dict)
 
     model_weights: str = "models/yoloe-26x-seg.pt"

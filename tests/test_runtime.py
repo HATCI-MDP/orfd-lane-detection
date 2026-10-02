@@ -33,7 +33,7 @@ def test_automatic_stop_does_not_resend_the_previous_throttle(monkeypatch):
     detector.update.side_effect = stop
     monkeypatch.setattr("sys.argv", ["offroad-autonomy", "--headless"])
     monkeypatch.setattr(app, "load_config", lambda _: cfg)
-    monkeypatch.setattr(app, "BeamNGClient", lambda _: client)
+    monkeypatch.setattr(app, "BeamNGClient", lambda _, **__: client)
     monkeypatch.setattr(app, "AutonomyPipeline", lambda _: pipeline)
     monkeypatch.setattr(app, "_StuckDetector", lambda **_: detector)
     monkeypatch.setattr(app.signal, "signal", Mock())

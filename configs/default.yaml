@@ -454,5 +454,33 @@ recording:
   preset: veryfast
   # Frames waiting for the encoder. When it falls behind, new frames are
   # dropped from the video rather than queued, so neither the dashboard nor
-  # the control loop ever waits on it. Each 1600 x 900 frame holds 4.3 MB.
+  # the control loop ever waits on it. Each 1600 x 900 frame holds 4.3 MB,
+  # and each 1920 x 1080 --presentation frame 6.2 MB.
   queue_frames: 8
+
+presentation:
+  # --presentation records a 1920 x 1080 video for an audience outside the
+  # team: this chase camera on the left, the dashcam overlay and key stats on
+  # the right. It is attached only with that flag, and no pipeline stage
+  # reads it, so nothing here changes how the vehicle drives.
+  orbit_camera:
+    # BeamNG vehicle space: +X left, +Y behind, +Z up. 6 m back and 2.6 m up
+    # keeps the whole vehicle in frame with the trail ahead of it visible.
+    pos: [0.0, 6.0, 2.6]
+    # Tilted down enough that the vehicle sits in the lower half of the view
+    # and the trail it is about to drive fills the rest.
+    pitch_deg: -12.0
+    sensor:
+      model: Orbit
+      # Close to the 1228 x 932 orbit view's aspect, so the cover fit crops
+      # almost nothing. Smaller than the view because the main loop polls
+      # this camera after every dashcam frame and every pixel costs capture
+      # time there; raise it only if orbit_capture stays short.
+      width: 960
+      height: 728
+      # Horizontal FOV. Wide enough for the vehicle and both trail edges at
+      # 6 m without the fisheye stretch of the dashcam's 120 degrees.
+      fov_h: 95.0
+      # Matches recording.fps; the video cannot show orbit frames faster
+      # than it records them.
+      target_fps: 20.0

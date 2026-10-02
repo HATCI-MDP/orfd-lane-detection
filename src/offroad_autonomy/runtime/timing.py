@@ -19,6 +19,7 @@ import numpy as np
 
 MAIN_STAGES = (
     "capture",
+    "orbit_capture",
     "vehicle_state",
     "preprocess",
     "segmentation",

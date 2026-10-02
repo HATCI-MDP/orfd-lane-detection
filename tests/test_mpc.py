@@ -306,7 +306,7 @@ def test_application_camera_watchdog_parks(repeated, monkeypatch):
     client.capture_frame.side_effect = capture
     monkeypatch.setattr("sys.argv", ["offroad-autonomy", "--headless"])
     monkeypatch.setattr(app, "load_config", lambda _: cfg)
-    monkeypatch.setattr(app, "BeamNGClient", lambda _: client)
+    monkeypatch.setattr(app, "BeamNGClient", lambda _, **__: client)
     monkeypatch.setattr(app, "AutonomyPipeline", lambda _: pipeline)
     monkeypatch.setattr(app, "_log_runtime", Mock())
     monkeypatch.setattr(app.signal, "signal", Mock())

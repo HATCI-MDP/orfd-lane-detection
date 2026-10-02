@@ -35,6 +35,8 @@ class DisplayState:
     valid_roi: np.ndarray | None = None
     debug_view: str = "default"
     timing_overlay: bool = False
+    #: The orbit camera's latest image, for the presentation video only.
+    orbit: np.ndarray | None = None
 
 
 class DisplayWorker:
