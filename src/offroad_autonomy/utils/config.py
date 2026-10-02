@@ -22,6 +22,7 @@ from offroad_autonomy.types import (
     PipelineConfig,
     mount_pose,
 )
+from offroad_autonomy.utils import environment
 
 logger = logging.getLogger("offroad_autonomy.config")
 
@@ -187,17 +188,43 @@ def _apply_env_overrides(bng: dict) -> dict:
     return bng
 
 
+def _resolve_platform_settings(bng: dict, ui: dict) -> tuple[dict, dict]:
+    """A fully explicit config never inspects the machine, so deployments
+    that pin every value behave the same everywhere."""
+    if not environment.needs_detection(bng, ui):
+        return bng, ui
+    facts = environment.detect_platform()
+    bng, ui = environment.resolve_auto(bng, ui, facts)
+    platform = facts.os_name
+    if facts.is_wsl:
+        platform = f"wsl2 ({facts.wsl_networking})"
+    action = "attaching to"
+    if bng.get("launch"):
+        action = "launching or attaching to"
+    host = bng.get("host") or "<unset, set BEAMNG_HOST>"
+    logger.info(
+        "Platform %s: %s BeamNG at %s:%s over %s",
+        platform,
+        action,
+        host,
+        bng.get("port", 64256),
+        bng.get("camera_transport"),
+    )
+    return bng, ui
+
+
 def load_config(path: str | Path) -> PipelineConfig:
     raw = _read_yaml(Path(path))
 
-    bng = _apply_env_overrides(_section(raw, "beamng"))
+    bng, ui = _resolve_platform_settings(
+        _apply_env_overrides(_section(raw, "beamng")), _section(raw, "ui")
+    )
     if "cameras" in bng:
         raise ValueError(
             "Replace beamng.cameras with the single beamng.camera dashcam configuration"
         )
     camera = _load_camera(_section(bng, "camera"))
     perc = _section(raw, "perception")
-    ui = _section(raw, "ui")
     safety = _section(raw, "safety")
     pre = _section(raw, "preprocessing")
     post = _section(raw, "postprocessing")

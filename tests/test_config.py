@@ -1,11 +1,14 @@
 """Unit tests for configuration loading."""
 
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from offroad_autonomy.types import DEFAULT_CAMERA, PipelineConfig
+from offroad_autonomy.utils import environment
 from offroad_autonomy.utils.config import load_config
+from offroad_autonomy.utils.environment import PlatformFacts
 
 REPO = Path(__file__).resolve().parents[1]
 DEFAULT_YAML = REPO / "configs" / "default.yaml"
@@ -59,10 +62,14 @@ def test_invalid_segmentation_mode_is_refused(tmp_path):
         load_config(config_path)
 
 
-def test_jetson_config_extends_the_default():
-    config = load_config(REPO / "configs" / "jetson.yaml")
-    base = load_config(DEFAULT_YAML)
+def test_jetson_config_extends_the_default(monkeypatch):
+    monkeypatch.setenv("BEAMNG_HOST", "192.168.1.50")
+    jetson = PlatformFacts(os_name="linux", default_gateway="192.168.1.1")
+    with patch.object(environment, "detect_platform", return_value=jetson):
+        config = load_config(REPO / "configs" / "jetson.yaml")
+        base = load_config(DEFAULT_YAML)
 
+    assert config.beamng_host == "192.168.1.50"
     assert config.beamng_launch is False
     assert config.beamng_camera_transport == "socket"
     assert config.ui_headless is True

@@ -39,6 +39,11 @@ class BeamNGClient:
         self._shared_memory = config.beamng_camera_transport == "shared_memory"
 
     def connect(self) -> None:
+        if not self._config.beamng_host:
+            raise RuntimeError(
+                "No BeamNG address for this machine: BeamNG.tech runs only on Windows, "
+                "so set BEAMNG_HOST to the address of the Windows machine running it"
+            )
         from beamngpy import BeamNGpy, Scenario, Vehicle
         from beamngpy.sensors.camera import Camera
 

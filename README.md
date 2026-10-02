@@ -6,28 +6,48 @@ Off-Road Autonomy drives a vehicle along unmarked dirt trails in BeamNG.tech usi
 
 Perception uses RGB segmentation only. There is no depth estimation, terrain fusion or depth-based obstacle veto. One GMSL2 dashcam with 120° horizontal FOV supplies segmentation, planning, control and the dashboard. It retains the previous dashcam mount: height 1.85 m, forward offset -0.30 m, pitch -8°. Capture is 960x620 at 30 FPS, processed at 720x465. The dashboard draws the same captured frame and its results; it does not poll another camera. Debug views are `0` path, `1` raw dashcam, `6` mask and `9` pipeline. Configure the sensor, mount and hood exclusion under `beamng.camera`. Ground distances still use a flat-ground assumption. Old `beamng.cameras`, `segmentation_mode` and `stitching` settings must be removed.
 
-It runs on a Windows workstation next to the simulator, or in a Docker container on an NVIDIA Jetson that connects to the simulator over the network.
+It runs on Windows, WSL2, macOS or a Jetson. BeamNG.tech itself runs only on Windows, so every other machine connects to it over the network.
 
 When the hood hides the nearest part of the path, steering joins a visible lookahead point with a geometric pursuit arc. It does not extrapolate the path backward under the hood, which could reverse the commanded turn. Stanley tracking resumes when the predicted vehicle position lies within the observed path.
 
-## Development Setup
+## Setup
 
 Requires Python 3.10+ and BeamNG.tech 0.38 (`beamngpy` 1.35).
 
 ```bash
 python -m venv .venv
-.venv\Scripts\activate          # Linux: source .venv/bin/activate
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
 ```
 
 Put the model weights in `models/`: `yoloe-26x-seg.pt` (default config), `yoloe-26s-seg.pt` (Jetson) and `mobileclip2_b.ts` (the YOLOE text encoder).
 
-Set `beamng.home` in `configs/default.yaml` to your BeamNG.tech folder, or export `BEAMNG_HOME`.
+### Connect To BeamNG
 
-## Run Locally
+BeamNG.tech runs only on Windows. The Windows machine running it is the BeamNG host. The stack runs either on the BeamNG host or on another machine that connects to it.
+
+| Stack Runs On                | What To Set                                                  | How To Start BeamNG      |
+| ---------------------------- | ------------------------------------------------------------ | ------------------------ |
+| Windows, on the BeamNG host  | Nothing. Optional: `BEAMNG_HOME` lets the stack start BeamNG | Normally                 |
+| WSL2, on the BeamNG host     | Nothing                                                      | Listening on the network |
+| macOS                        | `BEAMNG_HOST` (the BeamNG host's address)                    | Listening on the network |
+| Jetson                       | `BEAMNG_HOST` (the BeamNG host's address)                    | Listening on the network |
+
+For WSL2, macOS and Jetson, BeamNG must listen on the network. Start it from PowerShell on the BeamNG host:
+
+```powershell
+cd "<your BeamNG.tech folder>"
+.\Bin64\BeamNG.tech.x64.exe -nosteam -tcom -tport 64256 -tcom-listen-ip "*"
+```
+
+If the connection is refused, allow TCP port 64256 through the Windows firewall. For macOS and Jetson, find the BeamNG host's address with `ipconfig`.
+
+The first log line shows the address the stack connects to. `BEAMNG_HOST` overrides it on any machine.
+
+## Run
 
 ```bash
-offroad-autonomy --config configs/default.yaml
+offroad-autonomy
 ```
 
 For MPC with Stanley fallback, run `offroad-autonomy --config configs/mpc.yaml`.
@@ -42,34 +62,28 @@ connected road at confidence 0.18 or above and still rejects insufficient or
 disconnected road masks. Run `python scripts/check_brake_hold.py --reproduce-arcade`
 to reproduce the former reversal and verify the brake-hold/forward-restart fix.
 
-- Launches BeamNG.tech if it is not already running, then spawns the vehicle and opens the dashboard
+- Starts BeamNG.tech when `BEAMNG_HOME` is set and it is not already running, then spawns the vehicle and opens the dashboard
 - `E` safe stop, `P` resume, `0`, `1`, `6`, `9` debug views, `T` timing overlay, `Q` quit
 - `--headless` runs without a window
 
 ## Run On Jetson (Docker)
 
-Requires JetPack 6 with the NVIDIA container runtime.
+Requires JetPack 6 with the NVIDIA container runtime. Start BeamNG listening on the network first (see [Connect To BeamNG](#connect-to-beamng)).
 
-1. On the BeamNG machine, start the simulator listening on the network, and allow TCP port 64256 through the firewall:
-
-```powershell
-Bin64\BeamNG.tech.x64.exe -nosteam -tcom -tport 64256 -tcom-listen-ip "*"
-```
-
-2. On the Jetson, build the image and export the TensorRT engine (first time only, since engines are tied to the device that builds them):
+1. Build the image and export the TensorRT engine (first time only, since engines are tied to the device that builds them):
 
 ```bash
 docker compose build
 docker compose run --rm --entrypoint python autonomy scripts/export_engine.py --weights models/yoloe-26s-seg.pt
 ```
 
-3. Run:
+2. Run:
 
 ```bash
 BEAMNG_HOST=192.168.1.50 docker compose up
 ```
 
-- The container runs `configs/jetson.yaml`: attach to the running simulator, socket camera transport, TensorRT engine, headless
+- The container runs `configs/jetson.yaml`: TensorRT engine, headless
 - `models/`, `output/` and `configs/` are mounted from the host, so config changes need no rebuild
 - `docker compose stop` parks the vehicle before disconnecting
 
@@ -103,7 +117,7 @@ BEAMNG_HOST=192.168.1.50 docker compose up
 - Package code is in `src/offroad_autonomy/`; the entry point is `main.py`, and the stage order is in `pipeline.py`
 - Only `simulation/beamng_client.py` imports `beamngpy`
 - `configs/default.yaml` holds every tuning value, with the reason for it next to the key; `configs/jetson.yaml` overrides it through `extends:`
-- `BEAMNG_HOST`, `BEAMNG_PORT`, `BEAMNG_HOME` and `BEAMNG_LAUNCH` override the `beamng:` block
+- `beamng.host`, `beamng.launch`, `beamng.camera_transport` and `ui.display_async` default to `auto` and are derived from the platform; `BEAMNG_HOST`, `BEAMNG_PORT`, `BEAMNG_HOME` and `BEAMNG_LAUNCH` override the `beamng:` block
 - The dashboard runs on its own thread, and the control loop never waits for it
 - After changing the mount or lens in `beamng.camera`, re-run `scripts/derive_ego_mask.py` and re-check `planning.roi_height`
 - Manual driving (W/A/S/D under safe stop) reads the OS key state and works only on Windows

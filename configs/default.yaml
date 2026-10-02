@@ -1,14 +1,20 @@
 beamng:
   # BEAMNG_HOME / BEAMNG_HOST / BEAMNG_PORT / BEAMNG_LAUNCH override these, so
   # a deployment can point at its simulator without editing this file.
-  home: "E:\\BeamNG.tech.v0.38.3.0"
-  host: localhost
+  # The install folder is personal, so it comes from BEAMNG_HOME; empty means
+  # the stack attaches to a simulator someone already started.
+  home: ""
+  # auto: localhost on Windows and mirrored WSL2, the Windows host under NAT
+  # WSL2, and unset (BEAMNG_HOST required) on macOS and Linux, because
+  # BeamNG.tech runs only on Windows. See utils/environment.py.
+  host: auto
   port: 64256
+  # auto launches only from Windows with a local host and a home folder;
   # false attaches to an already running simulator and never quits it.
-  launch: true
-  # shared_memory is fastest but needs BeamNG on this machine; a remote
-  # client (the Jetson container) must use socket.
-  camera_transport: shared_memory
+  launch: auto
+  # auto picks shared_memory, the fastest, only for a native Windows client
+  # on the same machine; it cannot cross the network or the WSL2 VM boundary.
+  camera_transport: auto
   map: automation_test_track
   vehicle: hopper
   spawn_index: 0
@@ -344,8 +350,10 @@ ui:
   # nothing; this only matters when display_async is false.
   render_every_n: 1
   # Keeps rendering and GUI time out of the autonomy loop, so "Autonomy FPS"
-  # measures the vehicle rather than the window. false is for debugging only.
-  display_async: true
+  # measures the vehicle rather than the window. auto turns it off on macOS,
+  # which drives OpenCV windows only from the main thread, and on WSL2, where
+  # WSLg hangs on the first frame drawn from another thread.
+  display_async: auto
   # The autonomy loop is not synchronised to this; lowering it frees GPU/CPU
   # for perception and nothing else.
   display_rate_hz: 20.0

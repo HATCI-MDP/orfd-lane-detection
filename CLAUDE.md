@@ -28,6 +28,8 @@ Rules that carry weight:
 - The control loop must never block on the dashboard.
 - Every tuning value lives in `configs/default.yaml` with its reason next to it, not as a
   literal in code.
+- Machine-specific simulator settings stay `auto` and resolve in `utils/environment.py`;
+  never write a host, install path or transport for one machine into a config.
 
 Prefer simple, well-defined boundaries over unnecessary abstractions or infrastructure.
 
