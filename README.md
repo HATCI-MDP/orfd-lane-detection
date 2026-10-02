@@ -66,6 +66,19 @@ to reproduce the former reversal and verify the brake-hold/forward-restart fix.
 - `E` safe stop, `P` resume, `0`, `1`, `6`, `9` debug views, `T` timing overlay, `Q` quit
 - `--headless` runs without a window
 
+### Dashboard
+
+The 1600 x 900 dashboard has a header with the autonomy status, the dashcam view with the traversable mask, planned path and ego exclusion, a Vehicle card, a Perception card and a Runtime strip. Speed is the largest number on screen.
+
+- **Safe stop:** a red wash, a red border and a banner cover the dashcam view, and no planned path is drawn.
+- **Autonomy FPS:** green at `visualization.dashboard.target_fps` or above, amber from `fps_warn_fraction` of it up to the target, red below that. Latency is red when its p95 passes `latency_budget_ms`.
+- **Segmentation confidence:** red below the gate's `planning.gate.confidence_threshold`, amber up to `confidence_good`, green above.
+- **Ticks:** the Road / Valid Px bar is marked at `safety.min_road_fraction` and the confidence bar at the gate threshold, both read from their own config sections.
+- **Dashboard FPS:** shown in its own tile and never colored, because a slow window says nothing about the vehicle.
+- **Held path:** when the planner holds a fallback path, it is drawn dashed in amber.
+
+Text is drawn with Pillow using the bundled IBM Plex Sans and Mono fonts in `src/offroad_autonomy/visualization/fonts/` (SIL Open Font License, included). A missing font file stops startup.
+
 ## Run On Jetson (Docker)
 
 Requires JetPack 6 with the NVIDIA container runtime. Start BeamNG listening on the network first (see [Connect To BeamNG](#connect-to-beamng)).

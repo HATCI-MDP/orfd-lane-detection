@@ -14,6 +14,7 @@ dependencies = [
     "beamngpy>=1.35,<1.36",
     "numpy>=1.26",
     "opencv-python>=4.8",
+    "pillow>=10.0",
     "pyyaml>=6.0",
     "scipy>=1.11",
     "torch>=2.1",
@@ -35,6 +36,10 @@ offroad-autonomy = "offroad_autonomy.main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+# The dashboard loads its fonts from disk at startup and never falls back to another face.
+offroad_autonomy = ["visualization/fonts/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

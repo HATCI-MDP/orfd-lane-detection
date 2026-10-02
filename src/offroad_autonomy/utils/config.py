@@ -18,6 +18,7 @@ from offroad_autonomy.types import (
     GMSL2_CAPTURE_SENSOR,
     CameraSensor,
     CameraSpec,
+    DashboardThresholds,
     EgoMaskSpec,
     PipelineConfig,
     mount_pose,
@@ -45,6 +46,41 @@ def _load_dashboard_colors(raw: object) -> dict[str, tuple[int, int, int]]:
     for key, default in DEFAULT_DASHBOARD_COLORS.items():
         colors[key] = _parse_color(raw.get(key), default)
     return colors
+
+
+def _load_dashboard_thresholds(dashboard: dict, gate: dict, safety: dict) -> DashboardThresholds:
+    """The two floors come from the gate and the safe stop, not from the
+    dashboard section, so the bar ticks always match what triggers them."""
+    defaults = DashboardThresholds()
+    thresholds = DashboardThresholds(
+        target_fps=float(dashboard.get("target_fps", defaults.target_fps)),
+        fps_warn_fraction=float(dashboard.get("fps_warn_fraction", defaults.fps_warn_fraction)),
+        latency_budget_ms=float(dashboard.get("latency_budget_ms", defaults.latency_budget_ms)),
+        confidence_floor=float(gate.get("confidence_threshold", defaults.confidence_floor)),
+        confidence_good=float(dashboard.get("confidence_good", defaults.confidence_good)),
+        road_floor=float(safety.get("min_road_fraction", defaults.road_floor)),
+        fps_bar_scale=float(dashboard.get("fps_bar_scale", defaults.fps_bar_scale)),
+        latency_bar_scale=float(dashboard.get("latency_bar_scale", defaults.latency_bar_scale)),
+        road_bar_full_scale=float(
+            dashboard.get("road_bar_full_scale", defaults.road_bar_full_scale)
+        ),
+    )
+    if thresholds.target_fps <= 0.0 or thresholds.latency_budget_ms <= 0.0:
+        raise ValueError("visualization.dashboard target_fps and latency_budget_ms must be > 0")
+    if not 0.0 < thresholds.fps_warn_fraction < 1.0:
+        raise ValueError("visualization.dashboard.fps_warn_fraction must be between 0 and 1")
+    if thresholds.confidence_good <= thresholds.confidence_floor:
+        raise ValueError(
+            "visualization.dashboard.confidence_good must be above planning.gate.confidence_threshold"
+        )
+    # A full scale at or below the target would push the target tick off the bar.
+    if min(thresholds.fps_bar_scale, thresholds.latency_bar_scale) <= 1.0:
+        raise ValueError("visualization.dashboard bar scales must be above 1")
+    if thresholds.road_bar_full_scale <= thresholds.road_floor:
+        raise ValueError(
+            "visualization.dashboard.road_bar_full_scale must exceed the safe stop floor"
+        )
+    return thresholds
 
 
 def _parse_vec3(
@@ -345,6 +381,7 @@ def load_config(path: str | Path) -> PipelineConfig:
         clearance_slow_m=ctrl.get("clearance_slow_m", 6.0),
         clearance_stop_m=ctrl.get("clearance_stop_m", 2.5),
         dashboard_colors=_load_dashboard_colors(dashboard.get("colors")),
+        dashboard_thresholds=_load_dashboard_thresholds(dashboard, gate, safety),
         ui_headless=bool(ui.get("headless", False)),
         ui_render_every_n=max(1, int(ui.get("render_every_n", 1))),
         ui_debug_view=debug_view,

@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
-from offroad_autonomy.types import DEFAULT_CAMERA, PipelineConfig
+from offroad_autonomy.types import DEFAULT_CAMERA, DashboardThresholds, PipelineConfig
 from offroad_autonomy.utils import environment
 from offroad_autonomy.utils.config import load_config
 from offroad_autonomy.utils.environment import PlatformFacts
@@ -115,4 +115,45 @@ def test_old_multi_camera_config_requires_migration(tmp_path):
     path = tmp_path / "old.yaml"
     path.write_text("beamng:\n  cameras:\n    left: {}\n")
     with pytest.raises(ValueError, match="beamng.camera"):
+        load_config(path)
+
+
+def test_dashboard_thresholds_default_to_the_shipped_config():
+    thresholds = load_config(DEFAULT_YAML).dashboard_thresholds
+
+    assert thresholds == DashboardThresholds()
+
+
+def test_dashboard_floors_come_from_the_gate_and_safe_stop(tmp_path):
+    path = tmp_path / "floors.yaml"
+    path.write_text(
+        "planning:\n  gate:\n    confidence_threshold: 0.3\nsafety:\n  min_road_fraction: 0.05\n"
+        "visualization:\n  dashboard:\n    target_fps: 10\n    latency_budget_ms: 100\n",
+        encoding="utf-8",
+    )
+
+    thresholds = load_config(path).dashboard_thresholds
+
+    assert thresholds.confidence_floor == pytest.approx(0.3)
+    assert thresholds.road_floor == pytest.approx(0.05)
+    assert thresholds.target_fps == pytest.approx(10.0)
+    assert thresholds.latency_budget_ms == pytest.approx(100.0)
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        "target_fps: 0",
+        "latency_budget_ms: -1",
+        "fps_warn_fraction: 1.0",
+        "confidence_good: 0.1",
+        "fps_bar_scale: 1.0",
+        "road_bar_full_scale: 0.01",
+    ],
+)
+def test_invalid_dashboard_thresholds_are_refused(tmp_path, block):
+    path = tmp_path / "bad.yaml"
+    path.write_text(f"visualization:\n  dashboard:\n    {block}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="visualization.dashboard"):
         load_config(path)

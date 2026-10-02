@@ -341,6 +341,7 @@ def main() -> None:
                 height=900,
                 colors=config.dashboard_colors,
                 sensor=config.camera.sensor,
+                thresholds=config.dashboard_thresholds,
             )
             dashboard_window = _open_window(dashboard.width, dashboard.height)
 

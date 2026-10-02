@@ -22,22 +22,46 @@ DEFAULT_PERCEPTION_PROMPTS = [
 ]
 
 DEFAULT_DASHBOARD_COLORS = {
-    "BG": (18, 22, 26),
-    "PANEL_BG": (28, 33, 38),
-    "CARD_BG": (34, 40, 46),
-    "CARD_BORDER": (54, 62, 70),
-    "TEXT_PRIMARY": (238, 240, 242),
-    "TEXT_SECONDARY": (155, 163, 172),
-    "MUTED_LINE": (72, 80, 88),
-    "MASK_FILL": (100, 172, 116),
-    "MASK_EDGE": (182, 224, 193),
-    "PATH_GLOW": (92, 184, 255),
-    "PATH_CORE": (72, 174, 255),
-    "PATH_HIGHLIGHT": (246, 249, 252),
-    "GOOD": (102, 187, 106),
-    "WARN": (82, 181, 233),
-    "BAD": (90, 92, 225),
+    "BG": (17, 15, 14),
+    "PANEL_BG": (27, 24, 22),
+    "CARD_BG": (36, 32, 29),
+    "CARD_BORDER": (58, 52, 48),
+    "TEXT_PRIMARY": (255, 255, 255),
+    "TEXT_SECONDARY": (180, 172, 166),
+    "MUTED_LINE": (66, 59, 54),
+    "MASK_FILL": (191, 179, 79),
+    "MASK_EDGE": (240, 235, 189),
+    "PATH_GLOW": (77, 154, 255),
+    "PATH_CORE": (26, 122, 255),
+    "PATH_HIGHLIGHT": (234, 244, 255),
+    "GOOD": (138, 214, 91),
+    "WARN": (59, 185, 245),
+    "BAD": (91, 91, 255),
+    # Distinct from MASK_FILL and BAD so the excluded hood cannot be mistaken
+    # for traversable trail or for a fault.
+    "EGO_EXCLUDED": (255, 91, 212),
 }
+
+
+@dataclass(frozen=True)
+class DashboardThresholds:
+    """What the dashboard colours its health readouts against.
+
+    ``confidence_floor`` and ``road_floor`` are copied from the gate and the
+    safe stop at load time, so the ticks on the bars cannot drift from the
+    values that actually trigger them.
+    """
+
+    target_fps: float = 7.0
+    fps_warn_fraction: float = 0.8
+    latency_budget_ms: float = 143.0
+    confidence_floor: float = 0.18
+    confidence_good: float = 0.5
+    road_floor: float = 0.015
+    fps_bar_scale: float = 2.0
+    latency_bar_scale: float = 1.4
+    road_bar_full_scale: float = 0.2
+
 
 DEBUG_VIEWS = (
     "default",
@@ -455,6 +479,7 @@ class PipelineConfig:
     dashboard_colors: dict[str, tuple[int, int, int]] = field(
         default_factory=lambda: DEFAULT_DASHBOARD_COLORS.copy()
     )
+    dashboard_thresholds: DashboardThresholds = field(default_factory=DashboardThresholds)
     #: No window at all: for containers and remote runs without a display.
     ui_headless: bool = False
     ui_render_every_n: int = 1

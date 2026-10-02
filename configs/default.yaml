@@ -325,22 +325,43 @@ control:
 
 visualization:
   dashboard:
+    # BGR, not RGB. Graphite: a neutral charcoal chrome so the only saturated
+    # colours on screen are the ones that carry meaning (health, path, mask).
     colors:
-      BG: [18, 22, 26]
-      PANEL_BG: [28, 33, 38]
-      CARD_BG: [34, 40, 46]
-      CARD_BORDER: [54, 62, 70]
-      TEXT_PRIMARY: [238, 240, 242]
-      TEXT_SECONDARY: [155, 163, 172]
-      MUTED_LINE: [72, 80, 88]
-      MASK_FILL: [100, 172, 116]
-      MASK_EDGE: [182, 224, 193]
-      PATH_GLOW: [92, 184, 255]
-      PATH_CORE: [72, 174, 255]
-      PATH_HIGHLIGHT: [246, 249, 252]
-      GOOD: [102, 187, 106]
-      WARN: [82, 181, 233]
-      BAD: [90, 92, 225]
+      BG: [17, 15, 14]
+      PANEL_BG: [27, 24, 22]
+      CARD_BG: [36, 32, 29]
+      CARD_BORDER: [58, 52, 48]
+      TEXT_PRIMARY: [255, 255, 255]
+      TEXT_SECONDARY: [180, 172, 166]    # still reads on CARD_BG at small sizes
+      MUTED_LINE: [66, 59, 54]
+      MASK_FILL: [191, 179, 79]          # teal, so it never reads as the green of a healthy value
+      MASK_EDGE: [240, 235, 189]
+      PATH_GLOW: [77, 154, 255]
+      PATH_CORE: [26, 122, 255]
+      PATH_HIGHLIGHT: [234, 244, 255]
+      GOOD: [138, 214, 91]
+      WARN: [59, 185, 245]
+      BAD: [91, 91, 255]
+      EGO_EXCLUDED: [255, 91, 212]       # magenta: distinct from the mask teal and the fault red
+    # The autonomy loop's target rate. Below it the readout turns amber,
+    # then red once it falls under fps_warn_fraction of the target.
+    target_fps: 7.0
+    fps_warn_fraction: 0.8              # amber from 80% of the target up to the target; a design choice, not measured
+    # One frame period at target_fps (1000 / 7). Latency past this means the
+    # loop cannot hold its target.
+    latency_budget_ms: 143.0
+    # Segmentation confidence is red below planning.gate.confidence_threshold
+    # (the gate rejects the frame there), amber up to this value, green above.
+    confidence_good: 0.5
+    # Bar full scales as multiples of the target or budget, so the target tick
+    # sits inside the bar instead of at its end.
+    fps_bar_scale: 2.0
+    latency_bar_scale: 1.4
+    # Road / valid px is tiny when healthy; the bar saturates here so the
+    # safe stop tick (safety.min_road_fraction) stays visible and not a hair
+    # at the left edge.
+    road_bar_full_scale: 0.2
 
 ui:
   # Suppress the window for containers and machines without a screen.
