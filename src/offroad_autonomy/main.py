@@ -18,6 +18,7 @@ from offroad_autonomy.pipeline import AutonomyPipeline
 from offroad_autonomy.runtime.benchmark import BenchmarkRecorder
 from offroad_autonomy.runtime.display_worker import DisplayState, DisplayWorker
 from offroad_autonomy.runtime.timing import DISPLAY_STAGES, MAIN_STAGES
+from offroad_autonomy.runtime.video_recorder import VideoRecorder, default_video_path
 from offroad_autonomy.simulation.beamng_client import BeamNGClient
 from offroad_autonomy.types import (
     DEBUG_VIEW_KEYS,
@@ -38,6 +39,8 @@ logger = logging.getLogger("offroad_autonomy.main")
 
 _shutdown = False
 _WINDOW_TITLE = "Off-Road Autonomy Dashboard"
+_DASHBOARD_WIDTH = 1600
+_DASHBOARD_HEIGHT = 900
 _MPH_PER_MPS = 2.2369362920544
 
 _STUCK_SPEED_MPS = 0.4
@@ -93,6 +96,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--label",
         default="",
         help="Name for the benchmark run (default: the config file name).",
+    )
+    parser.add_argument(
+        "--record-video",
+        action="store_true",
+        help=(
+            "Record the dashboard to an H.264 mp4 (needs ffmpeg on PATH). "
+            "With --headless the dashboard is drawn off screen for the recording only."
+        ),
+    )
+    parser.add_argument(
+        "--record-video-out",
+        default="",
+        help="Video path (default: output/videos/<label>_<timestamp>.mp4).",
     )
     return parser
 
@@ -283,6 +299,19 @@ def _handle_key(
     return autopilot_active
 
 
+def _log_video(video: VideoRecorder) -> None:
+    if video.failed:
+        logger.error("Video recording failed; %s may be incomplete", video.path)
+        return
+    logger.info(
+        "Video saved to %s: %d frames (%d repeated to keep real time, %d dropped by a busy encoder)",
+        video.path,
+        video.frames_written,
+        video.frames_repeated,
+        video.frames_dropped,
+    )
+
+
 def main() -> None:
     global _shutdown
     _shutdown = False
@@ -308,6 +337,7 @@ def main() -> None:
     pipeline = AutonomyPipeline(config)
     dashboard_window: DashboardWindow | None = None
     display: DisplayWorker | None = None
+    video: VideoRecorder | None = None
     stats = pipeline.stats
 
     debug_view = config.ui_debug_view
@@ -332,21 +362,41 @@ def main() -> None:
         no_road_time_s=config.safety_no_road_time_s,
     )
 
+    # Opened before connecting so a missing ffmpeg stops the run before a map
+    # is loaded and a vehicle spawned for nothing.
+    if args.record_video:
+        video_path = args.record_video_out or default_video_path(args.label or config_path.stem)
+        try:
+            video = VideoRecorder(
+                video_path,
+                _DASHBOARD_WIDTH,
+                _DASHBOARD_HEIGHT,
+                fps=config.recording_fps,
+                crf=config.recording_crf,
+                preset=config.recording_preset,
+                queue_frames=config.recording_queue_frames,
+            )
+        except (RuntimeError, OSError) as exc:
+            sys.exit(f"Cannot record video: {exc}")
+        logger.info("Recording the dashboard to %s", video.path)
+
     try:
         client.connect()
 
-        if not config.ui_headless:
+        record = None
+        if video is not None:
+            record = video.write
+
+        if not config.ui_headless or video is not None:
             dashboard = AutonomyDashboard(
-                width=1600,
-                height=900,
+                width=_DASHBOARD_WIDTH,
+                height=_DASHBOARD_HEIGHT,
                 colors=config.dashboard_colors,
                 sensor=config.camera.sensor,
                 thresholds=config.dashboard_thresholds,
             )
-            dashboard_window = _open_window(dashboard.width, dashboard.height)
-
-        if dashboard_window is not None:
-            window = dashboard_window
+            if not config.ui_headless:
+                dashboard_window = _open_window(dashboard.width, dashboard.height)
 
             def _render(state: DisplayState) -> np.ndarray:
                 return dashboard.render(
@@ -358,12 +408,15 @@ def main() -> None:
                     timing_overlay=state.timing_overlay,
                 )
 
+        if dashboard_window is not None:
+            window = dashboard_window
             # Tkinter's event loop belongs to the thread that built the root
             # window, so only the OpenCV backend can be driven off-thread.
             display = DisplayWorker(
                 render=_render,
                 show=window.show,
                 read_key=lambda: window.last_key,
+                record=record,
                 rate_hz=config.ui_display_rate_hz,
                 asynchronous=config.ui_display_async and window.backend == "opencv",
             )
@@ -378,6 +431,19 @@ def main() -> None:
                 "Keys: E safe stop, P resume, 0/1/6/9 debug view (%s), T timing overlay",
                 " ".join(f"{i}={name}" for i, name in DEBUG_VIEW_KEYS.items()),
             )
+        elif video is not None:
+            # No window to keep on its own thread, so the off-screen dashboard
+            # always renders asynchronously, whatever ui.display_async says.
+            display = DisplayWorker(
+                render=_render,
+                show=lambda canvas: True,
+                read_key=lambda: -1,
+                record=record,
+                rate_hz=config.ui_display_rate_hz,
+                asynchronous=True,
+            )
+            display.start()
+            logger.info("No window: dashboard drawn off screen for the recording only")
         else:
             logger.info("Headless: no dashboard; manual control is unavailable")
 
@@ -510,9 +576,12 @@ def main() -> None:
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
     finally:
-        # Stop drawing before the window is torn down.
+        # Stop drawing before the window is torn down and the video is closed.
         if display is not None:
             display.stop()
+        if video is not None:
+            video.close()
+            _log_video(video)
         if dashboard_window is not None:
             dashboard_window.close()
         client.disconnect()

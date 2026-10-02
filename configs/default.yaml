@@ -384,3 +384,22 @@ ui:
   debug_view: default
   timing_overlay: false
   log_interval_s: 5.0
+
+recording:
+  # --record-video writes the dashboard, as drawn, to an H.264 mp4 through the
+  # ffmpeg binary, because OpenCV's bundled encoder cannot produce H.264 and
+  # its mp4v output does not play in browsers or the VS Code media preview.
+  # Matches ui.display_rate_hz: frames arrive at that rate, so a higher value
+  # only repeats frames and a lower one throws rendered frames away.
+  fps: 20.0
+  # libx264 constant quality, 0 to 51 and lower is better. 23 is libx264's
+  # own default and keeps the dashboard text legible.
+  crf: 23
+  # On an i9-12900K with a moving test scene, veryfast took about 21% of one
+  # core at 20 FPS and ultrafast about 14%, with files 2.3x larger. On a
+  # weaker CPU such as a Jetson's, ultrafast is the safer choice.
+  preset: veryfast
+  # Frames waiting for the encoder. When it falls behind, new frames are
+  # dropped from the video rather than queued, so neither the dashboard nor
+  # the control loop ever waits on it. Each 1600 x 900 frame holds 4.3 MB.
+  queue_frames: 8

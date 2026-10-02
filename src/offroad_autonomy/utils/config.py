@@ -9,6 +9,7 @@ from pathlib import Path
 import yaml
 
 from offroad_autonomy.control.controller_config import MPCConfig
+from offroad_autonomy.runtime.video_recorder import X264_PRESETS
 from offroad_autonomy.types import (
     CAMERA_TRANSPORTS,
     DEBUG_VIEWS,
@@ -209,6 +210,27 @@ def _camera_transport(raw: object) -> str:
     return transport
 
 
+def _load_recording(raw: dict) -> dict:
+    fps = float(raw.get("fps", 20.0))
+    crf = int(raw.get("crf", 23))
+    preset = str(raw.get("preset", "veryfast")).lower()
+    queue_frames = int(raw.get("queue_frames", 8))
+    if fps <= 0.0:
+        raise ValueError("recording.fps must be > 0")
+    if not 0 <= crf <= 51:
+        raise ValueError("recording.crf must be between 0 and 51")
+    if preset not in X264_PRESETS:
+        raise ValueError(f"recording.preset must be one of {X264_PRESETS}, got {preset!r}")
+    if queue_frames < 1:
+        raise ValueError("recording.queue_frames must be at least 1")
+    return {
+        "recording_fps": fps,
+        "recording_crf": crf,
+        "recording_preset": preset,
+        "recording_queue_frames": queue_frames,
+    }
+
+
 def _apply_env_overrides(bng: dict) -> dict:
     """The simulator's address differs per deployment, so it can be set
     without editing a YAML file baked into a container image."""
@@ -389,4 +411,5 @@ def load_config(path: str | Path) -> PipelineConfig:
         ui_display_async=bool(ui.get("display_async", True)),
         ui_display_rate_hz=float(ui.get("display_rate_hz", 20.0)),
         runtime_log_interval_s=float(ui.get("log_interval_s", 5.0)),
+        **_load_recording(_section(raw, "recording")),
     )

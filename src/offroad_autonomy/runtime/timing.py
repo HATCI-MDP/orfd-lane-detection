@@ -35,6 +35,7 @@ MAIN_STAGES = (
 DISPLAY_STAGES = (
     "dashboard_render",
     "dashboard_show",
+    "dashboard_record",
     "dashboard_total",
 )
 

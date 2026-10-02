@@ -488,3 +488,7 @@ class PipelineConfig:
     ui_display_async: bool = True
     ui_display_rate_hz: float = 20.0
     runtime_log_interval_s: float = 5.0
+    recording_fps: float = 20.0
+    recording_crf: int = 23
+    recording_preset: str = "veryfast"
+    recording_queue_frames: int = 8

@@ -97,3 +97,32 @@ def test_worker_renders_the_exact_inference_snapshot():
     worker, drawn = _worker()
     worker.publish(state)
     assert drawn == [state]
+
+
+def test_each_drawn_canvas_is_handed_to_the_recorder_with_its_draw_time():
+    recorded: list = []
+    worker, _ = _worker(record=lambda canvas, t: recorded.append((canvas.shape, t)))
+
+    worker.publish(DisplayState(result=object(), telemetry=object()))
+    worker.publish(DisplayState(result=object(), telemetry=object()))
+
+    assert [shape for shape, _ in recorded] == [(4, 4, 3), (4, 4, 3)]
+    assert recorded[0][1] <= recorded[1][1]
+    assert worker.stats.stage("dashboard_record").count == 2
+
+
+def test_a_failing_recorder_is_disabled_and_the_dashboard_keeps_drawing():
+    calls: list = []
+
+    def broken(canvas, t):
+        calls.append(t)
+        raise OSError("disk full")
+
+    worker, _ = _worker(record=broken)
+
+    for _ in range(3):
+        worker.publish(DisplayState(result=object(), telemetry=object()))
+
+    assert len(calls) == 1
+    assert worker.rendered == 3
+    assert worker.failed == 0

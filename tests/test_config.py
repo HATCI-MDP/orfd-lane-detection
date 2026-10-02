@@ -157,3 +157,25 @@ def test_invalid_dashboard_thresholds_are_refused(tmp_path, block):
 
     with pytest.raises(ValueError, match="visualization.dashboard"):
         load_config(path)
+
+
+def test_recording_defaults_match_the_shipped_config():
+    config = load_config(DEFAULT_YAML)
+    defaults = PipelineConfig()
+
+    assert config.recording_fps == defaults.recording_fps
+    assert config.recording_crf == defaults.recording_crf
+    assert config.recording_preset == defaults.recording_preset
+    assert config.recording_queue_frames == defaults.recording_queue_frames
+
+
+@pytest.mark.parametrize(
+    "block",
+    ["  preset: turbo", "  crf: 60", "  fps: 0", "  queue_frames: 0"],
+)
+def test_invalid_recording_settings_are_refused(tmp_path, block):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("recording:\n" + block + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="recording"):
+        load_config(config_path)

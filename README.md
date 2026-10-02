@@ -65,6 +65,29 @@ to reproduce the former reversal and verify the brake-hold/forward-restart fix.
 - Starts BeamNG.tech when `BEAMNG_HOME` is set and it is not already running, then spawns the vehicle and opens the dashboard
 - `E` safe stop, `P` resume, `0`, `1`, `6`, `9` debug views, `T` timing overlay, `Q` quit
 - `--headless` runs without a window
+- `--record-video` saves the dashboard to an mp4 (see Record The Dashboard below)
+
+### Record The Dashboard
+
+```bash
+offroad-autonomy --record-video
+offroad-autonomy --record-video --headless --benchmark-seconds 60 --label stanley-run
+```
+
+`--record-video` saves the dashboard, exactly as drawn, to `output/videos/<label>_<timestamp>.mp4`
+(or the path given with `--record-video-out`). The file is H.264 in yuv420p with the index at the
+front, so it plays in the VS Code media preview and in browsers.
+
+- Needs `ffmpeg` with libx264 on `PATH` (`sudo apt install ffmpeg`). Without it the run stops before
+  connecting to BeamNG. A snap-packaged ffmpeg cannot write under `/tmp`, so keep the output in
+  your home directory.
+- Encoding runs in a separate ffmpeg process fed from its own thread, so neither the control loop
+  nor the dashboard waits for it. If the encoder falls behind, frames are dropped from the video
+  and counted in the log when the run ends.
+- Frames are paced onto a constant `recording.fps`, so the video plays back at real speed even
+  when the dashboard stalls.
+- With `--headless` the dashboard is drawn off screen for the recording only.
+- Quality, preset and queue length are in the `recording` section of `configs/default.yaml`.
 
 ### Dashboard
 
@@ -115,6 +138,7 @@ BEAMNG_HOST=192.168.1.50 docker compose up
 | Command                                                         | What it does                                            |
 | --------------------------------------------------------------- | ------------------------------------------------------- |
 | `offroad-autonomy --config <file>`                              | Run the stack with a config                             |
+| `offroad-autonomy --record-video`                               | Run and save the dashboard to `output/videos/` as mp4   |
 | `ruff check src tests scripts`                                  | Lint                                                    |
 | `ruff format src tests scripts`                                 | Format (CI runs it with `--check`)                      |
 | `python -m build`                                               | Build the wheel and sdist                               |
