@@ -11,7 +11,7 @@ requires-python = ">=3.10"
 license = "MIT"
 
 dependencies = [
-    "beamngpy>=1.35,<1.36",
+    "beamngpy>=1.35,<1.37",
     "numpy>=1.26",
     "opencv-python>=4.8",
     "pillow>=10.0",
@@ -28,7 +28,7 @@ dev = [
     "pytest-cov>=5.0",
     # Pinned: a new ruff release can enable new default rules and fail CI
     # with no code change. Dependabot proposes upgrades as pull requests.
-    "ruff==0.16.8",
+    "ruff==0.16.9",
 ]
 
 [project.scripts]
