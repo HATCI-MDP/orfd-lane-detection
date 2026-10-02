@@ -1,24 +1,4 @@
-"""The dashboard, off the control loop.
-
-The autonomy loop's job is to capture, segment, plan and actuate. Drawing a
-1600x900 picture and pushing it through a GUI toolkit is not that job, and
-neither is grabbing the display camera's frames. Both used to happen between
-one control command and the next, which put GUI work inside the loop period
-and made "main loop FPS" a measure of how fast the *window* was.
-
-So this worker owns all of it: the display camera, the dashboard rendering
-and the window itself. The control loop only calls :meth:`publish`, which
-swaps one reference under a lock and returns - it never waits for a redraw,
-and it is never paced by one. If rendering falls behind, snapshots are
-simply overwritten and the picture goes stale; the vehicle keeps driving at
-full rate. That is the intended failure mode.
-
-Keys read from the window are queued and drained by the control loop, so
-safe stop, resume and the debug views still work from a window this thread
-owns. With ``asynchronous=False`` everything happens inline on the caller's
-thread instead, which is the mode for tests and for measuring what a
-synchronous dashboard would cost.
-"""
+"""Render completed dashcam inference snapshots without blocking control."""
 
 from __future__ import annotations
 
@@ -55,17 +35,17 @@ class DisplayState:
     valid_roi: np.ndarray | None = None
     debug_view: str = "default"
     timing_overlay: bool = False
-    stitched: np.ndarray | None = None
-    depth_roi: np.ndarray | None = None
+    #: The orbit camera's latest image, for the presentation video only.
+    orbit: np.ndarray | None = None
 
 
 class DisplayWorker:
     def __init__(
         self,
-        render: Callable[[DisplayState, np.ndarray | None], np.ndarray],
+        render: Callable[[DisplayState], np.ndarray],
         show: Callable[[np.ndarray], bool],
         read_key: Callable[[], int],
-        capture: Callable[[], np.ndarray | None] | None = None,
+        record: Callable[[np.ndarray, float], None] | None = None,
         rate_hz: float = 20.0,
         asynchronous: bool = True,
         stats: RuntimeStats | None = None,
@@ -73,7 +53,7 @@ class DisplayWorker:
         self._render = render
         self._show = show
         self._read_key = read_key
-        self._capture = capture
+        self._record = record
         self._period = 0.0
         if rate_hz > 0.0:
             self._period = 1.0 / rate_hz
@@ -164,11 +144,7 @@ class DisplayWorker:
         t0 = time.perf_counter()
         self._last_draw_time = t0
         try:
-            frame = None
-            if self._capture is not None:
-                frame = self._capture()
-            t1 = time.perf_counter()
-            canvas = self._render(state, frame)
+            canvas = self._render(state)
             t2 = time.perf_counter()
             alive = self._show(canvas)
             t3 = time.perf_counter()
@@ -179,10 +155,21 @@ class DisplayWorker:
                 self._last_error_log = t0
             return
 
-        self.stats.record("display_capture", (t1 - t0) * 1000.0)
-        self.stats.record("dashboard_render", (t2 - t1) * 1000.0)
+        t4 = t3
+        if self._record is not None:
+            try:
+                self._record(canvas, t0)
+            except Exception:
+                # A recording fault will not fix itself, and retrying it every
+                # frame would flood the log while the dashboard keeps working.
+                logger.exception("Video recording failed; recording disabled")
+                self._record = None
+            t4 = time.perf_counter()
+            self.stats.record("dashboard_record", (t4 - t3) * 1000.0)
+
+        self.stats.record("dashboard_render", (t2 - t0) * 1000.0)
         self.stats.record("dashboard_show", (t3 - t2) * 1000.0)
-        self.stats.record("dashboard_total", (t3 - t0) * 1000.0)
+        self.stats.record("dashboard_total", (t4 - t0) * 1000.0)
         self.stats.tick()
         self.rendered += 1
 

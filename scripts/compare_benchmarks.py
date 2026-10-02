@@ -4,8 +4,7 @@
     python scripts/compare_benchmarks.py output/benchmarks/*.json
 
 Each report comes from one ``--benchmark-seconds`` run of
-``offroad-autonomy``. Values the run could
-not measure - stereo metrics with stereo off, say - print as "-".
+``offroad-autonomy``. Values the run could not measure print as "-".
 """
 
 from __future__ import annotations
@@ -20,12 +19,7 @@ COLUMNS = (
     ("lat mean", lambda r: r.get("primary_latency_mean_ms")),
     ("lat p95", lambda r: r.get("primary_latency_p95_ms")),
     ("loop p95", lambda r: r.get("full_loop_p95_ms")),
-    ("stereo Hz", lambda r: r.get("stereo", {}).get("fps")),
-    ("stereo ms", lambda r: r.get("stereo", {}).get("latency_mean_ms")),
     ("seg conf", lambda r: r.get("segmentation_confidence_mean")),
-    ("disp %", lambda r: r.get("valid_disparity_pct_mean")),
-    ("cover %", lambda r: r.get("depth_coverage_pct_mean")),
-    ("depth used %", lambda r: r.get("depth_used_pct")),
     ("jitter", lambda r: r.get("path_jitter_pct")),
     ("departures", lambda r: r.get("lane_departures")),
     (">=20FPS", lambda r: _yes_no(r.get("meets_20fps"))),

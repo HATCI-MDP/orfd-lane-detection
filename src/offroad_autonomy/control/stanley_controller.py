@@ -4,8 +4,7 @@ Positive steering is to the right, as in BeamNG.
 
 Everything happens on the ground, not in the image
 --------------------------------------------------
-Image rows are extremely non-linear in distance on the bumper camera (6-40 m
-of road sits in ~28 rows), so gains tuned in pixels would mean something
+Image rows are non-linear in ground distance, so gains tuned in pixels would mean something
 different at every range. Every path point is projected onto the ground
 first and ``right(f) = a + b*f + c*f^2`` is fitted in metres, which gives
 offset, heading ``atan(right'(f))`` and curvature
@@ -31,6 +30,10 @@ terms are evaluated from there::
 wherever it runs within ``edge_margin_m`` of a trail edge, and "arc" is
 where the car will be after ``f0`` metres on its current steering - so the
 error is read at the pose the command will actually act on.
+
+When that pose is behind the first visible path point, the near road is
+unobserved. A geometric pursuit arc joins a visible lookahead point instead
+of extrapolating the fitted polynomial underneath the hood.
 
 The lookahead shrinks in tight curves, so the feedforward only averages
 over the bend the car is in - not the reverse bend of an S behind it,
@@ -85,7 +88,7 @@ _NEAR_FIELD_M = 4.0
 #: Masks stop a pixel or two short of the border, so a run ending here is the
 #: field of view, not the trail edge.
 _BORDER_PX = 3
-#: Depth vetoes and specks punch small holes into real masks; they must not
+#: Segmentation misses and specks punch small holes into real masks; they must not
 #: split the trail (same rule as the planner).
 _EDGE_MERGE_GAP_M = 0.6
 _EDGE_EMA = 0.5
@@ -94,8 +97,7 @@ _EDGE_EMA = 0.5
 def path_to_ground(
     camera: CameraModel, centerline: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """``(forward_m, right_m, keep)``, measured from the camera, which on this
-    rig is the front of the vehicle."""
+    """``(forward_m, right_m, keep)``, measured from the dashcam."""
     return camera.image_to_ground(centerline, max_range_m=_MAX_GROUND_RANGE_M)
 
 
@@ -262,10 +264,9 @@ class StanleyController:
         self._speed_kp = config.speed_kp
         self._clearance_stop_m = float(max(config.clearance_stop_m, 0.0))
         self._clearance_slow_m = float(max(config.clearance_slow_m, self._clearance_stop_m))
-        # The path is in the segmentation view's pixels, and stitched mode
-        # has its own camera, so the default is only right for single views.
+        # Share the inference camera model so pixel-to-ground projection agrees.
         self._camera = camera or CameraModel(
-            config.segmentation_camera, config.preprocess_width, config.preprocess_height
+            config.camera, config.preprocess_width, config.preprocess_height
         )
         self._prev_steering = 0.0
         self._prev_target: float | None = None
@@ -352,11 +353,12 @@ class StanleyController:
 
         # Every term is read where the car will be when the command lands.
         f0 = min(speed * self._latency, path.end)
-        trust = self._curvature_trust(path, f0)
+        visible_start = max(f0, path.start)
+        trust = self._curvature_trust(path, visible_start)
         kappa = lambda f: path.curvature(f, self._max_curvature, trust)
-        lookahead = self.lookahead_distance(speed, float(kappa(f0)))
-        f_end = min(f0 + lookahead, path.end)
-        window = np.linspace(f0, max(f_end, f0 + 1e-3), 8)
+        lookahead = self.lookahead_distance(speed, float(kappa(visible_start)))
+        f_end = float(np.clip(f0 + lookahead, path.start, path.end))
+        window = np.linspace(visible_start, f_end, 8)
         kappa_ff = float(np.mean(kappa(window)))
 
         # The planner's path is already the per-row centre of the road; the
@@ -376,9 +378,10 @@ class StanleyController:
             arc_offset = 0.5 * arc * f0 * f0
             arc_heading = arc * f0
             cte_at = f0
-        debug.centering_shift_m = float(ref.right(f0) - path.right(f0))
-        heading_error = math.atan(float(ref.slope(f0))) - arc_heading
-        cte = float(ref.right(cte_at)) - arc_offset
+        reference_at = max(cte_at, path.start, ref.start)
+        debug.centering_shift_m = float(ref.right(reference_at) - path.right(reference_at))
+        heading_error = math.atan(float(ref.slope(max(f0, reference_at)))) - arc_heading
+        cte = float(ref.right(reference_at)) - arc_offset
         cte_eff = self._deadzone(cte)
 
         # The rejoin distance shortens only past ``cross_track_recovery_m``:
@@ -397,6 +400,19 @@ class StanleyController:
         wheel = (
             feedforward + self._heading_gain * heading_error + math.atan2(self._k * cte_eff, rejoin)
         )
+        if cte_at < max(path.start, ref.start):
+            # An unconstrained backwards fit can put a rightward path metres
+            # to the left under the hood. Join an observed point geometrically;
+            # its lateral position determines the turn, not an invented offset.
+            f_end = float(np.clip(f_end, max(path.start, ref.start), path.end))
+            target_forward = f_end - cte_at
+            target_right = float(ref.right(f_end)) - arc_offset
+            local_right = target_right * math.cos(arc_heading) - target_forward * math.sin(
+                arc_heading
+            )
+            distance_sq = target_forward**2 + target_right**2
+            wheel = math.atan2(2.0 * self._wheelbase * self._deadzone(local_right), distance_sq)
+            feedforward = 0.0
         command = debug.authority * self.wheel_to_command(wheel)
         cap = self.steering_cap(speed)
 
@@ -628,7 +644,7 @@ class StanleyController:
         Each point ahead allows ``sqrt(v_curve^2 + 2*decel*distance)`` so the
         car is already slow on entry rather than braking inside the bend.
         """
-        f0 = min(speed * self._latency, path.end)
+        f0 = float(np.clip(speed * self._latency, path.start, path.end))
         f = np.linspace(f0, path.end, _PROFILE_SAMPLES)
         kappa = np.abs(path.curvature(f, self._max_curvature, self._curvature_trust(path, f0)))
         v_curve = np.sqrt(self._lat_accel / np.maximum(kappa, 1e-4))
@@ -673,3 +689,18 @@ class StanleyController:
         self._prev_time = None
         self._cte_rate = 0.0
         self._edge_state = [None, None]
+
+    def observe_applied_steering(self, steering: float) -> None:
+        """Keep fallback smoothing and trail prediction aligned with applied MPC input."""
+        self._prev_steering = float(steering)
+
+    def tracking_reference(self, plan: PathPlan) -> _GroundPath:
+        """Reuse the metric fit and existing trail-edge correction for MPC."""
+        forward, right, keep = path_to_ground(self._camera, plan.centerline)
+        forward, indices = np.unique(forward[keep], return_index=True)
+        if len(forward) < 2 or np.ptp(forward) < 0.1:
+            raise ValueError("insufficient ground trajectory")
+        path = _GroundPath(forward, right[keep][indices])
+        arc = math.tan(self._prev_steering * self._max_wheel_angle) / self._wheelbase
+        trail = measure_trail(self._camera, plan.planner_mask, arc)
+        return self._centred_reference(path, trail, SteeringDebug())

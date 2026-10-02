@@ -20,9 +20,7 @@ def _config(**overrides) -> PipelineConfig:
 
 
 def _camera(config: PipelineConfig) -> CameraModel:
-    return CameraModel(
-        config.segmentation_camera, config.preprocess_width, config.preprocess_height
-    )
+    return CameraModel(config.camera, config.preprocess_width, config.preprocess_height)
 
 
 _DEFAULT_FORWARD = np.linspace(1.5, 14.0, 20)
@@ -76,9 +74,41 @@ def test_curve_is_followed_in_the_right_direction():
     left_curve = _path(config, lambda f: -(radius - math.sqrt(radius**2 - f**2)))
     command = _settle(StanleyController(config), left_curve, speed=4.0)
     assert command.steering < -0.05
-    # Heading error is read against the car's predicted arc, which is already
-    # turning left here - the curve shows up in the feedforward instead.
-    assert command.debug.feedforward_steering < 0.0
+    assert command.debug.curvature < 0.0
+
+
+@pytest.mark.parametrize("direction", [-1.0, 1.0])
+@pytest.mark.parametrize("held", [False, True])
+def test_hidden_near_path_does_not_reverse_the_visible_turn(direction, held):
+    """The rightward screenshot path extrapolated to -2.6 m under the hood."""
+    config = _config()
+    forward = np.linspace(3.28, 12.05, 24)
+    plan = _path(
+        config,
+        lambda f: direction * (-0.04327203 * f**2 + 1.36603377 * f - 3.44486698),
+        forward=forward,
+    )
+    plan.fallback_active = held
+    if held:
+        plan.speed_scale = 0.4
+    controller = StanleyController(config)
+    state = VehicleState(speed_mps=3.9 * 0.44704)
+    for _ in range(10):
+        command = controller.compute(plan, state)
+        assert direction * command.steering > 0.0
+        assert direction * command.debug.cross_track_m > 0.0
+    target_f, _, keep = path_to_ground(_camera(config), np.array([command.debug.lookahead_px]))
+    assert keep.all()
+    assert forward.min() - 0.01 <= target_f[0] <= forward.max() + 0.01
+
+    from unittest.mock import Mock
+
+    from offroad_autonomy.simulation.beamng_client import BeamNGClient
+
+    client = BeamNGClient(config)
+    client._vehicle = Mock()
+    client.send_controls(command)
+    assert direction * client._vehicle.control.call_args.kwargs["steering"] > 0.0
 
 
 def test_steering_rate_is_limited_per_frame():
@@ -118,7 +148,7 @@ def test_feedforward_steers_for_the_arc_before_any_error():
     config = _config(steering_ema_alpha=1.0, max_steering_delta=1.0)
     radius = 12.0
     command = StanleyController(config).compute(
-        _path(config, _arc(radius), forward=np.linspace(0.5, 6.0, 20)), VehicleState(speed_mps=1.0)
+        _path(config, _arc(radius), forward=np.linspace(0.1, 6.0, 20)), VehicleState(speed_mps=1.0)
     )
     expected = math.atan(config.wheelbase_m / radius) / math.radians(config.max_wheel_angle_deg)
     assert command.debug.curvature == pytest.approx(1.0 / radius, rel=0.15)

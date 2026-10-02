@@ -1,56 +1,125 @@
-"""Operator dashboard.
-
-Layout::
-
-    +---------------------------------------------+-----------------+
-    | main view: DISPLAY camera + mask + path     | VEHICLE         |
-    |   (or a debug view, keys 0-8)               | PERCEPTION      |
-    +---------------+---------------+-------------+ STEREO / DEPTH  |
-    | LEFT RECTIFIED| RIGHT RECTIFIED| STEREO DEPTH| RUNTIME         |
-    +---------------+---------------+-------------+-----------------+
-
-The bottom strip shows the bumper cameras, which produce everything the
-vehicle computes. The main panel shows the display camera, which computes
-nothing; its label says DISPLAY ONLY so a screenshot cannot be misread as
-evidence that the stack is looking through it.
-
-Everything is drawn at the working resolution and only then fitted to the
-window, so the dashboard costs a few milliseconds rather than tens.
-"""
+"""Dashcam imagery, segmentation and planned path from the same capture."""
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
+from typing import NamedTuple
 
 import cv2
 import numpy as np
 
-from offroad_autonomy.perception.stereo_rectification import draw_epipolar_pair
 from offroad_autonomy.types import (
+    DEBUG_VIEW_KEYS,
     DEBUG_VIEWS,
     DEFAULT_DASHBOARD_COLORS,
     GMSL2_CAPTURE_SENSOR,
     CameraSensor,
-    DepthResult,
+    DashboardThresholds,
     PathPlan,
     PipelineStepResult,
-    TerrainAnalysis,
 )
-from offroad_autonomy.visualization.path_projector import GroundProjector
+from offroad_autonomy.visualization import bands
+from offroad_autonomy.visualization.layout import Rect, build_layout
+from offroad_autonomy.visualization.text import (
+    BODY,
+    BODY_STRONG,
+    CAPTION,
+    CAPTION_MONO,
+    DISPLAY,
+    HERO,
+    HERO_SANS,
+    LABEL,
+    LARGE,
+    LARGE_SANS,
+    TITLE,
+    VALUE,
+    TextRenderer,
+    TextStyle,
+)
+from offroad_autonomy.visualization.widgets import (
+    CoverTransform,
+    blend_rect,
+    blit_cover,
+    chip_height,
+    chip_width,
+    cover_point,
+    draw_bar,
+    draw_centered_bar,
+    draw_chip,
+    fill_rect,
+    outline_rect,
+    wrap_text,
+)
 
 _VIEW_TITLES = {
-    "default": "PATH VISUALIZATION",
-    "raw": "RAW LEFT | RIGHT",
-    "rectified": "RECTIFIED LEFT | RIGHT",
-    "disparity": "DISPARITY (rectified left)",
-    "depth": "DEPTH (segmentation view)",
-    "stitched": "STITCHED WIDE VIEW",
-    "mask": "SEGMENTATION MASK",
-    "fused": "FUSED MASK + DEPTH",
-    "roi": "DEPTH ROI",
-    "pipeline": "PIPELINE DEBUG  raw | mask | planner input | path",
+    "default": "Path Visualization",
+    "raw": "Raw Dashcam",
+    "mask": "Segmentation Mask",
+    "pipeline": "Pipeline Debug",
 }
+
+_ALL_STYLES: tuple[TextStyle, ...] = (
+    DISPLAY,
+    HERO,
+    HERO_SANS,
+    LARGE,
+    LARGE_SANS,
+    TITLE,
+    VALUE,
+    BODY,
+    BODY_STRONG,
+    LABEL,
+    CAPTION,
+    CAPTION_MONO,
+)
+
+# Row positions inside the cards, measured down from the card's top edge. The
+# static layer and the per-frame values read the same numbers, so a label and
+# its value cannot drift apart.
+_CARD_TITLE_BASELINE = 30
+_CARD_INSET = 20
+_SPEED_BASELINE = 128
+_STEER_BASELINE = 172
+_STEER_BAR_TOP = 184
+_PEDAL_BASELINE = 246
+_PEDAL_BAR_TOP = 258
+_ROAD_BASELINE = 64
+_ROAD_BAR_TOP = 76
+_ROAD_CAPTION_BASELINE = 108
+_CONF_BASELINE = 146
+_CONF_BAR_TOP = 158
+_CONF_CAPTION_BASELINE = 190
+_ROI_BASELINE = 230
+_FALLBACK_BASELINE = 270
+_REASON_LINE_HEIGHT = 22
+_CARD_BOTTOM_MARGIN = 14
+
+_TILE_TITLE_BASELINE = 26
+_TILE_VALUE_BASELINE = 76
+_TILE_BAR_TOP = 90
+_TILE_BAR_H = 8
+_DASHBOARD_TILE_VALUE_BASELINE = 68
+_DASHBOARD_TILE_NOTE_BASELINE = 94
+
+# Frame pixels below the hood's top edge.
+_EGO_LABEL_DROP_PX = 22
+EGO_LABEL = "EGO - EXCLUDED"
+
+_PIPELINE_READOUT_W = 330
+_READOUT_ROW_H = 22
+
+
+class DashcamOverlay(NamedTuple):
+    """The dashcam frame with perception and plan drawn on, before scaling.
+
+    ``ego_label_px`` is where the hood label goes, in frame pixels. The label
+    is left to whoever scales the image, since text drawn here would be
+    scaled with it.
+    """
+
+    image: np.ndarray
+    ego_label_px: tuple[int, int] | None
 
 
 @dataclass
@@ -68,23 +137,12 @@ class DashboardTelemetry:
     autopilot_active: bool = True
     road_fraction: float = 0.0
     ego_coverage: float = 0.0
-    segmentation_mode: str = "left"
+    segmentation_mode: str = "dashcam"
     fallback_state: str = "NONE"
-    depth_active: bool = False
-    depth_state: str = "OFF"
-    depth_coverage: float = 0.0
-    valid_disparity_fraction: float = 0.0
-    median_forward_depth_m: float = float("nan")
-    min_corridor_depth_m: float = float("nan")
-    min_clearance_m: float = float("inf")
-    depth_age_ms: float = float("inf")
-    stereo_fps: float = 0.0
-    stereo_latency_ms: float = 0.0
-    stereo_latency_p95_ms: float = 0.0
+    fallback_reason: str = ""
     #: Never an autonomy number: it can drop to single figures without the
     #: vehicle noticing.
     dashboard_fps: float = 0.0
-    sync_ok: bool = True
     timing_lines: list[str] = field(default_factory=list)
 
 
@@ -95,47 +153,34 @@ class AutonomyDashboard:
         height: int = 900,
         colors: dict[str, tuple[int, int, int]] | None = None,
         sensor: CameraSensor | None = None,
-        projector: GroundProjector | None = None,
-        display_clip: np.ndarray | None = None,
+        thresholds: DashboardThresholds | None = None,
     ) -> None:
         self.width = width
         self.height = height
         if sensor is None:
             sensor = GMSL2_CAPTURE_SENSOR
         self.sensor = sensor
-        # Without a projector the main panel falls back to the perception
-        # view, so the dashboard still works on a rig with no display camera.
-        self.projector = projector
-        self.display_clip = display_clip
-        self._pad = 24
-        self._gap = 20
-        self._header_h = 52
-        self._sidebar_w = 420
-        self._strip_fraction = 0.28
+        if thresholds is None:
+            thresholds = DashboardThresholds()
+        self._thresholds = thresholds
         self._colors = DEFAULT_DASHBOARD_COLORS.copy()
-        # Distinct from MASK_FILL and from BAD so the excluded region cannot be
-        # mistaken for traversable road or for a detected obstacle.
-        self._colors.setdefault("EGO_EXCLUDED", (168, 96, 220))
         if colors is not None:
             self._colors.update(colors)
-        self._ego_cache: dict[tuple, tuple[np.ndarray, list]] = {}
+        self._layout = build_layout(width, height)
+        # Loaded here so a missing font stops startup, not the first frame.
+        self._text = TextRenderer()
+        self._text.preload(_ALL_STYLES)
+        self._fallback_label_w = self._text.width("Fallback", BODY)
+        self._ego_cache: dict[tuple, tuple[np.ndarray, list, tuple[int, int] | None]] = {}
+        #: Centre of the hood exclusion in frame pixels, set while the default
+        #: overlay is built so its label can be drawn after the frame is scaled.
+        self._ego_label_px: tuple[int, int] | None = None
         # Filling a large array with a colour costs ~5 ms at 1600x900;
-        # copying a cached blank costs ~1 ms, so blanks are made once.
-        self._blanks: dict[tuple, np.ndarray] = {}
-        # Depth updates at the stereo rate, the dashboard at the loop rate,
-        # so the colour-mapped view is reused until a new result arrives.
-        self._depth_view_src: tuple = ()
-        self._depth_view: np.ndarray | None = None
+        # copying a cached blank costs ~1 ms, so everything that never changes
+        # between frames is drawn once into one image and copied.
+        self._static = self._build_static()
 
-    def _blank(self, height: int, width: int, fill: tuple[int, int, int]) -> np.ndarray:
-        key = (height, width, tuple(fill))
-        blank = self._blanks.get(key)
-        if blank is None:
-            if len(self._blanks) > 16:
-                self._blanks.clear()
-            blank = np.full((height, width, 3), fill, dtype=np.uint8)
-            self._blanks[key] = blank
-        return blank.copy()
+    # ------------------------------------------------------------------ frame
 
     def render(
         self,
@@ -145,9 +190,6 @@ class AutonomyDashboard:
         valid_roi: np.ndarray | None = None,
         debug_view: str = "default",
         timing_overlay: bool = False,
-        stitched: np.ndarray | None = None,
-        depth_roi: np.ndarray | None = None,
-        display_frame: np.ndarray | None = None,
     ) -> np.ndarray:
         """``plan`` is passed separately because it is withheld under safe
         stop: perception keeps running, but nothing should suggest the stack
@@ -155,51 +197,34 @@ class AutonomyDashboard:
         if debug_view not in DEBUG_VIEWS:
             debug_view = "default"
 
-        canvas = self._blank(self.height, self.width, self._colors["BG"])
-        self._draw_header(canvas, telemetry.autopilot_active)
+        canvas = self._static.copy()
+        self._draw_status_chip(canvas, telemetry.autopilot_active)
 
-        content_top = self._pad + self._header_h
-        content_h = self.height - content_top - self._pad
-        main_w = self.width - (self._pad * 2) - self._gap - self._sidebar_w
-
-        main_rect = (self._pad, content_top, main_w, content_h)
-        side_rect = (self._pad + main_w + self._gap, content_top, self._sidebar_w, content_h)
-        self._draw_panel(canvas, main_rect)
-        self._draw_panel(canvas, side_rect)
-
-        inner_pad = 16
-        inner_x = main_rect[0] + inner_pad
-        inner_y = main_rect[1] + inner_pad
-        inner_w = main_rect[2] - inner_pad * 2
-        inner_h = main_rect[3] - inner_pad * 2
-
-        strip_h = int(round(inner_h * self._strip_fraction))
-        viewport_rect = (inner_x, inner_y, inner_w, inner_h - strip_h - self._gap)
-        strip_rect = (inner_x, inner_y + inner_h - strip_h, inner_w, strip_h)
-
-        main_image = self._main_view(
-            debug_view, result, plan, valid_roi, stitched, depth_roi, display_frame
-        )
-        on_display_camera = debug_view == "default" and self._can_reproject(display_frame)
-        viewport = self._fit_image(
-            main_image, viewport_rect[2], viewport_rect[3], fill=self._colors["PANEL_BG"]
-        )
-        self._blit(canvas, viewport, viewport_rect[0], viewport_rect[1])
-        self._draw_viewport_labels(canvas, viewport_rect, telemetry, debug_view, on_display_camera)
+        viewport = self._layout.viewport
+        has_ego = valid_roi is not None and not bool(valid_roi.all())
+        self._ego_label_px = None
+        if debug_view == "pipeline":
+            self._draw_pipeline_view(canvas, viewport, result)
+        else:
+            image = self._main_view(debug_view, result, plan, valid_roi)
+            transform = blit_cover(canvas, image, viewport)
+            if self._ego_label_px is not None:
+                self._draw_ego_label(canvas, transform, self._ego_label_px)
+        self._draw_viewport_labels(canvas, viewport, debug_view)
+        if debug_view in ("default", "raw"):
+            self._draw_mask_inset(canvas, viewport, result)
         if debug_view == "default":
-            self._draw_perception_legend(
-                canvas,
-                viewport_rect,
-                has_ego=valid_roi is not None and not bool(valid_roi.all()),
-                reprojected=on_display_camera,
-            )
+            self._draw_perception_legend(canvas, viewport, plan, has_ego)
+            if plan is not None and plan.fallback_active:
+                self._draw_fallback_chip(canvas, viewport)
         if timing_overlay and telemetry.timing_lines:
-            self._draw_timing_overlay(canvas, viewport_rect, telemetry.timing_lines)
+            self._draw_timing_overlay(canvas, viewport, telemetry.timing_lines)
         if not telemetry.autopilot_active:
-            self._draw_safe_stop_overlay(canvas, viewport_rect)
+            self._draw_safe_stop_overlay(canvas, viewport)
 
-        self._draw_camera_strip(canvas, strip_rect, result.depth, result.terrain, telemetry)
-        self._draw_sidebar(canvas, side_rect, telemetry)
+        self._draw_vehicle_card(canvas, telemetry)
+        self._draw_perception_card(canvas, telemetry)
+        self._draw_runtime_strip(canvas, telemetry)
         return canvas
 
     def _main_view(
@@ -208,47 +233,12 @@ class AutonomyDashboard:
         result: PipelineStepResult,
         plan: PathPlan | None,
         valid_roi: np.ndarray | None,
-        stitched: np.ndarray | None,
-        depth_roi: np.ndarray | None,
-        display_frame: np.ndarray | None = None,
     ) -> np.ndarray:
         frame = result.frame.preprocessed
-        depth = result.depth
-        pair = result.frames
-
         if view == "raw":
-            if pair is not None and pair.left is not None and pair.right is not None:
-                return np.hstack([self._ensure_bgr(pair.left), self._ensure_bgr(pair.right)])
-            return self._placeholder(frame, "PAIR INCOMPLETE")
-        if view == "rectified":
-            if depth is not None and depth.rectified_left is not None:
-                return draw_epipolar_pair(depth.rectified_left, depth.rectified_right)
-            return self._placeholder(frame, "NO STEREO RESULT")
-        if view == "disparity":
-            image = self._render_disparity(depth)
-            if image is None:
-                return self._placeholder(frame, "NO STEREO RESULT")
-            return image
-        if view == "depth":
-            image = self._render_depth_view(depth, result.terrain)
-            if image is None:
-                return self._placeholder(frame, "NO DEPTH")
-            return image
-        if view == "stitched":
-            if stitched is not None:
-                return stitched
-            return self._placeholder(frame, "STITCHING DISABLED (stitching.enabled)")
+            return self._ensure_bgr(result.frame.raw)
         if view == "mask":
             return self._render_mask_view(result)
-        if view == "fused":
-            return self._render_fused_view(result)
-        if view == "roi":
-            return self._render_roi_view(frame, depth_roi, depth)
-        if view == "pipeline":
-            return self._render_pipeline_view(result)
-
-        if self._can_reproject(display_frame):
-            return self._build_display_overlay(display_frame, result, plan)
 
         mask = self._ensure_mask(result.stabilized.mask, frame.shape[:2])
         ego = None
@@ -256,66 +246,624 @@ class AutonomyDashboard:
             ego = ~self._ensure_mask(valid_roi, frame.shape[:2])
         return self._build_overlay(frame, mask, plan, result.stabilized.mask.shape[:2], ego)
 
-    def _can_reproject(self, display_frame: np.ndarray | None) -> bool:
-        return display_frame is not None and self.projector is not None
-
-    def _build_display_overlay(
+    def dashcam_overlay(
         self,
-        display_frame: np.ndarray,
         result: PipelineStepResult,
         plan: PathPlan | None,
-    ) -> np.ndarray:
-        """Only a redraw of results that already exist, so the large view
-        costs the same whether or not anyone is watching it."""
-        assert self.projector is not None
-        target = self._ensure_bgr(display_frame)
-        projector = self.projector
-        if target.shape[:2] != (projector.target.height, projector.target.width):
-            target = cv2.resize(
-                target,
-                (projector.target.width, projector.target.height),
-                interpolation=cv2.INTER_AREA,
+        valid_roi: np.ndarray | None,
+    ) -> DashcamOverlay:
+        """The image the default view shows, for other layouts to scale.
+
+        ``plan`` is None under safe stop, which leaves the path and its
+        lookahead dot off, as on the dashboard."""
+        self._ego_label_px = None
+        image = self._main_view("default", result, plan, valid_roi)
+        return DashcamOverlay(image, self._ego_label_px)
+
+    # ----------------------------------------------------------- static layer
+
+    def _build_static(self) -> np.ndarray:
+        colors = self._colors
+        layout = self._layout
+        canvas = np.full((self.height, self.width, 3), colors["BG"], dtype=np.uint8)
+
+        header = layout.header
+        fill_rect(canvas, header, colors["PANEL_BG"])
+        outline_rect(canvas, header, colors["CARD_BORDER"])
+        title_w = self._text.draw(
+            canvas,
+            "OFF-ROAD AUTONOMY",
+            header.x + 20,
+            header.y + 36,
+            TITLE,
+            colors["TEXT_PRIMARY"],
+        )
+        self._text.draw(
+            canvas,
+            "Front Path View",
+            header.x + 20 + title_w + 16,
+            header.y + 35,
+            BODY,
+            colors["TEXT_SECONDARY"],
+        )
+
+        self._static_card(canvas, layout.vehicle, "Vehicle")
+        vehicle = layout.vehicle
+        self._static_label(canvas, vehicle, "Steering", _STEER_BASELINE)
+        half_gap = 20
+        column_w = (vehicle.w - 2 * _CARD_INSET - half_gap) // 2
+        self._text.draw(
+            canvas,
+            "Throttle",
+            vehicle.x + _CARD_INSET,
+            vehicle.y + _PEDAL_BASELINE,
+            BODY,
+            colors["TEXT_SECONDARY"],
+        )
+        self._text.draw(
+            canvas,
+            "Brake",
+            vehicle.x + _CARD_INSET + column_w + half_gap,
+            vehicle.y + _PEDAL_BASELINE,
+            BODY,
+            colors["TEXT_SECONDARY"],
+        )
+
+        self._static_card(canvas, layout.perception, "Perception")
+        perception = layout.perception
+        thresholds = self._thresholds
+        self._static_label(canvas, perception, "Road / Valid Px", _ROAD_BASELINE)
+        self._static_caption(
+            canvas,
+            perception,
+            f"Tick: Safe Stop Threshold {thresholds.road_floor:g}",
+            _ROAD_CAPTION_BASELINE,
+        )
+        self._static_label(canvas, perception, "Segmentation Confidence", _CONF_BASELINE)
+        self._static_caption(
+            canvas,
+            perception,
+            f"Tick: Gate Minimum {thresholds.confidence_floor:g}",
+            _CONF_CAPTION_BASELINE,
+        )
+        self._static_label(canvas, perception, "Valid ROI / Ego", _ROI_BASELINE)
+        self._static_label(canvas, perception, "Fallback", _FALLBACK_BASELINE)
+
+        for rect, title in (
+            (layout.autonomy_fps, "Autonomy FPS"),
+            (layout.latency, "Autonomy Latency Mean / P95"),
+            (layout.dashboard_fps, "Dashboard FPS"),
+        ):
+            fill_rect(canvas, rect, colors["CARD_BG"])
+            outline_rect(canvas, rect, colors["CARD_BORDER"])
+            self._text.draw(
+                canvas,
+                title.upper(),
+                rect.x + _CARD_INSET,
+                rect.y + _TILE_TITLE_BASELINE,
+                LABEL,
+                colors["TEXT_SECONDARY"],
+            )
+        # The note that keeps a slow window from posing as a slow vehicle.
+        self._text.draw(
+            canvas,
+            "Display Only, Not The Vehicle",
+            layout.dashboard_fps.x + _CARD_INSET,
+            layout.dashboard_fps.y + _DASHBOARD_TILE_NOTE_BASELINE,
+            CAPTION,
+            colors["TEXT_SECONDARY"],
+        )
+        return canvas
+
+    def _static_card(self, canvas: np.ndarray, rect: Rect, title: str) -> None:
+        fill_rect(canvas, rect, self._colors["CARD_BG"])
+        outline_rect(canvas, rect, self._colors["CARD_BORDER"])
+        self._text.draw(
+            canvas,
+            title.upper(),
+            rect.x + _CARD_INSET,
+            rect.y + _CARD_TITLE_BASELINE,
+            LABEL,
+            self._colors["TEXT_SECONDARY"],
+        )
+
+    def _static_label(self, canvas: np.ndarray, card: Rect, text: str, baseline: int) -> None:
+        self._text.draw(
+            canvas,
+            text,
+            card.x + _CARD_INSET,
+            card.y + baseline,
+            BODY,
+            self._colors["TEXT_SECONDARY"],
+        )
+
+    def _static_caption(self, canvas: np.ndarray, card: Rect, text: str, baseline: int) -> None:
+        self._text.draw(
+            canvas,
+            text,
+            card.x + _CARD_INSET,
+            card.y + baseline,
+            CAPTION,
+            self._colors["TEXT_SECONDARY"],
+        )
+
+    # ----------------------------------------------------------------- header
+
+    def _draw_status_chip(self, canvas: np.ndarray, autopilot_active: bool) -> None:
+        header = self._layout.header
+        if autopilot_active:
+            text, color, solid = "AUTONOMY ACTIVE", self._colors["GOOD"], False
+        else:
+            text, color, solid = "SAFE STOP | MANUAL CONTROL", self._colors["BAD"], True
+        height = chip_height(self._text)
+        draw_chip(
+            canvas,
+            self._text,
+            header.right - 20,
+            header.y + (header.h - height) // 2,
+            text,
+            color,
+            self._colors["BG"],
+            solid=solid,
+            align="right",
+        )
+
+    # --------------------------------------------------------------- viewport
+
+    def _draw_viewport_labels(self, canvas: np.ndarray, rect: Rect, debug_view: str) -> None:
+        if debug_view == "default":
+            text = f"Dashcam {self.sensor.model} {self.sensor.fov_x_deg:.0f} Deg"
+            color = self._colors["TEXT_PRIMARY"]
+        else:
+            index = next(key for key, view in DEBUG_VIEW_KEYS.items() if view == debug_view)
+            text = f"[{index}] {_VIEW_TITLES[debug_view]} (0 = Back)"
+            color = self._colors["PATH_CORE"]
+        self._draw_plate_text(canvas, rect.x + 16, rect.y + 16, text, BODY_STRONG, color)
+
+    def _draw_plate_text(
+        self,
+        canvas: np.ndarray,
+        x: int,
+        y: int,
+        text: str,
+        style: TextStyle,
+        color: tuple[int, int, int],
+    ) -> None:
+        """Text on a dark translucent plate, so it reads over any scene."""
+        cap = self._text.cap_height(style)
+        plate = Rect(x, y, self._text.width(text, style) + 24, cap + 20)
+        blend_rect(canvas, plate, self._colors["BG"], 0.8)
+        self._text.draw(canvas, text, x + 12, y + 10 + cap, style, color)
+
+    def _draw_mask_inset(
+        self, canvas: np.ndarray, viewport: Rect, result: PipelineStepResult
+    ) -> None:
+        inset_w, inset_h = 172, 104
+        inset = Rect(viewport.x + 16, viewport.bottom - 16 - inset_h, inset_w, inset_h)
+        self._text.draw(
+            canvas,
+            "MASK",
+            inset.x,
+            inset.y - 8,
+            LABEL,
+            self._colors["TEXT_PRIMARY"],
+        )
+        image = self._render_mask_view(result)
+        fitted = self._fit_image(image, inset.w, inset.h, fill=self._colors["CARD_BG"])
+        canvas[inset.y : inset.bottom, inset.x : inset.right] = fitted
+        outline_rect(canvas, inset, self._colors["CARD_BORDER"])
+
+    def _draw_perception_legend(
+        self,
+        canvas: np.ndarray,
+        viewport: Rect,
+        plan: PathPlan | None,
+        has_ego: bool,
+    ) -> None:
+        entries = [("Traversable Mask", self._colors["MASK_FILL"])]
+        if plan is not None:
+            if plan.fallback_active:
+                entries.append(("Held Path", self._colors["WARN"]))
+            else:
+                entries.append(("Planned Path", self._colors["PATH_CORE"]))
+        if has_ego:
+            entries.append(("Ego Vehicle (Excluded)", self._colors["EGO_EXCLUDED"]))
+
+        swatch = 14
+        swatch_gap = 8
+        entry_gap = 20
+        pad_x = 16
+        cap = self._text.cap_height(BODY)
+        widths = [swatch + swatch_gap + self._text.width(label, BODY) for label, _ in entries]
+        plate_w = sum(widths) + entry_gap * (len(entries) - 1) + 2 * pad_x
+        plate_h = cap + 24
+        plate = Rect(
+            viewport.right - 16 - plate_w,
+            viewport.bottom - 16 - plate_h,
+            plate_w,
+            plate_h,
+        )
+        blend_rect(canvas, plate, self._colors["BG"], 0.8)
+        x = plate.x + pad_x
+        baseline = plate.y + 12 + cap
+        for (label, color), width in zip(entries, widths, strict=True):
+            fill_rect(canvas, Rect(x, baseline - swatch + 2, swatch, swatch), color)
+            self._text.draw(
+                canvas,
+                label,
+                x + swatch + swatch_gap,
+                baseline,
+                BODY,
+                self._colors["TEXT_PRIMARY"],
+            )
+            x += width + entry_gap
+
+    def _draw_fallback_chip(self, canvas: np.ndarray, viewport: Rect) -> None:
+        text = "PATH FALLBACK ACTIVE"
+        width = chip_width(self._text, text)
+        draw_chip(
+            canvas,
+            self._text,
+            viewport.x + (viewport.w - width) // 2,
+            viewport.y + 20,
+            text,
+            self._colors["WARN"],
+            self._colors["BG"],
+            solid=True,
+        )
+
+    def _draw_ego_label(
+        self, canvas: np.ndarray, transform: CoverTransform, anchor: tuple[int, int]
+    ) -> None:
+        x, y = cover_point(transform, anchor)
+        self._text.draw(
+            canvas,
+            EGO_LABEL,
+            x,
+            y,
+            BODY_STRONG,
+            self._colors["TEXT_PRIMARY"],
+            align="center",
+        )
+
+    def _draw_timing_overlay(self, canvas: np.ndarray, viewport: Rect, lines: list[str]) -> None:
+        row_h = 17
+        plate_w = 360
+        top = viewport.y + 60
+        plate_h = min(viewport.h - 120, 16 + row_h * len(lines))
+        plate = Rect(viewport.x + 16, top, plate_w, plate_h)
+        blend_rect(canvas, plate, self._colors["BG"], 0.8)
+        for index, line in enumerate(lines):
+            baseline = top + 20 + row_h * index
+            if baseline > plate.bottom - 4:
+                break
+            self._text.draw(
+                canvas, line, plate.x + 10, baseline, CAPTION_MONO, self._colors["TEXT_PRIMARY"]
             )
 
-        mask = projector.warp_mask(result.stabilized.mask)
-        if self.display_clip is not None and self.display_clip.shape == mask.shape:
-            mask = mask & ~self.display_clip
+    def _draw_safe_stop_overlay(self, canvas: np.ndarray, viewport: Rect) -> None:
+        colors = self._colors
+        blend_rect(canvas, viewport, colors["BAD"], 0.22)
+        outline_rect(canvas, viewport, colors["BAD"], 6)
 
-        projected = None
-        if plan is not None and len(plan.centerline) >= 2:
-            points = projector.project_points(plan.centerline)
-            if len(points) >= 2:
-                projected = replace(plan, centerline=points)
-
-        return self._build_overlay(target, mask, projected, target.shape[:2], ego=None)
-
-    def _placeholder(self, like: np.ndarray, text: str) -> np.ndarray:
-        image = np.full(like.shape[:2] + (3,), self._colors["CARD_BG"], dtype=np.uint8)
-        size, _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
-        cv2.putText(
-            image,
-            text,
-            ((image.shape[1] - size[0]) // 2, image.shape[0] // 2),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            self._colors["TEXT_SECONDARY"],
-            1,
-            cv2.LINE_AA,
+        banner_w, banner_h = 700, 190
+        banner = Rect(
+            viewport.x + (viewport.w - banner_w) // 2,
+            viewport.y + (viewport.h - banner_h) // 2 - 40,
+            banner_w,
+            banner_h,
         )
-        return image
+        fill_rect(canvas, banner, colors["CARD_BG"])
+        outline_rect(canvas, banner, colors["BAD"], 3)
+        centre = banner.x + banner.w // 2
+        self._text.draw(
+            canvas, "SAFE STOP", centre, banner.y + 70, HERO_SANS, colors["BAD"], align="center"
+        )
+        self._text.draw(
+            canvas,
+            "Manual Control Required",
+            centre,
+            banner.y + 118,
+            LARGE_SANS,
+            colors["TEXT_PRIMARY"],
+            align="center",
+        )
+        self._text.draw(
+            canvas,
+            "W/A/S/D Drive  |  Space Brake  |  P Resume Autopilot",
+            centre,
+            banner.y + 160,
+            BODY,
+            colors["TEXT_SECONDARY"],
+            align="center",
+        )
 
-    def _render_disparity(self, depth: DepthResult | None) -> np.ndarray | None:
-        if depth is None or depth.disparity is None:
-            return None
-        disparity = depth.disparity
-        valid = disparity > 0.0
-        if not valid.any():
-            return None
-        top = max(float(np.percentile(disparity[valid], 99)), 1.0)
-        indexed = (np.clip(disparity / top, 0.0, 1.0) * 255.0).astype(np.uint8)
-        coloured = cv2.applyColorMap(indexed, cv2.COLORMAP_TURBO)
-        coloured[~valid] = self._colors["CARD_BG"]
-        return coloured
+    # ---------------------------------------------------------------- vehicle
+
+    def _draw_vehicle_card(self, canvas: np.ndarray, telemetry: DashboardTelemetry) -> None:
+        colors = self._colors
+        card = self._layout.vehicle
+        left = card.x + _CARD_INSET
+        inner_w = card.w - 2 * _CARD_INSET
+
+        speed = f"{telemetry.speed_mph:.1f}"
+        speed_w = self._text.draw(
+            canvas, speed, left, card.y + _SPEED_BASELINE, DISPLAY, colors["TEXT_PRIMARY"]
+        )
+        self._text.draw(
+            canvas,
+            "mph",
+            left + speed_w + 12,
+            card.y + _SPEED_BASELINE,
+            TITLE,
+            colors["TEXT_SECONDARY"],
+        )
+
+        direction = "Right"
+        if telemetry.steering < 0.0:
+            direction = "Left"
+        right = card.right - _CARD_INSET
+        word_w = self._text.draw(
+            canvas,
+            direction,
+            right,
+            card.y + _STEER_BASELINE,
+            CAPTION,
+            colors["TEXT_SECONDARY"],
+            align="right",
+        )
+        self._text.draw(
+            canvas,
+            f"{telemetry.steering:+.2f}",
+            right - word_w - 8,
+            card.y + _STEER_BASELINE,
+            VALUE,
+            colors["TEXT_PRIMARY"],
+            align="right",
+        )
+        draw_centered_bar(
+            canvas,
+            Rect(left, card.y + _STEER_BAR_TOP, inner_w, 10),
+            telemetry.steering,
+            colors["TEXT_PRIMARY"],
+            colors["MUTED_LINE"],
+            colors["TEXT_SECONDARY"],
+        )
+
+        half_gap = 20
+        column_w = (inner_w - half_gap) // 2
+        for index, (value, color) in enumerate(
+            ((telemetry.throttle, colors["GOOD"]), (telemetry.brake, colors["BAD"]))
+        ):
+            x = left + index * (column_w + half_gap)
+            self._text.draw(
+                canvas,
+                f"{value:.2f}",
+                x + column_w,
+                card.y + _PEDAL_BASELINE,
+                VALUE,
+                colors["TEXT_PRIMARY"],
+                align="right",
+            )
+            draw_bar(
+                canvas,
+                Rect(x, card.y + _PEDAL_BAR_TOP, column_w, 10),
+                value,
+                color,
+                colors["MUTED_LINE"],
+            )
+
+    # ------------------------------------------------------------- perception
+
+    def _draw_perception_card(self, canvas: np.ndarray, telemetry: DashboardTelemetry) -> None:
+        colors = self._colors
+        thresholds = self._thresholds
+        card = self._layout.perception
+        left = card.x + _CARD_INSET
+        right = card.right - _CARD_INSET
+        inner_w = card.w - 2 * _CARD_INSET
+
+        # Road fraction, not confidence, is what the safe stop watches.
+        road_color = colors[bands.road_level(telemetry.road_fraction, thresholds.road_floor)]
+        self._text.draw(
+            canvas,
+            f"{telemetry.road_fraction:.3f}",
+            right,
+            card.y + _ROAD_BASELINE,
+            VALUE,
+            road_color,
+            align="right",
+        )
+        draw_bar(
+            canvas,
+            Rect(left, card.y + _ROAD_BAR_TOP, inner_w, 12),
+            telemetry.road_fraction / thresholds.road_bar_full_scale,
+            road_color,
+            colors["MUTED_LINE"],
+            tick=thresholds.road_floor / thresholds.road_bar_full_scale,
+            tick_color=colors["TEXT_PRIMARY"],
+        )
+
+        confidence = telemetry.perception_confidence
+        confidence_color = colors[
+            bands.confidence_level(
+                confidence, thresholds.confidence_floor, thresholds.confidence_good
+            )
+        ]
+        self._text.draw(
+            canvas,
+            f"{confidence:.2f}",
+            right,
+            card.y + _CONF_BASELINE,
+            VALUE,
+            confidence_color,
+            align="right",
+        )
+        draw_bar(
+            canvas,
+            Rect(left, card.y + _CONF_BAR_TOP, inner_w, 10),
+            confidence,
+            confidence_color,
+            colors["MUTED_LINE"],
+            tick=thresholds.confidence_floor,
+            tick_color=colors["TEXT_PRIMARY"],
+        )
+
+        valid = (1.0 - telemetry.ego_coverage) * 100.0
+        self._text.draw(
+            canvas,
+            f"{valid:.0f}% / {telemetry.ego_coverage * 100:.0f}%",
+            right,
+            card.y + _ROI_BASELINE,
+            VALUE,
+            colors["TEXT_PRIMARY"],
+            align="right",
+        )
+
+        chips_bottom = self._draw_fallback_chips(canvas, card, telemetry.fallback_state)
+        self._draw_reason(canvas, card, chips_bottom, telemetry)
+
+    def _draw_fallback_chips(self, canvas: np.ndarray, card: Rect, state: str) -> int:
+        """One chip per active fallback, wrapping, since the state is a
+        ``" + "`` joined list that can outgrow the card."""
+        parts = [part.strip() for part in state.split("+") if part.strip()]
+        if not parts:
+            parts = ["NONE"]
+        color = self._colors["BAD"]
+        if state == "NONE":
+            color = self._colors["GOOD"]
+
+        chip_h = chip_height(self._text)
+        row_start = card.x + _CARD_INSET
+        row_end = card.right - _CARD_INSET
+        x = row_start + self._fallback_label_w + 12
+        # The label's baseline is the chip text's baseline, so the chip sits
+        # level with it.
+        y = card.y + _FALLBACK_BASELINE - 10 - self._text.cap_height(BODY_STRONG)
+        for part in parts:
+            width = chip_width(self._text, part)
+            if x + width > row_end and x > row_start:
+                x = row_start
+                y += chip_h + 8
+            draw_chip(canvas, self._text, x, y, part, color, self._colors["BG"])
+            x += width + 8
+        return y + chip_h
+
+    def _draw_reason(
+        self, canvas: np.ndarray, card: Rect, chips_bottom: int, telemetry: DashboardTelemetry
+    ) -> None:
+        reason = telemetry.fallback_reason.strip()
+        left = card.x + _CARD_INSET
+        if not reason:
+            return
+        color = self._colors["TEXT_PRIMARY"]
+        lines = wrap_text(self._text, reason, BODY, card.w - 2 * _CARD_INSET)
+        baseline = chips_bottom + 26
+        room = (card.bottom - _CARD_BOTTOM_MARGIN - baseline) // _REASON_LINE_HEIGHT + 1
+        room = max(room, 1)
+        if len(lines) > room:
+            lines = lines[:room]
+            lines[-1] = self._ellipsize(lines[-1], card.w - 2 * _CARD_INSET, BODY)
+        for index, line in enumerate(lines):
+            self._text.draw(canvas, line, left, baseline + _REASON_LINE_HEIGHT * index, BODY, color)
+
+    def _ellipsize(self, text: str, max_width: int, style: TextStyle) -> str:
+        while text and self._text.width(text + "...", style) > max_width:
+            text = text[:-1]
+        return text.rstrip() + "..."
+
+    # ---------------------------------------------------------------- runtime
+
+    def _draw_runtime_strip(self, canvas: np.ndarray, telemetry: DashboardTelemetry) -> None:
+        colors = self._colors
+        thresholds = self._thresholds
+        layout = self._layout
+
+        fps_level = bands.fps_level(
+            telemetry.fps, thresholds.target_fps, thresholds.fps_warn_fraction
+        )
+        fps_note = f"Below {thresholds.target_fps:g} Fps Target"
+        if fps_level == bands.GOOD:
+            fps_note = "On Target"
+        elif fps_level == bands.WARN:
+            fps_note = f"Slightly Below {thresholds.target_fps:g} Fps Target"
+        self._draw_health_tile(
+            canvas,
+            layout.autonomy_fps,
+            f"{telemetry.fps:.1f}",
+            "fps",
+            fps_level,
+            fps_note,
+            telemetry.fps / (thresholds.target_fps * thresholds.fps_bar_scale),
+            1.0 / thresholds.fps_bar_scale,
+        )
+
+        latency_level = bands.latency_level(telemetry.latency_p95_ms, thresholds.latency_budget_ms)
+        latency_note = f"Over {thresholds.latency_budget_ms:.0f} Ms Budget"
+        if latency_level == bands.GOOD:
+            latency_note = f"Within {thresholds.latency_budget_ms:.0f} Ms Budget"
+        self._draw_health_tile(
+            canvas,
+            layout.latency,
+            f"{telemetry.latency_ms:.0f} / {telemetry.latency_p95_ms:.0f}",
+            "ms",
+            latency_level,
+            latency_note,
+            telemetry.latency_p95_ms
+            / (thresholds.latency_budget_ms * thresholds.latency_bar_scale),
+            1.0 / thresholds.latency_bar_scale,
+        )
+
+        tile = layout.dashboard_fps
+        self._text.draw(
+            canvas,
+            f"{telemetry.dashboard_fps:.1f}",
+            tile.x + _CARD_INSET,
+            tile.y + _DASHBOARD_TILE_VALUE_BASELINE,
+            LARGE,
+            colors["TEXT_SECONDARY"],
+        )
+
+    def _draw_health_tile(
+        self,
+        canvas: np.ndarray,
+        tile: Rect,
+        value: str,
+        unit: str,
+        level: str,
+        note: str,
+        fraction: float,
+        tick: float,
+    ) -> None:
+        color = self._colors[level]
+        if level != bands.GOOD:
+            outline_rect(canvas, tile, color, 2)
+        left = tile.x + _CARD_INSET
+        baseline = tile.y + _TILE_VALUE_BASELINE
+        value_w = self._text.draw(canvas, value, left, baseline, HERO, color)
+        self._text.draw(
+            canvas, unit, left + value_w + 10, baseline, BODY, self._colors["TEXT_SECONDARY"]
+        )
+        self._text.draw(
+            canvas,
+            note,
+            tile.right - _CARD_INSET,
+            tile.y + _TILE_TITLE_BASELINE,
+            LABEL,
+            color,
+            align="right",
+        )
+        draw_bar(
+            canvas,
+            Rect(left, tile.y + _TILE_BAR_TOP, tile.w - 2 * _CARD_INSET, _TILE_BAR_H),
+            fraction,
+            color,
+            self._colors["MUTED_LINE"],
+            tick=tick,
+            tick_color=self._colors["TEXT_PRIMARY"],
+        )
+
+    # ------------------------------------------------------------ debug views
 
     def _render_mask_view(self, result: PipelineStepResult) -> np.ndarray:
         stable = result.stabilized.mask
@@ -329,13 +877,15 @@ class AutonomyDashboard:
         cv2.drawContours(image, contours, -1, self._colors["MASK_EDGE"], 2, lineType=cv2.LINE_AA)
         return image
 
-    def _render_pipeline_view(self, result: PipelineStepResult) -> np.ndarray:
-        """Uses ``result.plan``, which is kept even under safe stop, so this
+    def _render_pipeline_view(self, result: PipelineStepResult) -> tuple[np.ndarray, int, int]:
+        """The 2 x 2 grid without any text, so it can be scaled freely. Returns
+        the grid and the size of one quadrant.
+
+        Uses ``result.plan``, which is kept even under safe stop, so this
         view always shows what the planner decided."""
         frame = result.frame.preprocessed
         h, w = frame.shape[:2]
         raw = cv2.resize(self._ensure_bgr(result.frame.raw), (w, h), interpolation=cv2.INTER_AREA)
-        perception = result.perception
         plan = result.plan
 
         def tint(image, mask, color, alpha=0.45):
@@ -344,62 +894,25 @@ class AutonomyDashboard:
             out[mask] = (out[mask] * (1.0 - alpha) + np.array(color) * alpha).astype(np.uint8)
             return out
 
-        def caption(image, lines):
-            for i, line in enumerate(lines):
-                y = 20 + 18 * i
-                cv2.putText(
-                    image, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 4, cv2.LINE_AA
-                )
-                cv2.putText(
-                    image,
-                    line,
-                    (10, y),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    (255, 255, 255),
-                    1,
-                    cv2.LINE_AA,
-                )
-            return image
-
-        confs = perception.confidences
-        seg = caption(
-            tint(frame, _model_mask(result), (0, 200, 255)),
-            [
-                "2 SEGMENTATION (model)",
-                f"{len(confs)} det  max conf {max(confs, default=0.0):.2f}",
-                f"road {perception.road_fraction:.1%} of valid px",
-            ],
-        )
+        seg = tint(frame, _model_mask(result), (0, 200, 255))
 
         processed = (frame * 0.4).astype(np.uint8)
         processed = tint(processed, result.stabilized.mask, (90, 90, 90), 0.6)
         if plan.planner_mask is not None:
             processed = tint(processed, plan.planner_mask, (0, 255, 0), 0.7)
         cv2.line(processed, (0, plan.roi_top), (w - 1, plan.roi_top), (255, 255, 0), 1)
-        processed = caption(
-            processed,
-            ["3 PLANNER INPUT", "green = road component, grey = rest", "cyan line = ROI top"],
-        )
 
         planner_mask = plan.planner_mask
         if planner_mask is None:
             planner_mask = np.zeros((h, w), bool)
         traj = tint(frame, planner_mask, (0, 255, 0), 0.25)
-        status = "perceived path"
         path_color = (255, 200, 0)
         if plan.fallback_active:
-            status = plan.fallback_reason
             path_color = (0, 165, 255)
         if len(plan.centerline) >= 2:
             pts = np.round(plan.centerline).astype(np.int32).reshape(-1, 1, 2)
             cv2.polylines(traj, [pts], False, path_color, 4, cv2.LINE_AA)
         cv2.line(traj, (w // 2, h - 1), (w // 2, h - 30), (255, 255, 255), 2)
-        lines = [
-            "4 TRAJECTORY + CONTROL",
-            status[:48],
-            f"thr {result.command.throttle:.2f}  brk {result.command.brake:.2f}",
-        ]
         dbg = result.command.debug
         if dbg is not None:
             edge_color = _level_color(dbg.edge_risk, warn=0.0, bad=0.66, ok=(0, 255, 255))
@@ -416,197 +929,154 @@ class AutonomyDashboard:
                 cv2.circle(traj, (lx, ly), 9, marker, 2, cv2.LINE_AA)
                 cv2.line(traj, (w // 2, h - 1), (lx, ly), (255, 0, 255), 1, cv2.LINE_AA)
 
-            def edge(d):
-                if not math.isfinite(d):
-                    return "n/a"
-                return f"{d:.2f}"
-
-            curvature_line = f"curvature {dbg.curvature:+.3f} /m (straight)"
-            if abs(dbg.curvature) > 1e-3:
-                curvature_line = (
-                    f"curvature {dbg.curvature:+.3f} /m (R {abs(1.0 / dbg.curvature):.0f} m)"
-                )
-            lookahead_line = f"lookahead {dbg.lookahead_m:.1f} m  rejoin {dbg.rejoin_m:.1f} m"
-            if dbg.lookahead_px is None:
-                lookahead_line += " (no point)"
-
-            lines += [
-                f"cross-track {dbg.cross_track_m:+.2f} m  ({dbg.cross_track_rate_mps:+.2f} m/s)",
-                f"trail edge L {edge(dbg.left_boundary_m)} m  R {edge(dbg.right_boundary_m)} m",
-                f"edge risk {dbg.edge_risk * 100:.0f}%  clear {edge(dbg.edge_clearance_m)} m",
-                f"lat accel {dbg.lateral_accel_mps2:.2f} m/s2",
-                f"heading err {math.degrees(dbg.heading_error_rad):+.1f} deg",
-                curvature_line,
-                f"steer desired {dbg.desired_steering:+.3f}  ff {dbg.feedforward_steering:+.2f}",
-                f"steer final   {dbg.final_steering:+.3f}",
-                f"saturation {dbg.saturation * 100:.0f}%  (sharpest ahead {dbg.max_curvature_ahead:.2f} /m)",
-                f"target {dbg.target_speed_mps:.1f} m/s ({dbg.speed_reason})",
-                lookahead_line,
-            ]
-        traj = caption(traj, lines)
-
-        top = np.hstack([caption(raw, ["1 RAW RGB"]), seg])
-        bottom = np.hstack([processed, traj])
-        grid = np.vstack([top, bottom])
+        grid = np.vstack([np.hstack([raw, seg]), np.hstack([processed, traj])])
         cv2.line(grid, (w, 0), (w, 2 * h), (255, 255, 255), 2)
         cv2.line(grid, (0, h), (2 * w, h), (255, 255, 255), 2)
-        # The view-title chip gets its own band so it covers no caption.
-        header = np.full((80, grid.shape[1], 3), self._colors["PANEL_BG"], dtype=np.uint8)
-        return np.vstack([header, grid])
+        return grid, w, h
 
-    def _render_fused_view(self, result: PipelineStepResult) -> np.ndarray:
-        frame = result.frame.preprocessed.copy()
-        trav = result.traversability
-        if trav is None:
-            return self._placeholder(frame, "NO FUSED DEPTH (appearance only)")
-        conf = np.clip(trav.confidence_map, 0.0, 1.0)
-        coloured = cv2.applyColorMap((conf * 255.0).astype(np.uint8), cv2.COLORMAP_VIRIDIS)
-        road = trav.binary_mask
-        frame[road] = cv2.addWeighted(frame, 0.35, coloured, 0.65, 0)[road]
-        frame[trav.obstacle_mask] = self._colors["BAD"]
-        edges = cv2.Canny(trav.valid_depth_mask.astype(np.uint8) * 255, 50, 150) > 0
-        frame[edges] = self._colors["WARN"]
-        return frame
+    def _pipeline_readout(self, result: PipelineStepResult) -> list[tuple[str, str | None]]:
+        """Label and value rows for the debug panel. A ``None`` value is a heading.
 
-    def _render_roi_view(
-        self,
-        frame: np.ndarray,
-        depth_roi: np.ndarray | None,
-        depth: DepthResult | None,
-    ) -> np.ndarray:
-        if depth_roi is None or depth_roi.shape != frame.shape[:2]:
-            return self._placeholder(frame, "DEPTH ROI DISABLED")
-        image = (frame * 0.25).astype(np.uint8)
-        image[depth_roi] = frame[depth_roi]
-        if depth is not None and depth.valid.shape == depth_roi.shape:
-            hits = depth.valid & depth_roi
-            image[hits] = cv2.addWeighted(
-                image, 0.5, np.full_like(image, self._colors["WARN"]), 0.5, 0
-            )[hits]
-        return image
+        Drawn as dashboard text rather than burned into the quadrants, where
+        scaling the grid to fit made it unreadable."""
+        perception = result.perception
+        plan = result.plan
+        command = result.command
+        confs = perception.confidences
+        status = "Perceived Path"
+        if plan.fallback_active:
+            status = plan.fallback_reason
+        rows: list[tuple[str, str | None]] = [
+            ("Segmentation", None),
+            ("Detections", str(len(confs))),
+            ("Max Confidence", f"{max(confs, default=0.0):.2f}"),
+            ("Road Of Valid Px", f"{perception.road_fraction:.1%}"),
+            ("Planner", None),
+            ("Status", status),
+            ("Throttle / Brake", f"{command.throttle:.2f} / {command.brake:.2f}"),
+        ]
+        dbg = command.debug
+        if dbg is None:
+            return rows
 
-    def _draw_camera_strip(
-        self,
-        canvas: np.ndarray,
-        rect: tuple[int, int, int, int],
-        depth: DepthResult | None,
-        terrain: TerrainAnalysis | None,
-        telemetry: DashboardTelemetry,
+        def meters(value):
+            if not math.isfinite(value):
+                return "n/a"
+            return f"{value:.2f} m"
+
+        curvature = "Straight"
+        if abs(dbg.curvature) > 1e-3:
+            curvature = f"{dbg.curvature:+.3f} /m (R {abs(1.0 / dbg.curvature):.0f} m)"
+        lookahead = f"{dbg.lookahead_m:.1f} m"
+        if dbg.lookahead_px is None:
+            lookahead += " (No Point)"
+
+        rows += [
+            ("Controller", None),
+            ("Cross-Track", f"{dbg.cross_track_m:+.2f} m ({dbg.cross_track_rate_mps:+.2f} m/s)"),
+            ("Trail Edge Left", meters(dbg.left_boundary_m)),
+            ("Trail Edge Right", meters(dbg.right_boundary_m)),
+            ("Edge Risk", f"{dbg.edge_risk * 100:.0f}%"),
+            ("Edge Clearance", meters(dbg.edge_clearance_m)),
+            ("Lateral Accel", f"{dbg.lateral_accel_mps2:.2f} m/s2"),
+            ("Heading Error", f"{math.degrees(dbg.heading_error_rad):+.1f} deg"),
+            ("Curvature", curvature),
+            ("Steer Desired", f"{dbg.desired_steering:+.3f} (ff {dbg.feedforward_steering:+.2f})"),
+            ("Steer Final", f"{dbg.final_steering:+.3f}"),
+            ("Saturation", f"{dbg.saturation * 100:.0f}%"),
+            ("Sharpest Ahead", f"{dbg.max_curvature_ahead:.2f} /m"),
+            ("Target Speed", f"{dbg.target_speed_mps:.1f} m/s ({dbg.speed_reason})"),
+            ("Lookahead", lookahead),
+            ("Rejoin", f"{dbg.rejoin_m:.1f} m"),
+        ]
+        if dbg.controller == "mpc":
+            rows += [
+                ("MPC Solve", f"{dbg.mpc_solve_ms:.1f} ms (ok {dbg.solver_success})"),
+                ("MPC Cost", f"{dbg.mpc_cost:.2f}"),
+                (
+                    "Controller Fallback",
+                    f"{dbg.controller_fallback}: {dbg.controller_fallback_reason}",
+                ),
+            ]
+        return rows
+
+    def _draw_pipeline_view(
+        self, canvas: np.ndarray, viewport: Rect, result: PipelineStepResult
     ) -> None:
-        x, y, w, h = rect
-        gap = 12
-        tile_w = (w - gap * 2) // 3
+        colors = self._colors
+        fill_rect(canvas, viewport, colors["PANEL_BG"])
 
-        age = ""
-        if math.isfinite(telemetry.depth_age_ms):
-            age = f"  {telemetry.depth_age_ms:.0f} ms old"
-        rect_left = None
-        rect_right = None
-        if depth is not None:
-            rect_left = depth.rectified_left
-            rect_right = depth.rectified_right
-        tiles = (
-            ("LEFT RECTIFIED", rect_left),
-            ("RIGHT RECTIFIED", rect_right),
-            ("STEREO DEPTH" + age, self._render_depth_view(depth, terrain)),
+        readout = Rect(
+            viewport.right - _PIPELINE_READOUT_W, viewport.y, _PIPELINE_READOUT_W, viewport.h
         )
-        placeholder = telemetry.depth_state
-        if telemetry.depth_state == "OFF":
-            placeholder = "NO SIGNAL"
+        # Below the view chip, which sits over the top-left corner.
+        chip_clearance = 64
+        region = Rect(
+            viewport.x,
+            viewport.y + chip_clearance,
+            viewport.w - _PIPELINE_READOUT_W - 16,
+            viewport.h - chip_clearance,
+        )
+        grid, quad_w, quad_h = self._render_pipeline_view(result)
+        scale = min(region.w / grid.shape[1], region.h / grid.shape[0])
+        new_w = max(1, int(round(grid.shape[1] * scale)))
+        new_h = max(1, int(round(grid.shape[0] * scale)))
+        resized = cv2.resize(grid, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        off_x = region.x + (region.w - new_w) // 2
+        off_y = region.y + (region.h - new_h) // 2
+        canvas[off_y : off_y + new_h, off_x : off_x + new_w] = resized
 
-        for index, (title, image) in enumerate(tiles):
-            tile_x = x + index * (tile_w + gap)
-            self._draw_card(canvas, (tile_x, y, tile_w, h), title)
-
-            body_rect = (tile_x + 8, y + 24, tile_w - 16, h - 32)
-            if body_rect[2] <= 0 or body_rect[3] <= 0:
-                continue
-            if image is None:
-                self._draw_tile_placeholder(canvas, body_rect, placeholder)
-                continue
-            fitted = self._fit_image(
-                self._ensure_bgr(image), body_rect[2], body_rect[3], fill=self._colors["CARD_BG"]
+        titles = (
+            ("1 Raw RGB", 0, 0),
+            ("2 Segmentation (Model)", 1, 0),
+            ("3 Planner Input", 0, 1),
+            ("4 Trajectory + Control", 1, 1),
+        )
+        for title, column, row in titles:
+            self._draw_plate_text(
+                canvas,
+                off_x + int(round(column * quad_w * scale)) + 8,
+                off_y + int(round(row * quad_h * scale)) + 8,
+                title.upper(),
+                LABEL,
+                colors["TEXT_PRIMARY"],
             )
-            self._blit(canvas, fitted, body_rect[0], body_rect[1])
 
-    def _draw_tile_placeholder(
-        self,
-        canvas: np.ndarray,
-        rect: tuple[int, int, int, int],
-        text: str,
-    ) -> None:
-        x, y, w, h = rect
-        cv2.rectangle(canvas, (x, y), (x + w, y + h), self._colors["CARD_BG"], -1)
-        size, _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        cv2.putText(
-            canvas,
-            text,
-            (x + (w - size[0]) // 2, y + h // 2),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            self._colors["TEXT_SECONDARY"],
-            1,
-            cv2.LINE_AA,
-        )
+        fill_rect(canvas, readout, colors["CARD_BG"])
+        outline_rect(canvas, readout, colors["CARD_BORDER"])
+        left = readout.x + 16
+        right = readout.right - 16
+        baseline = readout.y + 28
+        for label, value in self._pipeline_readout(result):
+            if baseline > readout.bottom - 8:
+                break
+            if value is None:
+                baseline += 8
+                self._text.draw(
+                    canvas, label.upper(), left, baseline, LABEL, colors["TEXT_SECONDARY"]
+                )
+            else:
+                label_w = self._text.draw(
+                    canvas, label, left, baseline, CAPTION, colors["TEXT_SECONDARY"]
+                )
+                value = self._ellipsize_left_room(value, right - left - label_w - 12)
+                self._text.draw(
+                    canvas,
+                    value,
+                    right,
+                    baseline,
+                    CAPTION_MONO,
+                    colors["TEXT_PRIMARY"],
+                    align="right",
+                )
+            baseline += _READOUT_ROW_H
 
-    def _render_depth_view(
-        self,
-        depth: DepthResult | None,
-        terrain: TerrainAnalysis | None,
-    ) -> np.ndarray | None:
-        """Inferred pixels are dimmed so it stays obvious at a glance how much
-        of the frame is measurement rather than an assumption about the
-        ground."""
-        if depth is None:
-            return None
-        # Keyed on array identity: the pipeline passes an age-corrected copy
-        # of terrain every frame, but the maps inside it are shared until
-        # stereo publishes a new result.
-        range_m = None
-        if terrain is not None:
-            range_m = terrain.range_m
-        source = (depth.depth_m, range_m)
-        cached = self._depth_view_src
-        if cached and all(a is b for a, b in zip(source, cached)):
-            return self._depth_view
-        view = self._colour_depth(depth, terrain)
-        self._depth_view_src, self._depth_view = source, view
-        return view
+    def _ellipsize_left_room(self, text: str, max_width: int) -> str:
+        if self._text.width(text, CAPTION_MONO) <= max_width:
+            return text
+        return self._ellipsize(text, max_width, CAPTION_MONO)
 
-    def _colour_depth(
-        self,
-        depth: DepthResult,
-        terrain: TerrainAnalysis | None,
-    ) -> np.ndarray | None:
-        # Prefer the terrain range map: it covers the ground-plane fill too.
-        if terrain is not None and terrain.range_m is not None:
-            depth_m, coverage = terrain.range_m, terrain.valid
-        else:
-            depth_m, coverage = depth.depth_m, depth.valid
-
-        finite = coverage & np.isfinite(depth_m) & (depth_m > 0.0)
-        if not finite.any():
-            return None
-
-        # Scale by inverse depth, not depth: a linear ramp spends its range on
-        # ground the vehicle will not reach for seconds and crushes the near
-        # field into one hue. Inverse depth is also what stereo measures.
-        near, far = 2.0, 40.0
-        inverse = np.divide(1.0, depth_m, out=np.zeros_like(depth_m), where=depth_m > 1e-3)
-        span = (1.0 / near) - (1.0 / far)
-        normalised = np.clip((inverse - 1.0 / far) / span, 0.0, 1.0)
-        indexed = (normalised * 255.0).astype(np.uint8)
-        coloured = cv2.applyColorMap(indexed, cv2.COLORMAP_TURBO)
-        coloured[~finite] = self._colors["CARD_BG"]
-
-        if terrain is not None:
-            if terrain.inferred is not None and terrain.inferred.any():
-                inferred = terrain.inferred & finite
-                coloured[inferred] = (coloured[inferred] * 0.45).astype(np.uint8)
-            if terrain.obstacle_mask.any():
-                coloured[terrain.obstacle_mask] = self._colors["BAD"]
-
-        return coloured
+    # ---------------------------------------------------------------- overlay
 
     @staticmethod
     def _ensure_bgr(image: np.ndarray) -> np.ndarray:
@@ -660,23 +1130,43 @@ class AutonomyDashboard:
             pts = self._smooth_points(pts)
             pts_i = np.round(pts).astype(np.int32).reshape(-1, 1, 2)
 
-            glow = display.copy()
-            cv2.polylines(glow, [pts_i], False, self._colors["PATH_GLOW"], 12, lineType=cv2.LINE_AA)
-            cv2.addWeighted(glow, 0.22, display, 0.78, 0, display)
-            cv2.polylines(
-                display, [pts_i], False, self._colors["PATH_CORE"], 4, lineType=cv2.LINE_AA
-            )
-            cv2.polylines(
-                display, [pts_i], False, self._colors["PATH_HIGHLIGHT"], 1, lineType=cv2.LINE_AA
-            )
+            core = self._colors["PATH_CORE"]
+            if plan.fallback_active:
+                # Dashed and amber: the path is being held, not freshly perceived.
+                core = self._colors["WARN"]
+                dash, gap = 8, 6
+                for start in range(0, len(pts_i), dash + gap):
+                    cv2.polylines(
+                        display,
+                        [pts_i[start : start + dash]],
+                        False,
+                        core,
+                        4,
+                        lineType=cv2.LINE_AA,
+                    )
+            else:
+                glow = display.copy()
+                cv2.polylines(
+                    glow, [pts_i], False, self._colors["PATH_GLOW"], 12, lineType=cv2.LINE_AA
+                )
+                cv2.addWeighted(glow, 0.22, display, 0.78, 0, display)
+                cv2.polylines(display, [pts_i], False, core, 4, lineType=cv2.LINE_AA)
+                cv2.polylines(
+                    display,
+                    [pts_i],
+                    False,
+                    self._colors["PATH_HIGHLIGHT"],
+                    1,
+                    lineType=cv2.LINE_AA,
+                )
 
             target = tuple(np.round(pts[max(0, len(pts) // 3)]).astype(int))
-            cv2.circle(display, target, 6, self._colors["PATH_CORE"], -1, lineType=cv2.LINE_AA)
+            cv2.circle(display, target, 6, core, -1, lineType=cv2.LINE_AA)
             cv2.circle(display, target, 6, self._colors["PATH_HIGHLIGHT"], 1, lineType=cv2.LINE_AA)
 
         return display
 
-    def _ego_layer(self, ego: np.ndarray) -> tuple[np.ndarray, list]:
+    def _ego_layer(self, ego: np.ndarray) -> tuple[np.ndarray, list, tuple[int, int] | None]:
         """Cached because the exclusion never changes during a run."""
         key = (ego.shape, int(ego.sum()))
         cached = self._ego_cache.get(key)
@@ -689,109 +1179,32 @@ class AutonomyDashboard:
             contours, _ = cv2.findContours(
                 ego.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
             )
-            cached = (stripes, list(contours))
+            centre = None
+            if contours:
+                biggest = max(contours, key=cv2.contourArea)
+                moments = cv2.moments(biggest)
+                if moments["m00"] > 0:
+                    # Near the top edge, not the centroid: the bottom of the
+                    # frame is where the legend sits and would cover the label.
+                    top = int(biggest[:, 0, 1].min())
+                    centre = (int(moments["m10"] / moments["m00"]), top + _EGO_LABEL_DROP_PX)
+            cached = (stripes, list(contours), centre)
             self._ego_cache = {key: cached}
         return cached
 
     def _draw_ego_exclusion(self, display: np.ndarray, ego: np.ndarray) -> None:
         """Hatched so it reads as excluded, not as terrain."""
         colour = self._colors["EGO_EXCLUDED"]
-        stripes, contours = self._ego_layer(ego)
+        stripes, contours, centre = self._ego_layer(ego)
 
         tinted = display.copy()
         tinted[ego] = colour
         tinted[stripes] = colour
         cv2.addWeighted(tinted, 0.3, display, 0.7, 0, display)
         cv2.drawContours(display, contours, -1, colour, 1, lineType=cv2.LINE_AA)
-
-        if contours:
-            biggest = max(contours, key=cv2.contourArea)
-            moments = cv2.moments(biggest)
-            if moments["m00"] > 0:
-                cx = int(moments["m10"] / moments["m00"])
-                cy = int(moments["m01"] / moments["m00"])
-                text = "EGO - EXCLUDED"
-                size, _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
-                cv2.putText(
-                    display,
-                    text,
-                    (cx - size[0] // 2, cy),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.4,
-                    (245, 240, 250),
-                    1,
-                    cv2.LINE_AA,
-                )
-
-    def _draw_perception_legend(
-        self,
-        canvas: np.ndarray,
-        rect: tuple[int, int, int, int],
-        has_ego: bool,
-        reprojected: bool = False,
-    ) -> None:
-        x, y, w, h = rect
-        suffix = ""
-        box_w = 214
-        if reprojected:
-            suffix = " (from bumper pair)"
-            box_w = 320
-        entries = [
-            (f"Traversable mask{suffix}", self._colors["MASK_FILL"]),
-            (f"Planned path{suffix}", self._colors["PATH_CORE"]),
-        ]
-        if has_ego:
-            entries.append(("Ego vehicle (excluded)", self._colors["EGO_EXCLUDED"]))
-
-        pad = 10
-        row_h = 20
-        box_h = pad * 2 + row_h * len(entries)
-        bx = x + w - box_w - 14
-        by = y + h - box_h - 14
-
-        cv2.rectangle(canvas, (bx, by), (bx + box_w, by + box_h), (22, 26, 30), -1)
-        cv2.rectangle(canvas, (bx, by), (bx + box_w, by + box_h), self._colors["CARD_BORDER"], 1)
-        for index, (label, colour) in enumerate(entries):
-            row_y = by + pad + row_h * index + 13
-            cv2.rectangle(canvas, (bx + pad, row_y - 9), (bx + pad + 14, row_y + 2), colour, -1)
-            cv2.putText(
-                canvas,
-                label,
-                (bx + pad + 22, row_y),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.42,
-                self._colors["TEXT_PRIMARY"],
-                1,
-                cv2.LINE_AA,
-            )
-
-    def _draw_timing_overlay(
-        self,
-        canvas: np.ndarray,
-        rect: tuple[int, int, int, int],
-        lines: list[str],
-    ) -> None:
-        x, y, _, h = rect
-        row_h = 17
-        box_w = 360
-        box_h = min(h - 60, 16 + row_h * len(lines))
-        bx, by = x + 14, y + 52
-        region = canvas[by : by + box_h, bx : bx + box_w]
-        region[:] = (region * 0.25).astype(np.uint8)
-        for index, line in enumerate(lines):
-            row_y = by + 16 + row_h * index
-            if row_y > by + box_h - 4:
-                break
-            cv2.putText(
-                canvas,
-                line,
-                (bx + 10, row_y),
-                cv2.FONT_HERSHEY_PLAIN,
-                1.0,
-                self._colors["TEXT_PRIMARY"],
-                1,
-                cv2.LINE_AA,
-            )
+        # The label is drawn on the canvas, in the dashboard font, once the
+        # frame has been scaled: text drawn here would be scaled with it.
+        self._ego_label_px = centre
 
     @staticmethod
     def _smooth_points(points: np.ndarray, samples: int = 120) -> np.ndarray:
@@ -808,8 +1221,9 @@ class AutonomyDashboard:
         ys = np.interp(q, arc, points[:, 1])
         return np.stack([xs, ys], axis=1)
 
+    @staticmethod
     def _fit_image(
-        self, image: np.ndarray, target_w: int, target_h: int, fill: tuple[int, int, int]
+        image: np.ndarray, target_w: int, target_h: int, fill: tuple[int, int, int]
     ) -> np.ndarray:
         src_h, src_w = image.shape[:2]
         scale = min(target_w / src_w, target_h / src_h)
@@ -817,469 +1231,15 @@ class AutonomyDashboard:
         new_h = max(1, int(round(src_h * scale)))
         resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
-        out = self._blank(target_h, target_w, fill)
+        out = np.full((target_h, target_w, 3), fill, dtype=np.uint8)
         off_x = (target_w - new_w) // 2
         off_y = (target_h - new_h) // 2
         out[off_y : off_y + new_h, off_x : off_x + new_w] = resized
         return out
 
-    @staticmethod
-    def _blit(canvas: np.ndarray, image: np.ndarray, x: int, y: int) -> None:
-        h, w = image.shape[:2]
-        canvas[y : y + h, x : x + w] = image
-
-    def _draw_panel(self, canvas: np.ndarray, rect: tuple[int, int, int, int]) -> None:
-        x, y, w, h = rect
-        cv2.rectangle(canvas, (x, y), (x + w, y + h), self._colors["PANEL_BG"], -1)
-        cv2.rectangle(canvas, (x, y), (x + w, y + h), self._colors["CARD_BORDER"], 1)
-
-    def _draw_header(self, canvas: np.ndarray, autopilot_active: bool = True) -> None:
-        x = self._pad
-        y = self._pad
-        w = self.width - self._pad * 2
-        h = self._header_h
-
-        cv2.rectangle(canvas, (x, y), (x + w, y + h), self._colors["PANEL_BG"], -1)
-        cv2.rectangle(canvas, (x, y), (x + w, y + h), self._colors["CARD_BORDER"], 1)
-        cv2.putText(
-            canvas,
-            "OFF-ROAD AUTONOMY  |  FRONT PATH VIEW",
-            (x + 20, y + 34),
-            cv2.FONT_HERSHEY_DUPLEX,
-            0.75,
-            self._colors["TEXT_PRIMARY"],
-            1,
-            cv2.LINE_AA,
-        )
-
-        if autopilot_active:
-            chip_text, chip_color = "AUTONOMY ACTIVE", self._colors["GOOD"]
-        else:
-            chip_text, chip_color = "SAFE STOP  |  MANUAL CONTROL", self._colors["BAD"]
-        chip_size, _ = cv2.getTextSize(chip_text, cv2.FONT_HERSHEY_SIMPLEX, 0.46, 1)
-        self._draw_chip(canvas, x + w - chip_size[0] - 44, y + 14, chip_text, chip_color)
-
-    def _draw_viewport_labels(
-        self,
-        canvas: np.ndarray,
-        rect: tuple[int, int, int, int],
-        telemetry: DashboardTelemetry,
-        debug_view: str,
-        on_display_camera: bool = False,
-    ) -> None:
-        x, y, _, _ = rect
-        source = telemetry.segmentation_mode.upper()
-        # The label has to answer "is the stack looking through this?" at a
-        # glance; on the display camera the answer is always no.
-        if on_display_camera:
-            label = "PATH VISUALIZATION  -  DISPLAY ONLY"
-        elif source == "STITCHED":
-            label = "STITCHED WIDE VIEW  (PERCEPTION)"
-        else:
-            label = f"{source} {self.sensor.model}  {self.sensor.fov_x_deg:.0f} deg  (PERCEPTION)"
-        if debug_view == "default":
-            self._draw_chip(canvas, x + 18, y + 18, label, self._colors["WARN"])
-        else:
-            index = DEBUG_VIEWS.index(debug_view)
-            self._draw_chip(
-                canvas,
-                x + 18,
-                y + 18,
-                f"[{index}] {_VIEW_TITLES[debug_view]}   (0 = back)",
-                self._colors["PATH_CORE"],
-            )
-        if not telemetry.sync_ok:
-            self._draw_chip(
-                canvas,
-                x + 18,
-                y + 48,
-                "PAIR NOT SYNCHRONISED - STEREO SKIPPED",
-                self._colors["BAD"],
-            )
-
-    def _draw_sidebar(
-        self,
-        canvas: np.ndarray,
-        rect: tuple[int, int, int, int],
-        telemetry: DashboardTelemetry,
-    ) -> None:
-        x, y, w, h = rect
-        inner_x = x + 16
-        inner_y = y + 16
-        inner_w = w - 32
-        gap = 14
-
-        available_h = h - 32 - gap * 3
-        vehicle_h = int(round(available_h * 0.23))
-        perception_h = int(round(available_h * 0.23))
-        runtime_h = int(round(available_h * 0.21))
-        stereo_h = available_h - vehicle_h - perception_h - runtime_h
-
-        self._draw_vehicle_card(canvas, (inner_x, inner_y, inner_w, vehicle_h), telemetry)
-        inner_y += vehicle_h + gap
-        self._draw_perception_card(canvas, (inner_x, inner_y, inner_w, perception_h), telemetry)
-        inner_y += perception_h + gap
-        self._draw_stereo_card(canvas, (inner_x, inner_y, inner_w, stereo_h), telemetry)
-        inner_y += stereo_h + gap
-        self._draw_runtime_card(canvas, (inner_x, inner_y, inner_w, runtime_h), telemetry)
-
-    def _draw_vehicle_card(
-        self,
-        canvas: np.ndarray,
-        rect: tuple[int, int, int, int],
-        telemetry: DashboardTelemetry,
-    ) -> None:
-        x, y, w, h = rect
-        self._draw_card(canvas, rect, "VEHICLE")
-        self._draw_value_row(
-            canvas, x + 18, y + 44, w - 36, "Vehicle speed", f"{telemetry.speed_mph:4.1f} mph"
-        )
-        self._draw_value_row(
-            canvas, x + 18, y + h - 78, w - 36, "Steering", f"{telemetry.steering:+.2f}"
-        )
-        self._draw_progress_row(
-            canvas, x + 18, y + h - 52, w - 36, "Throttle", telemetry.throttle, self._colors["GOOD"]
-        )
-        self._draw_progress_row(
-            canvas, x + 18, y + h - 24, w - 36, "Brake", telemetry.brake, self._colors["BAD"]
-        )
-
-    def _draw_perception_card(
-        self,
-        canvas: np.ndarray,
-        rect: tuple[int, int, int, int],
-        telemetry: DashboardTelemetry,
-    ) -> None:
-        x, y, w, h = rect
-        self._draw_card(canvas, rect, "PERCEPTION")
-        self._draw_progress_row(
-            canvas,
-            x + 18,
-            y + min(46, h - 74),
-            w - 36,
-            "Segmentation confidence",
-            telemetry.perception_confidence,
-            self._colors["WARN"],
-        )
-        # Road fraction, not confidence, is what the safe stop watches.
-        self._draw_progress_row(
-            canvas,
-            x + 18,
-            y + min(84, h - 46),
-            w - 36,
-            "Road / valid px",
-            telemetry.road_fraction,
-            self._colors["GOOD"],
-        )
-        self._draw_value_row(
-            canvas,
-            x + 18,
-            y + h - 40,
-            w - 36,
-            "Valid ROI / ego",
-            f"{(1.0 - telemetry.ego_coverage) * 100:.0f}%  /  {telemetry.ego_coverage * 100:.0f}%",
-        )
-        fallback = telemetry.fallback_state
-        fallback_color = self._colors["BAD"]
-        if fallback == "NONE":
-            fallback_color = self._colors["GOOD"]
-        self._draw_value_row(
-            canvas, x + 18, y + h - 16, w - 36, "Fallback", fallback, value_color=fallback_color
-        )
-
-    def _draw_stereo_card(
-        self,
-        canvas: np.ndarray,
-        rect: tuple[int, int, int, int],
-        telemetry: DashboardTelemetry,
-    ) -> None:
-        x, y, w, h = rect
-        self._draw_card(canvas, rect, "STEREO / DEPTH")
-        state_color = {
-            "LIVE": self._colors["GOOD"],
-            "WARMING UP": self._colors["WARN"],
-        }.get(telemetry.depth_state, self._colors["BAD"])
-        self._draw_value_row(
-            canvas, x + 18, y + 42, w - 36, "Depth state", telemetry.depth_state, state_color
-        )
-        if not telemetry.depth_active:
-            return
-
-        rows = np.linspace(y + 76, y + h - 14, 6).astype(int)
-        self._draw_progress_row(
-            canvas,
-            x + 18,
-            int(rows[0]),
-            w - 36,
-            "Depth coverage",
-            telemetry.depth_coverage,
-            self._colors["WARN"],
-        )
-        self._draw_progress_row(
-            canvas,
-            x + 18,
-            int(rows[1]),
-            w - 36,
-            "Valid disparity",
-            telemetry.valid_disparity_fraction,
-            self._colors["GOOD"],
-        )
-        self._draw_value_row(
-            canvas,
-            x + 18,
-            int(rows[2]),
-            w - 36,
-            "Median forward depth",
-            _metres(telemetry.median_forward_depth_m),
-        )
-        self._draw_value_row(
-            canvas,
-            x + 18,
-            int(rows[3]),
-            w - 36,
-            "Min corridor depth",
-            _metres(telemetry.min_corridor_depth_m),
-        )
-        clear = telemetry.min_clearance_m
-        clear_text = "CLEAR"
-        clear_color = self._colors["GOOD"]
-        if math.isfinite(clear):
-            clear_text = f"{clear:.1f} m"
-            if clear < 2.5:
-                clear_color = self._colors["BAD"]
-        self._draw_value_row(
-            canvas,
-            x + 18,
-            int(rows[4]),
-            w - 36,
-            "Obstacle clearance",
-            clear_text,
-            clear_color,
-        )
-        self._draw_value_row(
-            canvas,
-            x + 18,
-            int(rows[5]),
-            w - 36,
-            "Stereo update rate",
-            f"{telemetry.stereo_fps:.1f} Hz",
-        )
-
-    def _draw_runtime_card(
-        self,
-        canvas: np.ndarray,
-        rect: tuple[int, int, int, int],
-        telemetry: DashboardTelemetry,
-    ) -> None:
-        x, y, w, h = rect
-        self._draw_card(canvas, rect, "RUNTIME")
-        # Separate rows for separate threads: the autonomy numbers contain no
-        # drawing or GUI time, so a slow window cannot pose as a slow vehicle.
-        rows = np.linspace(y + 42, y + h - 14, 5).astype(int)
-        fps_color = self._colors["BAD"]
-        if telemetry.fps >= 20.0:
-            fps_color = self._colors["GOOD"]
-        latency_color = self._colors["BAD"]
-        if telemetry.latency_p95_ms <= 50.0:
-            latency_color = self._colors["GOOD"]
-        self._draw_value_row(
-            canvas, x + 18, int(rows[0]), w - 36, "Autonomy FPS", f"{telemetry.fps:.1f}", fps_color
-        )
-        self._draw_value_row(
-            canvas,
-            x + 18,
-            int(rows[1]),
-            w - 36,
-            "Autonomy latency (mean/p95)",
-            f"{telemetry.latency_ms:.0f} / {telemetry.latency_p95_ms:.0f} ms",
-            latency_color,
-        )
-        self._draw_value_row(
-            canvas, x + 18, int(rows[2]), w - 36, "Stereo FPS", f"{telemetry.stereo_fps:.1f}"
-        )
-        self._draw_value_row(
-            canvas,
-            x + 18,
-            int(rows[3]),
-            w - 36,
-            "Stereo latency (mean/p95)",
-            f"{telemetry.stereo_latency_ms:.0f} / {telemetry.stereo_latency_p95_ms:.0f} ms",
-        )
-        self._draw_value_row(
-            canvas,
-            x + 18,
-            int(rows[4]),
-            w - 36,
-            "Dashboard FPS",
-            f"{telemetry.dashboard_fps:.1f}",
-            self._colors["TEXT_SECONDARY"],
-        )
-
-    def _draw_card(self, canvas: np.ndarray, rect: tuple[int, int, int, int], title: str) -> None:
-        x, y, w, h = rect
-        cv2.rectangle(canvas, (x, y), (x + w, y + h), self._colors["CARD_BG"], -1)
-        cv2.rectangle(canvas, (x, y), (x + w, y + h), self._colors["CARD_BORDER"], 1)
-        cv2.putText(
-            canvas,
-            title,
-            (x + 14, y + 18),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.44,
-            self._colors["TEXT_SECONDARY"],
-            1,
-            cv2.LINE_AA,
-        )
-
-    def _draw_value_row(
-        self,
-        canvas: np.ndarray,
-        x: int,
-        y: int,
-        width: int,
-        label: str,
-        value: str,
-        value_color: tuple[int, int, int] | None = None,
-    ) -> None:
-        if value_color is None:
-            value_color = self._colors["TEXT_PRIMARY"]
-        cv2.putText(
-            canvas,
-            label,
-            (x, y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.48,
-            self._colors["TEXT_SECONDARY"],
-            1,
-            cv2.LINE_AA,
-        )
-        text_size, _ = cv2.getTextSize(value, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
-        cv2.putText(
-            canvas,
-            value,
-            (x + width - text_size[0], y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            value_color,
-            1,
-            cv2.LINE_AA,
-        )
-
-    def _draw_progress_row(
-        self,
-        canvas: np.ndarray,
-        x: int,
-        y: int,
-        width: int,
-        label: str,
-        value: float,
-        color: tuple[int, int, int],
-    ) -> None:
-        value_clamped = 0.0
-        if math.isfinite(value):
-            value_clamped = float(np.clip(value, 0.0, 1.0))
-        val_str = f"{value_clamped:.2f}"
-        val_size, _ = cv2.getTextSize(val_str, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
-        bar_w = width - (val_size[0] + 10)
-
-        cv2.putText(
-            canvas,
-            label,
-            (x, y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.46,
-            self._colors["TEXT_SECONDARY"],
-            1,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            canvas,
-            val_str,
-            (x + width - val_size[0], y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.48,
-            self._colors["TEXT_PRIMARY"],
-            1,
-            cv2.LINE_AA,
-        )
-        bar_y = y + 8
-        cv2.rectangle(canvas, (x, bar_y), (x + bar_w, bar_y + 8), self._colors["MUTED_LINE"], -1)
-        fill_w = int(round(bar_w * value_clamped))
-        if fill_w > 0:
-            cv2.rectangle(canvas, (x, bar_y), (x + fill_w, bar_y + 8), color, -1)
-
-    def _draw_safe_stop_overlay(self, canvas: np.ndarray, rect: tuple[int, int, int, int]) -> None:
-        x, y, w, h = rect
-        region = canvas[y : y + h, x : x + w]
-        red = np.full_like(region, (30, 30, 160))
-        cv2.addWeighted(red, 0.35, region, 0.65, 0, region)
-        cv2.rectangle(canvas, (x, y), (x + w, y + h), (60, 60, 220), 3)
-
-        banner_h = 72
-        banner_y = y + h // 2 - banner_h // 2
-        cv2.rectangle(canvas, (x, banner_y), (x + w, banner_y + banner_h), (20, 20, 100), -1)
-        cv2.rectangle(canvas, (x, banner_y), (x + w, banner_y + banner_h), (60, 60, 220), 2)
-
-        line1 = "SAFE STOP  -  MANUAL CONTROL REQUIRED"
-        sz1, _ = cv2.getTextSize(line1, cv2.FONT_HERSHEY_DUPLEX, 0.78, 1)
-        cv2.putText(
-            canvas,
-            line1,
-            (x + (w - sz1[0]) // 2, banner_y + 28),
-            cv2.FONT_HERSHEY_DUPLEX,
-            0.78,
-            (180, 180, 255),
-            1,
-            cv2.LINE_AA,
-        )
-        line2 = "W/A/S/D = drive  |  SPACE = brake  |  P = resume autopilot"
-        sz2, _ = cv2.getTextSize(line2, cv2.FONT_HERSHEY_SIMPLEX, 0.50, 1)
-        cv2.putText(
-            canvas,
-            line2,
-            (x + (w - sz2[0]) // 2, banner_y + 56),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.50,
-            (155, 163, 200),
-            1,
-            cv2.LINE_AA,
-        )
-
-    def _draw_chip(
-        self,
-        canvas: np.ndarray,
-        x: int,
-        y: int,
-        text: str,
-        accent: tuple[int, int, int],
-    ) -> None:
-        text_size, _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.46, 1)
-        w = text_size[0] + 26
-        h = 24
-        cv2.rectangle(canvas, (x, y), (x + w, y + h), (36, 42, 48), -1)
-        cv2.rectangle(canvas, (x, y), (x + w, y + h), accent, 1)
-        cv2.rectangle(canvas, (x + 8, y + 7), (x + 14, y + 13), accent, -1)
-        cv2.putText(
-            canvas,
-            text,
-            (x + 20, y + 17),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.46,
-            self._colors["TEXT_PRIMARY"],
-            1,
-            cv2.LINE_AA,
-        )
-
-
-def _metres(value: float) -> str:
-    if not math.isfinite(value):
-        return "--"
-    return f"{value:.1f} m"
-
 
 def _model_mask(result: PipelineStepResult) -> np.ndarray:
-    """The segmenter's own mask, before depth carved anything out of it."""
-    if result.perception.rgb_mask is not None:
-        return result.perception.rgb_mask
+    """The segmenter's mask before temporal stabilisation."""
     return result.perception.mask
 
 

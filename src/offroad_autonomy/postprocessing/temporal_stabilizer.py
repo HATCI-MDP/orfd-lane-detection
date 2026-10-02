@@ -70,25 +70,9 @@ class TemporalStabilizer:
             mask=stable_mask,
             stability_score=stability,
             raw_result=result,
-            traversability=self._carry_traversability(result, stable_mask),
             valid_roi=roi,
             road_fraction=road_fraction(stable_mask, roi),
         )
-
-    @staticmethod
-    def _carry_traversability(
-        result: PerceptionResult,
-        stable_mask: np.ndarray,
-    ) -> np.ndarray | None:
-        """Clipped to the new mask rather than smoothed: blurring a confidence
-        map across an obstacle edge would soften exactly the boundary the
-        planner needs to respect."""
-        field = result.traversability
-        if field is None or field.shape != stable_mask.shape:
-            return None
-        carried = field.astype(np.float32, copy=True)
-        carried[~stable_mask] = 0.0
-        return carried
 
     def _temporal_iou(self, mask: np.ndarray) -> float:
         if self._prev_mask is None:

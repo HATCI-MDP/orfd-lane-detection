@@ -8,27 +8,25 @@ from pathlib import Path
 
 import yaml
 
+from offroad_autonomy.control.controller_config import MPCConfig
+from offroad_autonomy.planning.grid_config import GridPlannerConfig
+from offroad_autonomy.runtime.video_recorder import X264_PRESETS
 from offroad_autonomy.types import (
     CAMERA_TRANSPORTS,
     DEBUG_VIEWS,
+    DEFAULT_CAMERA,
     DEFAULT_DASHBOARD_COLORS,
-    DEFAULT_DISPLAY_CAMERA,
-    DEFAULT_DISPLAY_RIG,
-    DEFAULT_LEFT_CAMERA,
+    DEFAULT_ORBIT_CAMERA,
     DEFAULT_PERCEPTION_PROMPTS,
-    DEFAULT_RIGHT_CAMERA,
-    DEFAULT_STEREO_RIG,
-    DISPLAY_SENSOR,
     GMSL2_CAPTURE_SENSOR,
-    SEGMENTATION_MODES,
     CameraSensor,
     CameraSpec,
-    DisplayRigSpec,
+    DashboardThresholds,
     EgoMaskSpec,
     PipelineConfig,
-    StereoRigSpec,
-    display_camera_spec,
+    mount_pose,
 )
+from offroad_autonomy.utils import environment
 
 logger = logging.getLogger("offroad_autonomy.config")
 
@@ -51,6 +49,41 @@ def _load_dashboard_colors(raw: object) -> dict[str, tuple[int, int, int]]:
     for key, default in DEFAULT_DASHBOARD_COLORS.items():
         colors[key] = _parse_color(raw.get(key), default)
     return colors
+
+
+def _load_dashboard_thresholds(dashboard: dict, gate: dict, safety: dict) -> DashboardThresholds:
+    """The two floors come from the gate and the safe stop, not from the
+    dashboard section, so the bar ticks always match what triggers them."""
+    defaults = DashboardThresholds()
+    thresholds = DashboardThresholds(
+        target_fps=float(dashboard.get("target_fps", defaults.target_fps)),
+        fps_warn_fraction=float(dashboard.get("fps_warn_fraction", defaults.fps_warn_fraction)),
+        latency_budget_ms=float(dashboard.get("latency_budget_ms", defaults.latency_budget_ms)),
+        confidence_floor=float(gate.get("confidence_threshold", defaults.confidence_floor)),
+        confidence_good=float(dashboard.get("confidence_good", defaults.confidence_good)),
+        road_floor=float(safety.get("min_road_fraction", defaults.road_floor)),
+        fps_bar_scale=float(dashboard.get("fps_bar_scale", defaults.fps_bar_scale)),
+        latency_bar_scale=float(dashboard.get("latency_bar_scale", defaults.latency_bar_scale)),
+        road_bar_full_scale=float(
+            dashboard.get("road_bar_full_scale", defaults.road_bar_full_scale)
+        ),
+    )
+    if thresholds.target_fps <= 0.0 or thresholds.latency_budget_ms <= 0.0:
+        raise ValueError("visualization.dashboard target_fps and latency_budget_ms must be > 0")
+    if not 0.0 < thresholds.fps_warn_fraction < 1.0:
+        raise ValueError("visualization.dashboard.fps_warn_fraction must be between 0 and 1")
+    if thresholds.confidence_good <= thresholds.confidence_floor:
+        raise ValueError(
+            "visualization.dashboard.confidence_good must be above planning.gate.confidence_threshold"
+        )
+    # A full scale at or below the target would push the target tick off the bar.
+    if min(thresholds.fps_bar_scale, thresholds.latency_bar_scale) <= 1.0:
+        raise ValueError("visualization.dashboard bar scales must be above 1")
+    if thresholds.road_bar_full_scale <= thresholds.road_floor:
+        raise ValueError(
+            "visualization.dashboard.road_bar_full_scale must exceed the safe stop floor"
+        )
+    return thresholds
 
 
 def _parse_vec3(
@@ -102,110 +135,54 @@ def _load_ego_mask(raw: object, default: EgoMaskSpec) -> EgoMaskSpec:
         polygon = tuple(points)
 
     if enabled and len(polygon) < 3:
-        raise ValueError("cameras.*.ego_mask is enabled but its polygon has fewer than 3 points")
+        raise ValueError(
+            "beamng.camera.ego_mask is enabled but its polygon has fewer than 3 points"
+        )
     return EgoMaskSpec(enabled=enabled, polygon=polygon, margin_px=margin)
 
 
-def _load_camera(
-    raw: object,
-    default: CameraSpec,
-    sensor: CameraSensor,
-    rig: StereoRigSpec,
-    side: str,
-) -> CameraSpec:
-    """An explicit ``pos``/``dir``/``up`` still wins so a deliberately bad rig
-    can be tested, and is logged because it breaks the shared-attitude
-    guarantee."""
-    block = raw
-    if not isinstance(block, dict):
-        block = {}
-    pos, direction, up = rig.mount(side)
-    explicit = [key for key in ("pos", "dir", "up") if key in block]
-    if explicit:
-        logger.warning(
-            "cameras.%s overrides %s from stereo_rig - the pair may no longer "
-            "share height/pitch/roll",
-            side,
-            ", ".join(explicit),
-        )
+def _load_camera(raw: dict) -> CameraSpec:
+    default = DEFAULT_CAMERA
+    direction, up = mount_pose(
+        float(raw.get("pitch_deg", -8.0)),
+        float(raw.get("roll_deg", 0.0)),
+        float(raw.get("yaw_deg", 0.0)),
+    )
+    pos = (
+        float(raw.get("lateral_offset_m", default.pos[0])),
+        float(raw.get("forward_offset_m", default.pos[1])),
+        float(raw.get("height_m", default.pos[2])),
+    )
     return CameraSpec(
-        name=str(block.get("name", default.name)),
-        pos=_parse_vec3(block.get("pos"), pos),
-        dir=_parse_vec3(block.get("dir"), direction),
-        up=_parse_vec3(block.get("up"), up),
-        sensor=sensor,
-        ego_mask=_load_ego_mask(block.get("ego_mask"), default.ego_mask),
+        name=str(raw.get("name", default.name)),
+        pos=_parse_vec3(raw.get("pos"), pos),
+        dir=_parse_vec3(raw.get("dir"), direction),
+        up=_parse_vec3(raw.get("up"), up),
+        sensor=_load_sensor(raw.get("sensor")),
+        ego_mask=_load_ego_mask(raw.get("ego_mask"), default.ego_mask),
     )
 
 
-def _mount_center(raw: dict, default: tuple[float, float, float]) -> tuple[float, float, float]:
-    return (
-        float(raw.get("lateral_offset_m", default[0])),
-        float(raw.get("forward_offset_m", default[1])),
-        float(raw.get("height_m", default[2])),
-    )
-
-
-def _load_stereo_rig(raw: object) -> StereoRigSpec:
-    if not isinstance(raw, dict):
-        return DEFAULT_STEREO_RIG
-    d = DEFAULT_STEREO_RIG
-    return StereoRigSpec(
-        baseline_m=float(raw.get("baseline_m", d.baseline_m)),
-        center=_mount_center(raw, d.center),
-        pitch_deg=float(raw.get("pitch_deg", d.pitch_deg)),
-        roll_deg=float(raw.get("roll_deg", d.roll_deg)),
-        toe_out_deg=float(raw.get("toe_out_deg", d.toe_out_deg)),
-    )
-
-
-def _load_display_rig(raw: dict) -> DisplayRigSpec:
-    d = DEFAULT_DISPLAY_RIG
-    return DisplayRigSpec(
-        enabled=bool(raw.get("enabled", d.enabled)),
-        name=str(raw.get("name", d.name)),
-        center=_mount_center(raw, d.center),
-        pitch_deg=float(raw.get("pitch_deg", d.pitch_deg)),
-        roll_deg=float(raw.get("roll_deg", d.roll_deg)),
-    )
-
-
-def _load_display_camera(raw: object) -> tuple[DisplayRigSpec, CameraSpec]:
-    """Read separately from the stereo sensor: it is rendered, never matched,
-    so it is free to differ in resolution, field of view and frame rate."""
-    block = raw
-    if not isinstance(block, dict):
-        block = {}
-    rig = _load_display_rig(block)
-    sensor = _load_sensor(block.get("sensor"), DISPLAY_SENSOR)
-    clip = _load_ego_mask(block.get("overlay_clip"), DEFAULT_DISPLAY_CAMERA.ego_mask)
-    return rig, display_camera_spec(rig, sensor, clip)
-
-
-def _load_camera_rig(cameras: dict) -> tuple[StereoRigSpec, CameraSpec, CameraSpec]:
-    sensor = _load_sensor(cameras.get("sensor"))
-    rig = _load_stereo_rig(cameras.get("stereo_rig"))
-    return (
-        rig,
-        _load_camera(cameras.get("left"), DEFAULT_LEFT_CAMERA, sensor, rig, "left"),
-        _load_camera(cameras.get("right"), DEFAULT_RIGHT_CAMERA, sensor, rig, "right"),
-    )
-
-
-def _optional_matrix(raw: object) -> tuple | None:
-    if raw is None:
-        return None
-    flat: list[float] = []
-
-    def _walk(value: object) -> None:
-        if isinstance(value, (list, tuple)):
-            for item in value:
-                _walk(item)
-        else:
-            flat.append(float(value))
-
-    _walk(raw)
-    return tuple(flat)
+def _load_orbit_camera(raw: dict) -> CameraSpec:
+    """A bad pose fails at load time, before a run is recorded with the
+    vehicle out of frame."""
+    default = DEFAULT_ORBIT_CAMERA
+    raw_pos = raw.get("pos", list(default.pos))
+    if not isinstance(raw_pos, (list, tuple)) or len(raw_pos) != 3:
+        raise ValueError("presentation.orbit_camera.pos must be a list of 3 numbers")
+    pos = tuple(float(value) for value in raw_pos)
+    pitch = float(raw.get("pitch_deg", -12.0))
+    if not -90.0 < pitch < 90.0:
+        raise ValueError("presentation.orbit_camera.pitch_deg must be between -90 and 90")
+    sensor = _load_sensor(raw.get("sensor"), default.sensor)
+    if sensor.width < 1 or sensor.height < 1:
+        raise ValueError("presentation.orbit_camera.sensor width and height must be positive")
+    if not 0.0 < sensor.fov_x_deg < 180.0:
+        raise ValueError("presentation.orbit_camera.sensor.fov_h must be between 0 and 180")
+    if sensor.target_fps <= 0.0:
+        raise ValueError("presentation.orbit_camera.sensor.target_fps must be > 0")
+    direction, up = mount_pose(pitch)
+    return CameraSpec(name=default.name, pos=pos, dir=direction, up=up, sensor=sensor)
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -243,8 +220,8 @@ def _section(raw: dict, key: str) -> dict:
 
 def _planner_mode(raw: object) -> str:
     mode = str(raw).lower()
-    if mode not in ("baseline", "advanced"):
-        raise ValueError(f"planning.mode must be 'baseline' or 'advanced', got {mode!r}")
+    if mode not in ("baseline", "advanced", "grid"):
+        raise ValueError(f"planning.mode must be 'baseline', 'advanced' or 'grid', got {mode!r}")
     return mode
 
 
@@ -255,6 +232,35 @@ def _camera_transport(raw: object) -> str:
             f"beamng.camera_transport must be one of {CAMERA_TRANSPORTS}, got {transport!r}"
         )
     return transport
+
+
+def _load_recording(raw: dict) -> dict:
+    fps = float(raw.get("fps", 20.0))
+    crf = int(raw.get("crf", 23))
+    preset = str(raw.get("preset", "veryfast")).lower()
+    queue_frames = int(raw.get("queue_frames", 8))
+    if fps <= 0.0:
+        raise ValueError("recording.fps must be > 0")
+    if not 0 <= crf <= 51:
+        raise ValueError("recording.crf must be between 0 and 51")
+    if preset not in X264_PRESETS:
+        raise ValueError(f"recording.preset must be one of {X264_PRESETS}, got {preset!r}")
+    if queue_frames < 1:
+        raise ValueError("recording.queue_frames must be at least 1")
+    return {
+        "recording_fps": fps,
+        "recording_crf": crf,
+        "recording_preset": preset,
+        "recording_queue_frames": queue_frames,
+    }
+
+
+def _load_grid(raw: dict) -> GridPlannerConfig:
+    try:
+        return GridPlannerConfig(**raw)
+    except TypeError as exc:
+        # A misspelled key would otherwise surface as a bare dataclass error.
+        raise ValueError(f"planning.grid: {exc}") from exc
 
 
 def _apply_env_overrides(bng: dict) -> dict:
@@ -272,34 +278,56 @@ def _apply_env_overrides(bng: dict) -> dict:
     return bng
 
 
+def _resolve_platform_settings(bng: dict, ui: dict) -> tuple[dict, dict]:
+    """A fully explicit config never inspects the machine, so deployments
+    that pin every value behave the same everywhere."""
+    if not environment.needs_detection(bng, ui):
+        return bng, ui
+    facts = environment.detect_platform()
+    bng, ui = environment.resolve_auto(bng, ui, facts)
+    platform = facts.os_name
+    if facts.is_wsl:
+        platform = f"wsl2 ({facts.wsl_networking})"
+    action = "attaching to"
+    if bng.get("launch"):
+        action = "launching or attaching to"
+    host = bng.get("host") or "<unset, set BEAMNG_HOST>"
+    logger.info(
+        "Platform %s: %s BeamNG at %s:%s over %s",
+        platform,
+        action,
+        host,
+        bng.get("port", 64256),
+        bng.get("camera_transport"),
+    )
+    return bng, ui
+
+
 def load_config(path: str | Path) -> PipelineConfig:
     raw = _read_yaml(Path(path))
 
-    bng = _apply_env_overrides(_section(raw, "beamng"))
-    cameras = _section(bng, "cameras")
-    stereo_rig, left_cam, right_cam = _load_camera_rig(cameras)
-    display_rig, display_cam = _load_display_camera(cameras.get("visualization"))
-    sync = _section(cameras, "sync")
+    bng, ui = _resolve_platform_settings(
+        _apply_env_overrides(_section(raw, "beamng")), _section(raw, "ui")
+    )
+    if "cameras" in bng:
+        raise ValueError(
+            "Replace beamng.cameras with the single beamng.camera dashcam configuration"
+        )
+    camera = _load_camera(_section(bng, "camera"))
     perc = _section(raw, "perception")
-    stitching = _section(raw, "stitching")
-    depth = _section(raw, "depth")
-    calibration = _section(depth, "calibration")
-    roi = _section(depth, "roi")
-    ui = _section(raw, "ui")
-    terrain = _section(raw, "terrain")
     safety = _section(raw, "safety")
     pre = _section(raw, "preprocessing")
     post = _section(raw, "postprocessing")
     plan = _section(raw, "planning")
     gate = _section(plan, "gate")
     ctrl = _section(raw, "control")
+    controller = str(ctrl.get("controller", "stanley")).lower()
+    if controller not in ("stanley", "mpc"):
+        raise ValueError("control.controller must be stanley or mpc")
     dashboard = _section(_section(raw, "visualization"), "dashboard")
 
-    mode = str(perc.get("segmentation_mode", "left")).lower()
-    if mode not in SEGMENTATION_MODES:
-        raise ValueError(
-            f"perception.segmentation_mode must be one of {SEGMENTATION_MODES}, got {mode!r}"
-        )
+    if "segmentation_mode" in perc or "stitching" in raw:
+        raise ValueError("Remove segmentation_mode and stitching: the dashcam is the only input")
     debug_view = str(ui.get("debug_view", "default")).lower()
     if debug_view not in DEBUG_VIEWS:
         raise ValueError(f"ui.debug_view must be one of {DEBUG_VIEWS}, got {debug_view!r}")
@@ -313,17 +341,9 @@ def load_config(path: str | Path) -> PipelineConfig:
         beamng_map=bng.get("map", "automation_test_track"),
         beamng_vehicle=bng.get("vehicle", "pickup"),
         beamng_spawn_index=bng.get("spawn_index", 0),
-        stereo_rig=stereo_rig,
-        left_camera=left_cam,
-        right_camera=right_cam,
-        display_rig=display_rig,
-        display_camera=display_cam,
+        camera=camera,
+        orbit_camera=_load_orbit_camera(_section(_section(raw, "presentation"), "orbit_camera")),
         map_spawns=bng.get("maps", {}),
-        sync_max_read_skew_ms=float(sync.get("max_read_skew_ms", 8.0)),
-        sync_require_both_new=bool(sync.get("require_both_new", True)),
-        segmentation_mode=mode,
-        stitch_enabled=bool(stitching.get("enabled", False)),
-        stitch_feather_px=int(stitching.get("feather_px", 24)),
         model_weights=perc.get("model_weights", "models/yoloe-26x-seg.pt"),
         confidence_threshold=perc.get("segmentation_threshold", 0.25),
         perception_input_size=perc.get("input_size", 640),
@@ -333,59 +353,6 @@ def load_config(path: str | Path) -> PipelineConfig:
         enable_clahe=pre.get("enable_clahe", False),
         clahe_clip_limit=pre.get("clahe_clip_limit", 2.0),
         clahe_grid_size=pre.get("clahe_grid_size", 8),
-        depth_enabled=bool(depth.get("enabled", True)),
-        stereo_async=bool(depth.get("async", True)),
-        stereo_rate_hz=float(depth.get("rate_hz", 10.0)),
-        stereo_max_age_s=float(depth.get("max_age_s", 0.4)),
-        stereo_width=depth.get("stereo_width", 720),
-        stereo_height=depth.get("stereo_height", 465),
-        stereo_num_disparities=depth.get("num_disparities", 0),
-        stereo_max_disparities=depth.get("max_disparities", 128),
-        stereo_block_size=depth.get("block_size", 7),
-        stereo_p1_factor=int(depth.get("p1_factor", 8)),
-        stereo_p2_factor=int(depth.get("p2_factor", 32)),
-        stereo_uniqueness_ratio=depth.get("uniqueness_ratio", 15),
-        stereo_speckle_window_size=depth.get("speckle_window_size", 96),
-        stereo_speckle_range=depth.get("speckle_range", 2),
-        stereo_disp12_max_diff=depth.get("disp12_max_diff", 1),
-        stereo_min_depth_m=depth.get("min_depth_m", 2.0),
-        stereo_max_depth_m=depth.get("max_depth_m", 40.0),
-        stereo_median_blur=depth.get("median_blur", 5),
-        stereo_rectify_alpha=float(depth.get("rectify_alpha", 0.0)),
-        stereo_K_left=_optional_matrix(calibration.get("K_left")),
-        stereo_K_right=_optional_matrix(calibration.get("K_right")),
-        stereo_D_left=_optional_matrix(calibration.get("D_left")),
-        stereo_D_right=_optional_matrix(calibration.get("D_right")),
-        stereo_R=_optional_matrix(calibration.get("R")),
-        stereo_T=_optional_matrix(calibration.get("T")),
-        depth_roi_enabled=bool(roi.get("enabled", True)),
-        depth_roi_row_top=float(roi.get("row_top", 0.35)),
-        depth_roi_row_bottom=float(roi.get("row_bottom", 1.0)),
-        depth_roi_use_mask=bool(roi.get("use_road_mask", True)),
-        depth_roi_mask_dilation_px=int(roi.get("mask_dilation_px", 25)),
-        depth_roi_corridor_half_width_m=float(roi.get("corridor_half_width_m", 4.0)),
-        depth_roi_corridor_length_m=float(roi.get("corridor_length_m", 35.0)),
-        obstacle_height_m=terrain.get("obstacle_height_m", 0.35),
-        drop_height_m=terrain.get("drop_height_m", -0.45),
-        max_slope_deg=terrain.get("max_slope_deg", 22.0),
-        max_point_height_m=terrain.get("max_point_height_m", 5.0),
-        min_point_height_m=terrain.get("min_point_height_m", -3.0),
-        ground_fit_min_points=terrain.get("ground_fit_min_points", 400),
-        ground_fit_near_m=terrain.get("ground_fit_near_m", 2.0),
-        ground_fit_far_m=terrain.get("ground_fit_far_m", 18.0),
-        ground_fit_lateral_m=terrain.get("ground_fit_lateral_m", 5.0),
-        bev_forward_m=terrain.get("bev_forward_m", 30.0),
-        bev_lateral_m=terrain.get("bev_lateral_m", 10.0),
-        bev_cell_m=terrain.get("bev_cell_m", 0.25),
-        bev_min_points_per_cell=terrain.get("bev_min_points_per_cell", 2),
-        bev_min_obstacle_ratio=terrain.get("bev_min_obstacle_ratio", 0.4),
-        vehicle_half_width_m=terrain.get("vehicle_half_width_m", 0.95),
-        clearance_lookahead_m=terrain.get("clearance_lookahead_m", 18.0),
-        ground_fill_enabled=bool(terrain.get("ground_fill_enabled", True)),
-        ground_fill_max_m=terrain.get("ground_fill_max_m", 25.0),
-        depth_fusion_weight=terrain.get("fusion_weight", 0.65),
-        depth_unknown_support=terrain.get("unknown_support", 0.6),
-        depth_inferred_support=terrain.get("inferred_support", 0.8),
         safety_min_road_fraction=safety.get("min_road_fraction", 0.015),
         safety_no_road_time_s=safety.get("no_road_time_s", 2.0),
         ema_alpha=post.get("ema_alpha", 0.7),
@@ -394,7 +361,7 @@ def load_config(path: str | Path) -> PipelineConfig:
         enable_morphology=bool(post.get("enable_morphology", True)),
         enable_ema=bool(post.get("enable_ema", True)),
         planner_mode=_planner_mode(plan.get("mode", "baseline")),
-        planner_roi_height=float(plan.get("roi_height", 0.45)),
+        planner_roi_height=float(plan.get("roi_height", 0.50)),
         baseline_temporal_blend=float(plan.get("baseline_temporal_blend", 0.0)),
         baseline_max_shift_m=float(plan.get("baseline_max_shift_m", 0.5)),
         gate_min_confidence=float(gate.get("confidence_threshold", 0.18)),
@@ -418,9 +385,9 @@ def load_config(path: str | Path) -> PipelineConfig:
         kalman_measurement_noise=plan.get("kalman_measurement_noise", 1e-1),
         fallback_after_n_misses=plan.get("fallback_after_n_misses", 3),
         min_road_pixels=plan.get("min_road_pixels", 500),
-        planner_depth_clearance_weight=plan.get("depth_clearance_weight", 0.35),
-        planner_min_clearance_m=plan.get("min_clearance_m", 1.15),
-        planner_obstacle_penalty=plan.get("obstacle_penalty", 0.85),
+        controller=controller,
+        mpc=MPCConfig(**_section(ctrl, "mpc")),
+        grid=_load_grid(_section(plan, "grid")),
         stanley_gain_k=ctrl.get("stanley_gain_k", 1.5),
         stanley_softening=ctrl.get("stanley_softening", 2.4),
         stanley_heading_gain=ctrl.get("stanley_heading_gain", 0.85),
@@ -455,6 +422,7 @@ def load_config(path: str | Path) -> PipelineConfig:
         cross_track_lookahead_gain=float(ctrl.get("cross_track_lookahead_gain", 1.0)),
         cross_track_min_lookahead_m=float(ctrl.get("cross_track_min_lookahead_m", 1.5)),
         cross_track_recovery_m=float(ctrl.get("cross_track_recovery_m", 0.5)),
+        vehicle_half_width_m=float(ctrl.get("vehicle_half_width_m", 0.95)),
         edge_margin_m=float(ctrl.get("edge_margin_m", 0.75)),
         edge_centering_gain=float(ctrl.get("edge_centering_gain", 0.7)),
         edge_speed_reduction=float(ctrl.get("edge_speed_reduction", 0.6)),
@@ -469,6 +437,7 @@ def load_config(path: str | Path) -> PipelineConfig:
         clearance_slow_m=ctrl.get("clearance_slow_m", 6.0),
         clearance_stop_m=ctrl.get("clearance_stop_m", 2.5),
         dashboard_colors=_load_dashboard_colors(dashboard.get("colors")),
+        dashboard_thresholds=_load_dashboard_thresholds(dashboard, gate, safety),
         ui_headless=bool(ui.get("headless", False)),
         ui_render_every_n=max(1, int(ui.get("render_every_n", 1))),
         ui_debug_view=debug_view,
@@ -476,4 +445,5 @@ def load_config(path: str | Path) -> PipelineConfig:
         ui_display_async=bool(ui.get("display_async", True)),
         ui_display_rate_hz=float(ui.get("display_rate_hz", 20.0)),
         runtime_log_interval_s=float(ui.get("log_interval_s", 5.0)),
+        **_load_recording(_section(raw, "recording")),
     )

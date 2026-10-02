@@ -10,7 +10,7 @@ This gate sits in front of every planner mode. A frame is rejected when
 
 * the best detection score is below ``gate_min_confidence``,
 * fewer than ``min_road_pixels`` traversable pixels fall in the planner ROI,
-* no road component reaches the bottom of the ROI (the road must start at
+* no road component reaches the near visible edge of the ROI (the road must start at
   the vehicle - a blob on the horizon is not somewhere we can drive to), or
 * that component covers less than ``gate_min_mask_area`` of the ROI.
 
@@ -73,7 +73,7 @@ class PerceptionGate:
             confidences = raw.confidences
         confidence = float(max(confidences, default=0.0))
         road_pixels = int(band.sum())
-        component = self._vehicle_component(band, top)
+        component = self._vehicle_component(band, top, valid)
         area = float(component.sum()) / max(roi_pixels, 1)
 
         reason = ""
@@ -97,7 +97,9 @@ class PerceptionGate:
         )
 
     @staticmethod
-    def _vehicle_component(band: np.ndarray, top: int) -> np.ndarray:
+    def _vehicle_component(
+        band: np.ndarray, top: int, valid: np.ndarray | None = None
+    ) -> np.ndarray:
         h = band.shape[0]
         if not band.any():
             return band
@@ -105,7 +107,16 @@ class PerceptionGate:
             band.astype(np.uint8), connectivity=8
         )
         anchor_top = h - max(1, int(round((h - top) * _ANCHOR_FRACTION)))
-        anchored = np.unique(labels[anchor_top:])
+        if valid is not None and valid.shape == band.shape:
+            # The hood hides the bottom of the dashcam image. Anchor each
+            # column at its nearest visible ground, never inside the hood.
+            rows = np.arange(h)[:, None]
+            last = np.max(np.where(valid, rows, -1), axis=0)
+            span = np.maximum(1, np.rint((last - top + 1) * _ANCHOR_FRACTION).astype(int))
+            anchors = valid & (rows >= np.maximum(top, last - span + 1)) & (rows <= last)
+            anchored = np.unique(labels[anchors])
+        else:
+            anchored = np.unique(labels[anchor_top:])
         anchored = anchored[anchored > 0]
         if len(anchored) == 0:
             return np.zeros_like(band)

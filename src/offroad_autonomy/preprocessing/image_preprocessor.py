@@ -19,8 +19,7 @@ class ImagePreprocessor:
         config: PipelineConfig,
         target_size: tuple[int, int] | None = None,
     ) -> None:
-        # The stitched view is wider than one camera, so the segmentation
-        # view may override the configured working size.
+        # Segmentation and camera geometry must use the same working grid.
         width, height = target_size or (config.preprocess_width, config.preprocess_height)
         self._target_w = int(width)
         self._target_h = int(height)

@@ -5,12 +5,12 @@ import pytest
 
 from offroad_autonomy.types import (
     GMSL2_SENSOR,
+    CameraFrame,
     ControlCommand,
     FramePacket,
     PathPlan,
     PerceptionResult,
     PipelineConfig,
-    StereoFramePair,
     VehicleState,
 )
 
@@ -76,9 +76,9 @@ def test_gmsl2_sensor_defaults():
 def test_camera_specs_expose_sensor_properties():
     """A mount reads its intrinsics through the shared sensor."""
     cfg = PipelineConfig()
-    sensor = cfg.left_camera.sensor
+    sensor = cfg.camera.sensor
 
-    for spec in (cfg.left_camera, cfg.right_camera):
+    for spec in (cfg.camera,):
         assert spec.width == sensor.width
         assert spec.height == sensor.height
         assert spec.fov_x_deg == GMSL2_SENSOR.fov_x_deg
@@ -86,21 +86,19 @@ def test_camera_specs_expose_sensor_properties():
         assert spec.target_fps == sensor.target_fps
 
 
-def test_stereo_frame_pair_only_offers_synchronised_stereo():
-    frame = np.zeros((4, 4, 3), dtype=np.uint8)
-
-    assert StereoFramePair(left=frame, right=frame).has_stereo
-    assert not StereoFramePair(left=frame, right=frame, synchronized=False).has_stereo
-    assert not StereoFramePair(left=frame, right=None).has_stereo
-    assert StereoFramePair(left=frame, right=None).frame("left") is frame
+def test_camera_frame_preserves_the_capture():
+    image = np.zeros((4, 4, 3), dtype=np.uint8)
+    capture = CameraFrame(image=image, frame_id=7, timestamp=1.5)
+    assert capture.image is image
+    assert capture.frame_id == 7
+    assert capture.timestamp == 1.5
 
 
 def test_working_resolution_defaults_are_a_clean_fraction():
     cfg = PipelineConfig()
-    capture = cfg.left_camera.sensor
+    capture = cfg.camera.sensor
 
     assert (cfg.preprocess_width, cfg.preprocess_height) == (720, 465)
-    assert (cfg.stereo_width, cfg.stereo_height) == (720, 465)
     # 3/4 of the capture, 1/4 of the imager - uniform in both axes.
     assert cfg.preprocess_width * 4 == capture.width * 3
     assert cfg.preprocess_height * 4 == capture.height * 3

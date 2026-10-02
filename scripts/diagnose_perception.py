@@ -66,17 +66,12 @@ def capture(args: argparse.Namespace) -> None:
             time.sleep(1.0)
             cfg = config
             for shot in range(args.frames):
-                pair = client.capture_pair()
-                if pair is None or pair.left is None:
+                frame = client.capture_frame()
+                if frame is None or frame.image is None:
                     logger.warning("spawn %d shot %d: no frame", index, shot)
                     continue
                 stem = f"{cfg.beamng_map}_s{index}_f{shot}"
-                cv2.imwrite(str(out / f"{stem}_left.png"), pair.left)
-                if pair.right is not None:
-                    cv2.imwrite(str(out / f"{stem}_right.png"), pair.right)
-                display = client.capture_display()
-                if display is not None:
-                    cv2.imwrite(str(out / f"{stem}_display.png"), display)
+                cv2.imwrite(str(out / f"{stem}_dashcam.png"), frame.image)
                 logger.info("saved %s", stem)
                 time.sleep(0.5)
     finally:
@@ -261,92 +256,56 @@ def _bottom_x(plan) -> float | None:
 
 
 def full(args: argparse.Namespace) -> None:
-    """Whole pipeline, stereo inline, on saved left/right pairs.
-
-    Reports what the *new* planner inputs (fused traversability, metric
-    clearance) do to a frame whose appearance mask is already good.
-    """
+    """Run the RGB pipeline on saved dashcam frames."""
     from offroad_autonomy.pipeline import AutonomyPipeline
-    from offroad_autonomy.types import StereoFramePair, VehicleState
+    from offroad_autonomy.types import CameraFrame, VehicleState
 
-    config = replace(load_config(args.config), stereo_async=False)
-    pipeline = AutonomyPipeline(config, start_worker=False)
+    config = load_config(args.config)
+    pipeline = AutonomyPipeline(config)
     src = Path(args.src)
     out_root = Path(args.out)
     rows = []
-    for left_path in sorted(src.glob("*_left.png")):
-        right_path = left_path.with_name(left_path.name.replace("_left", "_right"))
-        left, right = cv2.imread(str(left_path)), cv2.imread(str(right_path))
+    for path in sorted(src.glob("*_dashcam.png")):
+        image = cv2.imread(str(path))
         pipeline.reset()
         result = None
-        # Warm up: the first step has no depth yet (the mask feeds the ROI).
+        # Warm up the temporal stabiliser and planner before reporting the frame.
         for i in range(3):
-            pair = StereoFramePair(
-                left=left,
-                right=right,
+            frame = CameraFrame(
+                image=image,
                 timestamp=time.perf_counter(),
                 frame_id=i + 1,
-                synchronized=True,
                 is_new=True,
             )
-            result = pipeline.step_result(pair, VehicleState(speed_mps=4.0))
-        # Same stabilised mask, planned without any terrain.
-        pipeline.planner.reset()
-        stab = replace(result.stabilized, traversability=None)
-        plain = pipeline.planner.plan(stab, VehicleState(speed_mps=4.0), terrain=None)
-
-        terrain = result.terrain
-        rgb = result.perception.rgb_mask
-        if rgb is None:
-            rgb = result.perception.mask
-        vetoed = float((rgb & ~result.perception.mask).sum()) / max(int(rgb.sum()), 1)
+            result = pipeline.step_result(frame, VehicleState(speed_mps=4.0))
         row = {
-            "frame": left_path.stem,
-            "rgb_road": round(float(rgb.mean()), 3),
-            "fused_road": round(result.perception.road_fraction, 3),
-            "vetoed_by_depth": round(vetoed, 3),
-            "depth_coverage": None,
-            "valid_disp": None,
-            "obstacle_frac_in_mask": None,
-            "min_clearance_m": None,
-            "ground_slope_deg": None,
+            "frame": path.stem,
+            "road_fraction": round(result.perception.road_fraction, 3),
             "gate": _gate(result.plan),
-            "plan_no_depth_gate": _gate(plain),
             "bottom_x": _bottom_x(result.plan),
             "throttle": round(result.command.throttle, 3),
             "brake": round(result.command.brake, 3),
             "steer": round(result.command.steering, 3),
         }
-        if result.depth is not None:
-            row["depth_coverage"] = round(result.depth.coverage, 3)
-            row["valid_disp"] = round(result.depth.valid_disparity_fraction, 3)
-        if terrain is not None:
-            obstacle_px = float((terrain.obstacle_mask & rgb).sum())
-            row["obstacle_frac_in_mask"] = round(obstacle_px / max(int(rgb.sum()), 1), 3)
-            row["min_clearance_m"] = round(float(terrain.min_forward_clearance_m), 2)
-            row["ground_slope_deg"] = round(terrain.ground_slope_deg, 1)
         rows.append(row)
 
-        out = out_root / left_path.stem
+        out = out_root / path.stem
         out.mkdir(parents=True, exist_ok=True)
         img = result.frame.preprocessed
         vis = _tint(img, result.perception.mask, (0, 255, 0), 0.3)
-        vis = _tint(vis, rgb & ~result.perception.mask, (0, 0, 255), 0.6)
-        for plan, color in ((result.plan, (255, 200, 0)), (plain, (255, 0, 255))):
-            if len(plan.centerline) >= 2:
-                pts = np.round(plan.centerline).astype(np.int32).reshape(-1, 1, 2)
-                cv2.polylines(vis, [pts], False, color, 3, cv2.LINE_AA)
+        if len(result.plan.centerline) >= 2:
+            pts = np.round(result.plan.centerline).astype(np.int32).reshape(-1, 1, 2)
+            cv2.polylines(vis, [pts], False, (255, 200, 0), 3, cv2.LINE_AA)
         cv2.imwrite(
             str(out / "6_full_pipeline.png"),
             _label(
                 vis,
                 [
-                    "green=fused mask  red=vetoed by depth",
-                    "cyan=plan w/ depth  magenta=plan w/o depth",
+                    "Green = Segmentation Mask",
+                    "Cyan = Planned Path",
                 ],
             ),
         )
-    pipeline.close()
     print(json.dumps(rows, indent=1))
 
 
@@ -366,12 +325,12 @@ def main() -> None:
     ana = sub.add_parser("analyze", help="run every stage on saved frames")
     ana.add_argument("--src", default=str(ROOT / "output/diagnostics/frames"))
     ana.add_argument("--out", default=str(ROOT / "output/diagnostics"))
-    ana.add_argument("--side", default="left")
+    ana.add_argument("--side", choices=("dashcam",), default="dashcam")
     ana.add_argument("--conf", type=float, default=None)
     ana.add_argument("--weights", default="")
     ana.add_argument("--no-clahe", action="store_true")
 
-    fl = sub.add_parser("full", help="whole pipeline incl. inline stereo on saved pairs")
+    fl = sub.add_parser("full", help="RGB Pipeline On Saved Pairs")
     fl.add_argument("--src", default=str(ROOT / "output/diagnostics/frames"))
     fl.add_argument("--out", default=str(ROOT / "output/diagnostics"))
 
