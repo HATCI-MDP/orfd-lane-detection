@@ -158,6 +158,12 @@ planning:
   # A frame that fails any check produces NO new path: the last good path is
   # reused for hold_frames at hold_speed_scale x speed, then the car brakes.
   gate:
+    # Set this to 0.0 for a task="semantic" model. Such a model has no
+    # per-detection score, so RoadSegmenter reports 1.0 and this check passes
+    # on every frame regardless of the mask, which is worse than not having it:
+    # min_road_pixels, min_mask_area and the anchor check below are what
+    # actually gate a semantic model. RoadSegmenter warns at startup if a
+    # semantic model is loaded with this above zero.
     confidence_threshold: 0.18   # accept a connected road at 0.19; matches PipelineConfig
     min_mask_area: 0.05          # MIN_MASK_AREA: road component / planner ROI
     hold_frames: 10              # ~0.5 s at 20 Hz
