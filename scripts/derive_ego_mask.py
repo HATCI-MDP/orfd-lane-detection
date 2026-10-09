@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Derive the dashcam ego exclusion from the Hopper body geometry.
 
-Re-run after changing beamng.camera mount or sensor settings and put the
-polygon under beamng.camera.ego_mask in configs/default.yaml.
+Re-run after changing the camera mount or sensor settings and put the
+polygon under camera.ego_mask in src/offroad_autonomy/stacks/mono_yoloe/default.yaml.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from offroad_autonomy.perception.camera_geometry import CameraModel
-from offroad_autonomy.utils.config import load_config
+from offroad_autonomy.stacks.mono_yoloe.config import load_pipeline_config_file
 
 # (y, z_centre, z_outer, half_width) per node row, front -> rear: the front
 # bumper's top face, then the hood deck, then the cowl up to the windshield
@@ -127,8 +127,8 @@ def derive(spec, width: int, height: int, args, key: str) -> None:
     if len(polygon) < 3:
         # A mount ahead of the body may need no exclusion.
         print("#   -> no bodywork in frame; nothing to exclude")
-        print(f"      {key}:")
-        print("        enabled: false")
+        print(f"  {key}:")
+        print("    enabled: false")
         print()
         return
 
@@ -139,12 +139,12 @@ def derive(spec, width: int, height: int, args, key: str) -> None:
         f"{args.margin_px} px margin)"
     )
     print(f"#   body px missed : {int(missed.sum())} (before the runtime margin)")
-    print(f"      {key}:")
-    print("        enabled: true")
-    print(f"        margin_px: {args.margin_px}")
-    print("        polygon:")
+    print(f"  {key}:")
+    print("    enabled: true")
+    print(f"    margin_px: {args.margin_px}")
+    print("    polygon:")
     for x, y in polygon:
-        print(f"          - [{x:.4f}, {y:.4f}]")
+        print(f"      - [{x:.4f}, {y:.4f}]")
     print()
 
 
@@ -156,7 +156,7 @@ def main() -> None:
     parser.add_argument("--close-px", type=int, default=5)
     args = parser.parse_args()
 
-    config = load_config(args.config)
+    config = load_pipeline_config_file(args.config)
     derive(config.camera, config.preprocess_width, config.preprocess_height, args, "ego_mask")
 
 

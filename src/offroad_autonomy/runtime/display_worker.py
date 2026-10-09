@@ -1,4 +1,4 @@
-"""Render completed dashcam inference snapshots without blocking control."""
+"""Render completed stack snapshots without blocking control."""
 
 from __future__ import annotations
 
@@ -11,8 +11,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from offroad_autonomy.contract import StackOutput
 from offroad_autonomy.runtime.timing import RuntimeStats
-from offroad_autonomy.types import PathPlan, PipelineStepResult
 
 logger = logging.getLogger("offroad_autonomy.runtime.display")
 
@@ -29,11 +29,9 @@ class DisplayState:
     cosmetic outcome and the reason no lock is held while drawing.
     """
 
-    result: PipelineStepResult
+    output: StackOutput
     telemetry: object
-    plan: PathPlan | None = None
-    valid_roi: np.ndarray | None = None
-    debug_view: str = "default"
+    page: int = 0
     timing_overlay: bool = False
     #: The orbit camera's latest image, for the presentation video only.
     orbit: np.ndarray | None = None

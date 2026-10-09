@@ -21,11 +21,7 @@ MAIN_STAGES = (
     "capture",
     "orbit_capture",
     "vehicle_state",
-    "preprocess",
-    "segmentation",
-    "postprocess",
-    "planning",
-    "control",
+    "stack_step",
     "actuation",
     "primary_loop",
     "full_loop",
@@ -45,7 +41,6 @@ DISPLAY_STAGES = (
 class StageStats:
     mean_ms: float = 0.0
     p95_ms: float = 0.0
-    last_ms: float = 0.0
     count: int = 0
 
 
@@ -62,10 +57,6 @@ class RuntimeStats:
             if samples is None:
                 samples = self._samples[stage] = deque(maxlen=self._window)
             samples.append(float(elapsed_ms))
-
-    def record_many(self, timings: dict[str, float]) -> None:
-        for stage, elapsed in timings.items():
-            self.record(stage, elapsed)
 
     @contextmanager
     def time(self, stage: str) -> Iterator[None]:
@@ -100,7 +91,6 @@ class RuntimeStats:
         return StageStats(
             mean_ms=float(values.mean()),
             p95_ms=float(np.percentile(values, 95)),
-            last_ms=float(values[-1]),
             count=int(values.size),
         )
 

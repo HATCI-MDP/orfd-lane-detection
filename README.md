@@ -2,13 +2,11 @@
 
 ## Introduction
 
-Off-Road Autonomy drives a vehicle along unmarked dirt trails in BeamNG.tech using one dashcam. It segments the drivable trail with a YOLOE-26 model, plans a centreline and steers with Stanley control.
+Off-Road Autonomy drives a vehicle along unmarked dirt trails in BeamNG.tech. A fixed **harness** owns the simulator, the control loop, safety, the dashboard and scoring; a swappable **driving stack**, named in the config, turns sensor data into a control command. Different perception and planning approaches therefore run, and are compared, on one branch (see [Harness And Driving Stacks](#harness-and-driving-stacks)).
 
-Perception uses RGB segmentation only. There is no depth estimation, terrain fusion or depth-based obstacle veto. One GMSL2 dashcam with 120° horizontal FOV supplies segmentation, planning, control and the dashboard. It retains the previous dashcam mount: height 1.85 m, forward offset -0.30 m, pitch -8°. Capture is 960x620 at 30 FPS, processed at 720x465. The dashboard draws the same captured frame and its results; it does not poll another camera. Debug views are `0` path, `1` raw dashcam, `6` mask and `9` pipeline. Configure the sensor, mount and hood exclusion under `beamng.camera`. Ground distances still use a flat-ground assumption. Old `beamng.cameras`, `segmentation_mode` and `stitching` settings must be removed.
+Each stack's sensors, settings, dashboard pages, rules and tools are documented in [docs/stacks/](docs/stacks/README.md).
 
 It runs on Windows, WSL2, macOS or a Jetson. BeamNG.tech itself runs only on Windows, so every other machine connects to it over the network.
-
-When the hood hides the nearest part of the path, steering joins a visible lookahead point with a geometric pursuit arc. It does not extrapolate the path backward under the hood, which could reverse the commanded turn. Stanley tracking resumes when the predicted vehicle position lies within the observed path.
 
 ## Setup
 
@@ -20,16 +18,7 @@ source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
 ```
 
-Put the model weights in `models/`: `yoloe-26x-seg.pt` (default config), `yoloe-26s-seg.pt` (Jetson) and `mobileclip2_b.ts` (the YOLOE text encoder).
-
-### Custom Semantic Weights
-
-Custom semantic segmentation checkpoints such as `models/weights.pt` require
-Ultralytics 8.4.55 or newer (`pip install -e ".[dev]"`). Set `perception.model_weights`
-to the checkpoint and include its road class name in `perception.prompts`.
-For semantic models these names select fixed classes; other classes are excluded.
-The confidence readout is the mean predicted probability over accepted road pixels
-outside the ego mask. YOLOE instance segmentation weights remain supported.
+A stack may need model files in `models/` or other setup; its doc in [docs/stacks/](docs/stacks/README.md) lists them.
 
 ### Connect To BeamNG
 
@@ -78,72 +67,65 @@ The app uses port **64256**; BeamNG's `-tcom` default is **25252**, so include
 `-tport 64256` or set `BEAMNG_PORT` to the server's actual port. See the
 [BeamNG connection arguments](https://documentation.beamng.com/beamng_tech/arguments_and_settings/).
 
+## Harness And Driving Stacks
+
+A stack is any object with three methods, defined in `src/offroad_autonomy/contract.py`:
+
+- `sensors()` returns the `SensorSpec`s to attach (cameras today), read once before connecting.
+- `step(observation)` takes every declared sensor's reading and the vehicle state, and returns a
+  `StackOutput`: the control command, visuals for the dashboard, optional metrics, and an
+  optional safe-stop request.
+- `reset()` is called when the operator resumes after a safe stop.
+
+A run config names its stack by import path and hands it a section only the stack reads:
+
+```yaml
+extends: default.yaml
+stack: offroad_autonomy.stacks.<name>:build
+stack_config:
+  # Only the stack reads this section; its doc lists the keys.
+```
+
+| Section                                                                             | Read By        | Holds                                                                   |
+| ----------------------------------------------------------------------------------- | -------------- | ----------------------------------------------------------------------- |
+| `beamng`, `safety`, `ui`, `recording`, `presentation`, `visualization`, `benchmark` | Harness        | Simulator, map, spawn, stuck detector, dashboard, recording and scoring |
+| `stack`                                                                             | Harness        | Import path of the stack's `build(stack_config)` function               |
+| `stack_config`                                                                      | The stack only | Everything about its perception, planning, control and sensor rig       |
+
+- **Every key is checked.** The harness refuses keys it does not know, and keys from before the
+  split name where they moved (for example `perception` is now `stack_config.perception`).
+  Each stack validates `stack_config` itself.
+- **Adding a stack is adding a package** under `src/offroad_autonomy/stacks/` with a `build`
+  function; nothing in the harness, dashboard or benchmark lists stacks. Stacks may reuse
+  `perception/`, `planning/` and `control/`, but nothing requires them to.
+- **A stack never imports `beamngpy`** and must return from `step` within the loop budget. Slow
+  work belongs on the stack's own worker. The harness logs every `step` that takes longer than
+  `visualization.dashboard.latency_budget_ms`.
+- **Safety stays in the harness.** The stuck detector, `E` safe stop and manual override apply
+  to every stack. A stack can ask for a safe stop for a condition only it can see, but it
+  cannot disable one. The stack keeps running
+  under safe stop, so the operator can see the road come back before resuming.
+
 ## Run
 
 ```bash
 offroad-autonomy
 ```
 
-The pipeline uses Stanley steering with curvature feedforward and speed planning. Tune it
-under `control` in `configs/default.yaml`. Remove the former `control.controller` key
-and `--controller` flag from custom configurations and launch commands.
-
-For the bird's-eye grid planner, run `offroad-autonomy --config configs/grid.yaml`.
-At a split, the grid planner chooses the traversable branch closest to the current
-trajectory and locks onto it while multiple branches remain. A change in branch scores
-does not switch branches; the lock releases when only one option remains or the chosen
-branch is no longer safe. Arcs within a branch still use the existing quality scores and
-motion-compensated RMS trajectory-distance penalty. `planning.grid.weight_trajectory_distance`
-sets that penalty per metre (default `0.35`, `0` disables the soft penalty, not branch locking).
-
-### Grid Planner
-
-`planning.mode: grid` projects the road mask onto flat ground, fuses it over time using the
-vehicle's own motion, and picks the best of a fan of steerable arcs on that grid
-(`planning/bev_grid.py`, `planning/arc_planner.py`). It was built for the roof-mounted dashcam,
-whose hood hides the first ~3 m of ground and whose image edges cut wide trails:
-
-- Ground the camera cannot see is unknown, never "not road", so a trail running off the side of
-  the image does not pull the path toward the visible part.
-- Memory carries the road the hood now hides, using the simulator's direction vector to follow
-  the vehicle's motion. Without a valid pose the grid forgets rather than smearing.
-- Frames the perception gate rejects move the grid with the vehicle but add no evidence.
-- Arcs end where the vehicle's body would leave the road, and the path only extends as far as
-  the grid has seen road, so the path-end speed law still applies.
-- The projection assumes flat ground: on crests and in dips far cells are misplaced, and the
-  grid has no height information, so obstacles the segmenter labels as road are not seen.
-
-Settings, with reasons, are in `planning.grid` in `configs/default.yaml`. The baseline planner
-stays the default until the grid planner has been compared on several maps.
-
-The grid's road evidence comes only from the learned dashcam mask. BeamNG annotation,
-instance-label and depth buffers are explicitly disabled; the optional orbit RGB camera
-is display-only. `semantic_mask` in the model wrapper means a neural-network prediction,
-not a simulator annotation. The grid does use BeamNG's true vehicle position and direction
-to register its memory, and Stanley uses simulator velocity/speed. This is vision-based
-traversability with simulator-provided localization, so it does not measure performance
-with noisy estimated odometry. The synthetic S-bend and planner tests use idealized masks
-to test mechanics and are not evidence of real perception accuracy.
-
-False positives remain possible: a mistaken road mask can accumulate in grid memory,
-and flat-ground projection can misplace terrain on slopes. Unknown cells are not labeled
-as observed road, but the clearance calculation treats them optimistically so unseen
-ground under the hood does not block all motion. Neither that clearance nor a large
-positive road score guarantees that the physical terrain is safe. Ground-truth road
-labels would need to remain in a separate evaluator when measuring perception accuracy.
+This runs the stack named in `configs/default.yaml`; `--config <file>` runs another config.
 
 The BeamNG client selects realistic shifting and forward drive on startup and
 resume, so holding the brake cannot engage arcade reverse. Manual gearboxes use
-first gear for low-speed off-road operation; automatics select Drive. Gate holds
-show their reason in the dashboard and console. The default gate accepts a
-connected road at confidence 0.18 or above and still rejects insufficient or
-disconnected road masks. Run `python scripts/check_brake_hold.py --reproduce-arcade`
-to reproduce the former reversal and verify the brake-hold/forward-restart fix.
+first gear for low-speed off-road operation; automatics select Drive. Run
+`python scripts/check_brake_hold.py --reproduce-arcade` to reproduce the former reversal and
+verify the brake-hold/forward-restart fix.
 
 - Starts BeamNG.tech when `BEAMNG_HOME` is set and it is not already running, then spawns the vehicle and opens the dashboard
-- `E` safe stop, `P` resume, `0`, `1`, `6`, `9` debug views, `T` timing overlay, `Q` quit
+- `E` safe stop, `P` resume, `0` main view, `1`-`9` the stack's own layers, `T` timing overlay, `Q` quit
 - `--headless` runs without a window
-- `--presentation-view` shows the orbit camera, dashcam overlay and stats together live
+- `--presentation-view` shows the orbit camera, the stack's main view and stats together live
+- `--map` and `--spawn` override `beamng.map` and `beamng.spawn_index`
+- `--record-route` records the vehicle's true path as the reference route for this map and spawn (see [Benchmark And Compare Stacks](#benchmark-and-compare-stacks))
 - `--record-video` saves the dashboard to an mp4 (see Record The Dashboard below)
 - `--presentation` saves a 1920 x 1080 video for an audience outside the team (see Record A Presentation below)
 
@@ -153,7 +135,7 @@ to reproduce the former reversal and verify the brake-hold/forward-restart fix.
 offroad-autonomy --presentation-view
 ```
 
-Opens the split view with the orbit camera on the left and dashcam overlay and
+Opens the split view with the orbit camera on the left and the stack's main view and
 telemetry on the right. No video is recorded and ffmpeg is not required. Use
 `E` to stop, `P` to resume and `Q` to quit. Add `--presentation` to record this
 view too. `--headless` suppresses the live window.
@@ -162,7 +144,7 @@ view too. `--headless` suppresses the live window.
 
 ```bash
 offroad-autonomy --record-video
-offroad-autonomy --record-video --headless --benchmark-seconds 60 --label stanley-run
+offroad-autonomy --record-video --headless --benchmark-seconds 60 --label baseline
 ```
 
 `--record-video` saves the dashboard, exactly as drawn, to `output/videos/<label>_<timestamp>.mp4`
@@ -197,16 +179,16 @@ unchanged.
 
 - **Left:** a chase camera behind and above the vehicle, labelled Orbit Camera. Until its first
   frame arrives the view reads No Orbit Signal.
-- **Top right:** the dashcam image with the traversable mask, planned path and ego exclusion, drawn
-  by the same code as the dashboard's view.
-- **Bottom right:** speed, steering, Autonomy FPS, latency mean / p95, Road / Valid Px and
-  segmentation confidence, coloured by the dashboard's rules and thresholds.
+- **Top right:** the stack's main view with its masks, paths and exclusions, drawn by the same code
+  as the dashboard's view.
+- **Bottom right:** speed, steering, Autonomy FPS, latency mean / p95 and the stack's first two gauges,
+  coloured by the dashboard's rules and the gauges' own thresholds.
 - **Safe stop:** the header chip turns solid red, the orbit view gets a red wash and border, and no
-  path is drawn on the dashcam image.
+  path is drawn on the main view.
 
-The orbit camera is attached when recording or showing a presentation, and no pipeline stage reads it. Its pose,
+The orbit camera is attached when recording or showing a presentation, and no stack reads it. Its pose,
 resolution and field of view are in the `presentation` section of `configs/default.yaml`. The main
-loop polls it right after each dashcam frame, because the socket transport cannot be read from the
+loop polls it right after each frame of the stack's sensors, because the socket transport cannot be read from the
 dashboard thread. That poll is logged as the `orbit_capture` stage and is part of the measured
 primary loop, so the Autonomy FPS in the video is the real rate of the loop with the camera
 attached. It has not yet been measured against BeamNG, so expect a lower FPS than without the flag
@@ -218,26 +200,69 @@ Its render time is in the periodic runtime log line.
 
 ### Dashboard
 
-The 1600 x 900 dashboard has a header with the autonomy status, the dashcam view with the traversable mask, planned path and ego exclusion, a Vehicle card, a Perception card and a Runtime strip. Speed is the largest number on screen.
+The 1600 x 900 dashboard has a header with the autonomy status and the stack's name, the stack's main view, a Vehicle card, a Driving Stack card and a Runtime strip. Speed is the largest number on screen.
 
-- **Safe stop:** a red wash, a red border and a banner cover the dashcam view, and no planned path is drawn.
+The dashboard never sees a stack's own types. A stack describes itself with five primitives, so a new stack renders with no dashboard change:
+
+| Primitive     | Drawn As                                                                                          |
+| ------------- | ------------------------------------------------------------------------------------------------- |
+| `ImageLayer`  | A page. The first is the main view; keys `1`-`9` show the rest beside a readout of every metric   |
+| `MaskOverlay` | A tint on a layer: traversable (teal with an edge), excluded (hatched magenta) or info            |
+| `Polyline`    | A path on a layer, in image pixels or in ground metres projected with the declared camera         |
+| `Gauge`       | A bar on the Driving Stack card, coloured by its own thresholds and ticked at the first           |
+| `Status`      | A chip on the card when it is a warning or fault; good statuses appear only in the readout        |
+
+- **Safe stop:** a red wash, a red border and a banner cover the main view, and no path is drawn.
 - **Autonomy FPS:** green at `visualization.dashboard.target_fps` or above, amber from `fps_warn_fraction` of it up to the target, red below that. Latency is red when its p95 passes `latency_budget_ms`.
-- **Segmentation confidence:** red below the gate's `planning.gate.confidence_threshold`, amber up to `confidence_good`, green above.
-- **Ticks:** the Road / Valid Px bar is marked at `safety.min_road_fraction` and the confidence bar at the gate threshold, both read from their own config sections.
 - **Dashboard FPS:** shown in its own tile and never colored, because a slow window says nothing about the vehicle.
-- **Held path:** when the planner holds a fallback path, it is drawn dashed in amber.
+- **Held path:** a `held` polyline is drawn dashed in amber.
+- **Costly pages:** a layer's image may be a function. The dashboard calls it on its own thread, and only while that page is shown, so a costly debug image never runs in the control loop.
 
 Text is drawn with Pillow using the bundled IBM Plex Sans and Mono fonts in `src/offroad_autonomy/visualization/fonts/` (SIL Open Font License, included). A missing font file stops startup.
+
+## Benchmark And Compare Stacks
+
+The harness scores every run from simulator ground truth, never from what the stack reports, so
+any two stacks compare fairly.
+
+1. Record a reference route once per map and spawn by driving it cleanly, either with the stack
+   or by hand after `E`. It is saved on exit to
+   `<benchmark.routes_dir>/<map>_spawn<index>.json`:
+
+```bash
+offroad-autonomy --map automation_test_track --spawn 0 --record-route
+```
+
+2. Run several configs back to back on the same map, spawn and duration. Each config runs headless
+   in its own process; one JSON report per run goes to `output/experiments/`, followed by one
+   comparison table:
+
+```bash
+python scripts/run_experiments.py configs/a.yaml configs/b.yaml \
+    --seconds 60 --map automation_test_track --spawn 0
+```
+
+| Metric                                        | From                                                                                        |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| Cross-track mean and max, completion          | The vehicle's true position against the reference route                                     |
+| Departures                                    | Times the true position went more than `benchmark.departure_cross_track_m` off the route    |
+| Distance, safe stops                          | True positions, and the harness's own safe-stop state                                       |
+| Steering rate, sign changes per minute        | The commands sent; changes inside `benchmark.steer_sign_deadband` are ignored               |
+| FPS, capture-to-actuation latency, step time  | Measured by the harness around `step`, after `--benchmark-warmup` seconds                   |
+
+- Driving metrics stop at the first safe stop, because what the operator drives afterwards is not
+  the stack's. A run without a route reports cross-track, completion and departures as null.
+- Whatever the stack puts in `StackOutput.metrics` is averaged into a separate `stack_metrics`
+  section that never feeds the comparison.
 
 ## Run On Jetson (Docker)
 
 Requires JetPack 6 with the NVIDIA container runtime. Start BeamNG listening on the network first (see [Connect To BeamNG](#connect-to-beamng)).
 
-1. Build the image and export the TensorRT engine (first time only, since engines are tied to the device that builds them):
+1. Build the image, then do any device-specific preparation the stack's doc lists (such as exporting a TensorRT engine):
 
 ```bash
 docker compose build
-docker compose run --rm --entrypoint python autonomy scripts/export_engine.py --weights models/yoloe-26s-seg.pt
 ```
 
 2. Run:
@@ -246,8 +271,8 @@ docker compose run --rm --entrypoint python autonomy scripts/export_engine.py --
 BEAMNG_HOST=192.168.1.50 docker compose up
 ```
 
-- The container runs `configs/jetson.yaml`: TensorRT engine, headless
-- `models/`, `output/` and `configs/` are mounted from the host, so config changes need no rebuild
+- The container runs `configs/jetson.yaml`
+- `models/`, `output/` and `configs/` are mounted from the host, so changes to run configs (including their `stack_config`) need no rebuild; a stack's own `default.yaml` is part of the package and does
 - `docker compose stop` parks the vehicle before disconnecting
 
 ## Testing
@@ -257,8 +282,8 @@ BEAMNG_HOST=192.168.1.50 docker compose up
 | `pytest`                                      | Unit and integration tests (models and simulator are mocked) | No           |
 | `pytest --cov`                                | Same suite plus the 70% coverage gate CI enforces            | No           |
 | `docker compose --profile test run --rm test` | The same suite inside the Jetson image                       | No           |
-| `python scripts/sbend_sim.py`                 | Closed-loop controller check on a synthetic S-bend           | No           |
-| `offroad-autonomy --benchmark-seconds 90`     | Timed run that writes `output/benchmarks/<label>.json`       | Yes          |
+| `offroad-autonomy --benchmark-seconds 90`     | Timed run scored from ground truth, to `output/benchmarks/`  | Yes          |
+| `python scripts/run_experiments.py <configs>` | Several configs back to back, then one comparison table      | Yes          |
 
 ## Common Commands
 
@@ -272,21 +297,18 @@ BEAMNG_HOST=192.168.1.50 docker compose up
 | `python -m build`                                               | Build the wheel and sdist                               |
 | `pytest`                                                        | Run the tests                                           |
 | `python scripts/compare_benchmarks.py output/benchmarks/*.json` | Compare benchmark runs side by side                     |
-| `python scripts/derive_ego_mask.py`                             | Regenerate camera bodywork masks after moving a camera  |
-| `python scripts/diagnose_perception.py capture` / `analyze`     | Save simulator frames, then dump every perception stage |
-| `python scripts/closed_loop_log.py --seconds 120 --summary`     | Headless run that logs every control frame to CSV       |
-| `python scripts/export_engine.py`                               | Export the segmentation model to TensorRT               |
+| `python scripts/run_experiments.py <configs> --seconds 60`      | Run configs back to back and compare them               |
+| `offroad-autonomy --record-route`                               | Record the reference route for a map and spawn          |
 
 ## Development Notes
 
-- Package code is in `src/offroad_autonomy/`; the entry point is `main.py`, and the stage order is in `pipeline.py`
+- Package code is in `src/offroad_autonomy/`. The harness loop is `main.py` and the contract is `contract.py`; each stack is a package under `stacks/`, documented in `docs/stacks/<stack>/`
 - Only `simulation/beamng_client.py` imports `beamngpy`
-- `configs/default.yaml` holds every tuning value, with the reason for it next to the key; `configs/jetson.yaml` overrides it through `extends:`
+- `configs/default.yaml` holds every harness value and each stack's `default.yaml` every stack value, with the reason for each next to its key; other files in `configs/` override them through `extends:` and `stack_config`
 - `beamng.host`, `beamng.launch`, `beamng.camera_transport` and `ui.display_async` default to `auto` and are derived from the platform; `BEAMNG_HOST`, `BEAMNG_PORT`, `BEAMNG_HOME` and `BEAMNG_LAUNCH` override the `beamng:` block
 - The dashboard runs on its own thread, and the control loop never waits for it
-- After changing the mount or lens in `beamng.camera`, re-run `scripts/derive_ego_mask.py` and re-check `planning.roi_height`
 - Manual driving (W/A/S/D under safe stop) reads the OS key state and works only on Windows
-- CI (`.github/workflows/ci.yml`) runs lint, format, the S-bend check, tests with coverage and the build on Python 3.10; CodeQL scans weekly and on every pull request; Dependabot watches pip, the Docker base image and the Actions
+- CI (`.github/workflows/ci.yml`) runs lint, format, the stacks' offline checks, tests with coverage and the build on Python 3.10; CodeQL scans weekly and on every pull request; Dependabot watches pip, the Docker base image and the Actions
 
 ## Contribution Rules
 
@@ -295,7 +317,7 @@ BEAMNG_HOST=192.168.1.50 docker compose up
 - Open a pull request into main when the change is ready.
 - Keep pull requests small, focused, and easy to review.
 - Run `ruff check src tests scripts`, `ruff format --check src tests scripts` and `pytest --cov` before opening a pull request.
-- Run `python scripts/sbend_sim.py` after changing the controller or its config.
+- After changing a stack, run the checks its doc in `docs/stacks/` lists.
 - No ternary expressions, and no single-line `if` bodies.
 - Comments explain why, not what.
 - Do not create commits unless explicitly asked.

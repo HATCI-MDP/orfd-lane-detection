@@ -11,7 +11,6 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from offroad_autonomy.main import _StuckDetector
 from offroad_autonomy.perception.ego_mask import (
     EgoMask,
     apply_roi,
@@ -19,6 +18,7 @@ from offroad_autonomy.perception.ego_mask import (
     weighted_confidence,
 )
 from offroad_autonomy.postprocessing.temporal_stabilizer import TemporalStabilizer
+from offroad_autonomy.stacks.mono_yoloe.stack import NoRoadMonitor
 from offroad_autonomy.types import (
     EgoMaskSpec,
     PerceptionResult,
@@ -165,13 +165,13 @@ def test_pipeline_builds_the_ego_mask():
     config = _config()
 
     with (
-        patch("offroad_autonomy.pipeline.ImagePreprocessor"),
-        patch("offroad_autonomy.pipeline.RoadSegmenter"),
-        patch("offroad_autonomy.pipeline.TemporalStabilizer"),
-        patch("offroad_autonomy.pipeline.CenterlinePlanner"),
-        patch("offroad_autonomy.pipeline.StanleyController"),
+        patch("offroad_autonomy.stacks.mono_yoloe.pipeline.ImagePreprocessor"),
+        patch("offroad_autonomy.stacks.mono_yoloe.pipeline.RoadSegmenter"),
+        patch("offroad_autonomy.stacks.mono_yoloe.pipeline.TemporalStabilizer"),
+        patch("offroad_autonomy.stacks.mono_yoloe.pipeline.CenterlinePlanner"),
+        patch("offroad_autonomy.stacks.mono_yoloe.pipeline.StanleyController"),
     ):
-        from offroad_autonomy.pipeline import AutonomyPipeline
+        from offroad_autonomy.stacks.mono_yoloe.pipeline import AutonomyPipeline
 
         pipeline = AutonomyPipeline(config)
 
@@ -182,45 +182,30 @@ def test_pipeline_builds_the_ego_mask():
 
 
 def test_safe_stop_still_fires_when_the_road_really_is_gone():
-    detector = _StuckDetector(min_road_fraction=0.015, no_road_time_s=2.0)
+    monitor = NoRoadMonitor(min_road_fraction=0.015, no_road_time_s=2.0)
 
-    assert detector.update(0.0, road_fraction=0.0, speed_mps=5.0, throttle=0.3)[0] is False
-    assert detector.update(1.0, road_fraction=0.0, speed_mps=5.0, throttle=0.3)[0] is False
+    assert monitor.update(0.0, road_fraction=0.0) == ""
+    assert monitor.update(1.0, road_fraction=0.0) == ""
 
-    triggered, reason = detector.update(2.5, road_fraction=0.0, speed_mps=5.0, throttle=0.3)
+    reason = monitor.update(2.5, road_fraction=0.0)
 
-    assert triggered
     assert "no traversable road" in reason
 
 
 def test_safe_stop_does_not_fire_on_a_visible_road():
-    detector = _StuckDetector(min_road_fraction=0.015, no_road_time_s=2.0)
+    monitor = NoRoadMonitor(min_road_fraction=0.015, no_road_time_s=2.0)
 
     for t in range(100):
-        triggered, _ = detector.update(float(t), road_fraction=0.25, speed_mps=5.0, throttle=0.3)
-        assert not triggered
+        assert monitor.update(float(t), road_fraction=0.25) == ""
 
 
 def test_recovering_road_clears_the_safe_stop_timer():
-    detector = _StuckDetector(min_road_fraction=0.015, no_road_time_s=2.0)
+    monitor = NoRoadMonitor(min_road_fraction=0.015, no_road_time_s=2.0)
 
-    detector.update(0.0, road_fraction=0.0, speed_mps=5.0, throttle=0.3)
-    detector.update(1.0, road_fraction=0.30, speed_mps=5.0, throttle=0.3)
+    monitor.update(0.0, road_fraction=0.0)
+    monitor.update(1.0, road_fraction=0.30)
     # The timer restarted, so a single bad frame long after must not trip it.
-    triggered, _ = detector.update(3.0, road_fraction=0.0, speed_mps=5.0, throttle=0.3)
-
-    assert not triggered
-
-
-def test_stuck_detection_is_unchanged():
-    """The motion-based half of the safety net must still work."""
-    detector = _StuckDetector()
-
-    detector.update(0.0, road_fraction=0.5, speed_mps=0.1, throttle=0.5)
-    triggered, reason = detector.update(4.0, road_fraction=0.5, speed_mps=0.1, throttle=0.5)
-
-    assert triggered
-    assert reason == "vehicle stuck"
+    assert monitor.update(3.0, road_fraction=0.0) == ""
 
 
 def test_hood_sized_exclusion_cannot_by_itself_trigger_safe_stop():
@@ -234,27 +219,24 @@ def test_hood_sized_exclusion_cannot_by_itself_trigger_safe_stop():
     all_road = apply_roi(np.ones(roi.shape, dtype=bool), roi)
 
     fraction = road_fraction(all_road, roi)
-    detector = _StuckDetector(
+    monitor = NoRoadMonitor(
         min_road_fraction=config.safety_min_road_fraction,
         no_road_time_s=config.safety_no_road_time_s,
     )
 
     assert fraction == pytest.approx(1.0)
     for t in range(20):
-        triggered, _ = detector.update(
-            float(t), road_fraction=fraction, speed_mps=4.0, throttle=0.3
-        )
-        assert not triggered
+        assert monitor.update(float(t), road_fraction=fraction) == ""
 
 
 def test_ego_mask_round_trips_through_yaml(tmp_path):
-    from offroad_autonomy.utils.config import load_config
+    from offroad_autonomy.stacks.mono_yoloe.config import load_pipeline_config_file
 
     path = tmp_path / "ego.yaml"
     path.write_text(
         "\n".join(
             [
-                "beamng:",
+                "stack_config:",
                 "  camera:",
                 "      ego_mask:",
                 "        enabled: true",
@@ -268,7 +250,7 @@ def test_ego_mask_round_trips_through_yaml(tmp_path):
         encoding="utf-8",
     )
 
-    config = load_config(path)
+    config = load_pipeline_config_file(path)
     spec = config.camera.ego_mask
 
     assert spec.enabled
@@ -278,16 +260,16 @@ def test_ego_mask_round_trips_through_yaml(tmp_path):
 
 
 def test_enabled_mask_without_a_polygon_is_rejected(tmp_path):
-    from offroad_autonomy.utils.config import load_config
+    from offroad_autonomy.stacks.mono_yoloe.config import load_pipeline_config_file
 
     path = tmp_path / "bad.yaml"
     path.write_text(
-        "beamng:\n  camera:\n      ego_mask:\n        enabled: true\n        polygon: []\n",
+        "stack_config:\n  camera:\n      ego_mask:\n        enabled: true\n        polygon: []\n",
         encoding="utf-8",
     )
 
     with pytest.raises(ValueError, match="fewer than 3 points"):
-        load_config(path)
+        load_pipeline_config_file(path)
 
 
 def test_moving_the_camera_does_not_silently_move_the_mask():

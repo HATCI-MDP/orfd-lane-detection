@@ -1,20 +1,11 @@
 """Tests for the presentation video frame."""
 
-from dataclasses import replace
-
 import numpy as np
 import pytest
 
+from offroad_autonomy.contract import Gauge, ImageLayer, MaskOverlay, Polyline, StackOutput
 from offroad_autonomy.main import build_parser, video_paths
-from offroad_autonomy.types import (
-    DEFAULT_DASHBOARD_COLORS,
-    ControlCommand,
-    FramePacket,
-    PathPlan,
-    PerceptionResult,
-    PipelineStepResult,
-    StabilizedResult,
-)
+from offroad_autonomy.types import DEFAULT_DASHBOARD_COLORS, ControlCommand
 from offroad_autonomy.visualization.dashboard import DashboardTelemetry
 from offroad_autonomy.visualization.layout import Rect
 from offroad_autonomy.visualization.presentation import (
@@ -23,6 +14,7 @@ from offroad_autonomy.visualization.presentation import (
     STATS_CARD,
     PresentationRenderer,
 )
+from tests.conftest import count_color
 
 COLORS = DEFAULT_DASHBOARD_COLORS
 
@@ -36,18 +28,20 @@ def renderer() -> PresentationRenderer:
     return PresentationRenderer()
 
 
-def _result(plan: PathPlan | None = None) -> PipelineStepResult:
+def _output(style: str = "path", road: float = 0.08, confidence: float = 0.71) -> StackOutput:
     """A flat grey frame, so any pixel in a palette colour was drawn on it."""
     frame = np.full((465, 720, 3), 90, dtype=np.uint8)
     mask = np.zeros((465, 720), dtype=bool)
-    if plan is None:
-        plan = PathPlan(centerline=np.array([[360.0, 440.0], [360.0, 300.0], [370.0, 200.0]]))
-    return PipelineStepResult(
-        frame=FramePacket(raw=frame, preprocessed=frame, timestamp=0.0, height=465, width=720),
-        perception=PerceptionResult(mask=mask, confidences=[0.71]),
-        stabilized=StabilizedResult(mask=mask),
-        plan=plan,
+    path = np.array([[360.0, 440.0], [360.0, 300.0], [370.0, 200.0]])
+    return StackOutput(
         command=ControlCommand(),
+        visuals=[
+            ImageLayer("Dashcam", frame, camera="dashcam"),
+            MaskOverlay("Dashcam", mask, "traversable", "Traversable Mask"),
+            Polyline("Dashcam", path, "image", style, "Planned Path"),
+            Gauge("Road / Valid Px", road, (0.0, 0.2), (0.015,), text=f"{road:.3f}"),
+            Gauge("Segmentation Confidence", confidence, (0.0, 1.0), (0.18, 0.5)),
+        ],
     )
 
 
@@ -57,13 +51,9 @@ def _telemetry(**overrides) -> DashboardTelemetry:
         "steering": 0.14,
         "throttle": 0.34,
         "brake": 0.0,
-        "perception_confidence": 0.71,
-        "stability_score": 1.0,
-        "kalman_active": False,
         "fps": 8.6,
         "latency_ms": 96.0,
         "latency_p95_ms": 118.0,
-        "road_fraction": 0.08,
     }
     fields.update(overrides)
     return DashboardTelemetry(**fields)
@@ -77,70 +67,54 @@ def _crop(image: np.ndarray, rect: Rect) -> np.ndarray:
     return image[rect.y : rect.bottom, rect.x : rect.right]
 
 
-def _count_color(image: np.ndarray, color: tuple[int, int, int]) -> int:
-    return int((image == np.array(color, dtype=np.uint8)).all(axis=2).sum())
-
-
-@pytest.mark.parametrize("state", ["active", "safe_stop", "fallback"])
+@pytest.mark.parametrize("state", ["active", "safe_stop", "held"])
 def test_every_state_renders_a_full_hd_frame(renderer, state):
-    result = _result()
-    plan = result.plan
+    output = _output()
     telemetry = _telemetry()
     if state == "safe_stop":
-        plan = None
         telemetry = _telemetry(autopilot_active=False)
-    elif state == "fallback":
-        plan = replace(plan, fallback_active=True, fallback_reason="low confidence")
-        result = replace(result, plan=plan)
+    elif state == "held":
+        output = _output(style="held")
 
-    frame = renderer.render(result, telemetry, _orbit(), plan, None)
+    frame = renderer.render(output, telemetry, _orbit())
 
     assert frame.shape == (1080, 1920, 3)
     assert frame.dtype == np.uint8
 
 
-def test_missing_orbit_frame_shows_the_placeholder(renderer):
-    result = _result()
+def test_a_stack_with_no_image_or_gauges_still_renders(renderer):
+    frame = renderer.render(StackOutput(command=ControlCommand()), _telemetry(), _orbit())
 
-    frame = renderer.render(result, _telemetry(), None, result.plan, None)
+    assert frame.shape == (1080, 1920, 3)
+
+
+def test_missing_orbit_frame_shows_the_placeholder(renderer):
+    frame = renderer.render(_output(), _telemetry(), None)
 
     view = _crop(frame, ORBIT_VIEW)
     centre = view[view.shape[0] // 2 - 60 : view.shape[0] // 2 - 30, 100:-100]
-    assert _count_color(centre, COLORS["CARD_BG"]) == centre.shape[0] * centre.shape[1]
+    assert count_color(centre, COLORS["CARD_BG"]) == centre.shape[0] * centre.shape[1]
     # The placeholder text sits on the view's centre line.
     middle = view[view.shape[0] // 2 - 20 : view.shape[0] // 2 + 10]
     assert (middle != np.array(COLORS["CARD_BG"], dtype=np.uint8)).any()
 
 
 def test_orbit_frame_fills_the_view(renderer):
-    result = _result()
-
-    frame = renderer.render(result, _telemetry(), _orbit(), result.plan, None)
+    frame = renderer.render(_output(), _telemetry(), _orbit())
 
     view = _crop(frame, ORBIT_VIEW)
-    assert _count_color(view, (200, 200, 200)) > 0.9 * view.shape[0] * view.shape[1]
+    assert count_color(view, (200, 200, 200)) > 0.9 * view.shape[0] * view.shape[1]
 
 
 def test_safe_stop_draws_no_path_in_the_dashcam_card(renderer):
-    result = _result()
     path = COLORS["PATH_CORE"]
 
-    driving = renderer.render(result, _telemetry(), _orbit(), result.plan, None)
-    stopped = renderer.render(result, _telemetry(autopilot_active=False), _orbit(), None, None)
+    driving = renderer.render(_output(), _telemetry(), _orbit())
+    stopped = renderer.render(_output(), _telemetry(autopilot_active=False), _orbit())
 
-    assert _count_color(_crop(driving, DASHCAM_CARD), path) > 0
-    assert _count_color(_crop(stopped, DASHCAM_CARD), path) == 0
-    assert _count_color(_crop(stopped, ORBIT_VIEW), COLORS["BAD"]) > 0
-
-
-def test_safe_stop_hides_a_plan_even_if_one_is_passed(renderer):
-    result = _result()
-
-    stopped = renderer.render(
-        result, _telemetry(autopilot_active=False), _orbit(), result.plan, None
-    )
-
-    assert _count_color(_crop(stopped, DASHCAM_CARD), COLORS["PATH_CORE"]) == 0
+    assert count_color(_crop(driving, DASHCAM_CARD), path) > 0
+    assert count_color(_crop(stopped, DASHCAM_CARD), path) == 0
+    assert count_color(_crop(stopped, ORBIT_VIEW), COLORS["BAD"]) > 0
 
 
 @pytest.mark.parametrize(
@@ -148,13 +122,11 @@ def test_safe_stop_hides_a_plan_even_if_one_is_passed(renderer):
     [(7.0, "GOOD"), (6.9, "WARN"), (3.0, "BAD")],
 )
 def test_fps_colour_follows_the_dashboard_bands(renderer, fps, expected):
-    result = _result()
-
-    frame = renderer.render(result, _telemetry(fps=fps), _orbit(), result.plan, None)
+    frame = renderer.render(_output(), _telemetry(fps=fps), _orbit())
 
     block = _crop(frame, FPS_BLOCK)
     for level in ("GOOD", "WARN", "BAD"):
-        count = _count_color(block, COLORS[level])
+        count = count_color(block, COLORS[level])
         if level == expected:
             assert count > 0
         else:
@@ -162,21 +134,19 @@ def test_fps_colour_follows_the_dashboard_bands(renderer, fps, expected):
 
 
 @pytest.mark.parametrize(
-    ("overrides", "expected"),
+    ("telemetry", "gauges", "expected"),
     [
-        ({"latency_p95_ms": 143.0}, "GOOD"),
-        ({"latency_p95_ms": 150.0}, "BAD"),
-        ({"road_fraction": 0.01}, "BAD"),
-        ({"perception_confidence": 0.3}, "WARN"),
-        ({"perception_confidence": 0.1}, "BAD"),
+        ({"latency_p95_ms": 143.0}, {}, "GOOD"),
+        ({"latency_p95_ms": 150.0}, {}, "BAD"),
+        ({}, {"road": 0.01}, "BAD"),
+        ({}, {"confidence": 0.3}, "WARN"),
+        ({}, {"confidence": 0.1}, "BAD"),
     ],
 )
-def test_other_metric_colours_follow_the_dashboard_bands(renderer, overrides, expected):
-    result = _result()
+def test_other_metric_colours_follow_the_bands(renderer, telemetry, gauges, expected):
+    frame = renderer.render(_output(**gauges), _telemetry(**telemetry), _orbit())
 
-    frame = renderer.render(result, _telemetry(**overrides), _orbit(), result.plan, None)
-
-    assert _count_color(_crop(frame, STATS_CARD), COLORS[expected]) > 0
+    assert count_color(_crop(frame, STATS_CARD), COLORS[expected]) > 0
 
 
 def test_static_layer_is_built_once_and_never_drawn_on(monkeypatch):
@@ -190,10 +160,9 @@ def test_static_layer_is_built_once_and_never_drawn_on(monkeypatch):
     monkeypatch.setattr(PresentationRenderer, "_build_static", counting)
     renderer = PresentationRenderer()
     before = renderer._static.copy()
-    result = _result()
 
-    renderer.render(result, _telemetry(), _orbit(), result.plan, None)
-    renderer.render(result, _telemetry(autopilot_active=False), None, None, None)
+    renderer.render(_output(), _telemetry(), _orbit())
+    renderer.render(_output(), _telemetry(autopilot_active=False), None)
 
     assert len(calls) == 1
     assert np.array_equal(renderer._static, before)
@@ -216,21 +185,18 @@ def test_presentation_alone_does_not_record_the_dashboard():
 
 
 @pytest.mark.parametrize("record", [False, True])
-def test_live_presentation_displays_orbit_and_handles_stop_resume_and_close(monkeypatch, record):
+def test_live_presentation_displays_orbit_and_handles_stop_resume_and_close(run_harness, record):
     from unittest.mock import Mock
 
-    import offroad_autonomy.main as app
-    from offroad_autonomy.runtime.timing import RuntimeStats
-    from offroad_autonomy.types import PipelineConfig, VehicleState
-    from tests.test_dashboard import _result as captured_result
+    from offroad_autonomy.contract import camera_sensor
+    from offroad_autonomy.types import DEFAULT_CAMERA, CameraFrame, HarnessConfig, VehicleState
 
-    cfg = PipelineConfig(ui_display_async=False)
-    client, pipeline, window, video = Mock(), Mock(), Mock(), Mock()
-    result = captured_result()
-    pipeline.stats = RuntimeStats()
-    pipeline.ego_coverage = 0.0
-    pipeline.step_result.return_value = result
-    client.capture_frame.return_value = result.capture
+    cfg = HarnessConfig(ui_display_async=False)
+    client, stack, window, video = Mock(), Mock(), Mock(), Mock()
+    sensors = [camera_sensor(DEFAULT_CAMERA)]
+    stack.sensors.return_value = sensors
+    stack.step.return_value = _output()
+    client.capture.return_value = {"dashcam": CameraFrame(image=np.zeros((620, 960, 3), np.uint8))}
     client.capture_orbit.return_value = _orbit()
     client.get_vehicle_state.return_value = VehicleState()
     window.backend = "tkinter"
@@ -246,28 +212,30 @@ def test_live_presentation_displays_orbit_and_handles_stop_resume_and_close(monk
     client_factory = Mock(return_value=client)
     open_window = Mock(return_value=window)
     open_video = Mock(return_value=video)
-    argv = ["offroad-autonomy", "--presentation-view"]
+    argv = ["--presentation-view"]
     if record:
         argv.append("--presentation")
-    monkeypatch.setattr("sys.argv", argv)
-    monkeypatch.setattr(app, "setup_logger", lambda **kwargs: None)
-    monkeypatch.setattr(app, "load_config", lambda _: cfg)
-    monkeypatch.setattr(app, "BeamNGClient", client_factory)
-    monkeypatch.setattr(app, "AutonomyPipeline", lambda _: pipeline)
-    monkeypatch.setattr(app, "_open_window", open_window)
-    monkeypatch.setattr(app, "_open_video", open_video)
-    monkeypatch.setattr(app, "_build_dashboard_telemetry", lambda *args: _telemetry())
-    monkeypatch.setattr(app.signal, "signal", Mock())
-    app.main()
+    run_harness(
+        stack,
+        client,
+        argv,
+        cfg,
+        BeamNGClient=client_factory,
+        _open_window=open_window,
+        _open_video=open_video,
+        _build_dashboard_telemetry=lambda *args: _telemetry(),
+    )
 
-    client_factory.assert_called_once_with(cfg, orbit=True)
+    client_factory.assert_called_once_with(cfg, sensors, orbit=True)
     open_window.assert_called_once_with(1920, 1080)
     assert len(canvases) == 3
     assert all(canvas.shape == (1080, 1920, 3) for canvas in canvases)
     orbit = _crop(canvases[0], ORBIT_VIEW)
-    assert _count_color(orbit, (200, 200, 200)) > 0.9 * orbit.shape[0] * orbit.shape[1]
+    assert count_color(orbit, (200, 200, 200)) > 0.9 * orbit.shape[0] * orbit.shape[1]
     client.park.assert_called_once()
     client.release_park.assert_called_once()
+    # Resuming hands the stack a fresh start: the vehicle may have been moved by hand.
+    stack.reset.assert_called_once()
     window.close.assert_called_once()
     client.disconnect.assert_called_once()
     if record:

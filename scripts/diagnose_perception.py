@@ -38,15 +38,21 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from offroad_autonomy.stacks.mono_yoloe.config import (
+    load_pipeline_config,
+    load_pipeline_config_file,
+)
 from offroad_autonomy.utils.config import load_config
 
 logger = logging.getLogger("diagnose")
 
 
 def capture(args: argparse.Namespace) -> None:
+    from offroad_autonomy.contract import camera_sensor
     from offroad_autonomy.simulation.beamng_client import BeamNGClient
 
     config = load_config(args.config)
+    camera = load_pipeline_config(config.stack_config).camera
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     spawns = config.map_spawns.get(config.beamng_map, {}).get("spawns", [None])
@@ -54,7 +60,7 @@ def capture(args: argparse.Namespace) -> None:
     if args.spawn < 0:
         indices = list(range(len(spawns)))
 
-    client = BeamNGClient(replace(config, beamng_spawn_index=indices[0]))
+    client = BeamNGClient(replace(config, beamng_spawn_index=indices[0]), [camera_sensor(camera)])
     try:
         client.connect()
         for index in indices:
@@ -66,7 +72,10 @@ def capture(args: argparse.Namespace) -> None:
             time.sleep(1.0)
             cfg = config
             for shot in range(args.frames):
-                frame = client.capture_frame()
+                frames = client.capture()
+                frame = None
+                if frames is not None:
+                    frame = frames[camera.name]
                 if frame is None or frame.image is None:
                     logger.warning("spawn %d shot %d: no frame", index, shot)
                     continue
@@ -122,7 +131,7 @@ def analyze(args: argparse.Namespace) -> None:
     from offroad_autonomy.preprocessing.image_preprocessor import ImagePreprocessor
     from offroad_autonomy.types import VehicleState
 
-    config = load_config(args.config)
+    config = load_pipeline_config_file(args.config)
     if args.conf is not None:
         config = replace(config, confidence_threshold=args.conf)
     if args.no_clahe:
@@ -257,10 +266,10 @@ def _bottom_x(plan) -> float | None:
 
 def full(args: argparse.Namespace) -> None:
     """Run the RGB pipeline on saved dashcam frames."""
-    from offroad_autonomy.pipeline import AutonomyPipeline
+    from offroad_autonomy.stacks.mono_yoloe.pipeline import AutonomyPipeline
     from offroad_autonomy.types import CameraFrame, VehicleState
 
-    config = load_config(args.config)
+    config = load_pipeline_config_file(args.config)
     pipeline = AutonomyPipeline(config)
     src = Path(args.src)
     out_root = Path(args.out)

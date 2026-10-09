@@ -1,33 +1,44 @@
 # Off-Road Autonomy
 
-Autonomous off-road driving in BeamNG.tech: a YOLOE-26 model segments the drivable trail,
-a planner fits a centreline on the ground, and a Stanley controller steers. The single
-idea behind the design is that the control loop never waits for anything slow: the
-dashboard runs on its own thread. Perception uses RGB only.
+Autonomous off-road driving in BeamNG.tech. A fixed harness (simulator I/O, loop, safety,
+dashboard, scoring) runs a swappable driving stack chosen by the config. Each stack is
+documented in `docs/stacks/<stack>/`. The single idea behind the design is that the control
+loop never waits for anything slow: the dashboard runs on its own thread.
 
 ## Architecture
 
 Keep these boundaries clear:
 
-- `simulation/`: all BeamNG I/O. The only package that imports `beamngpy`.
-- `perception/`: segmentation, camera geometry, ego masking.
-- `planning/`: the perception gate, then the baseline, advanced or bird's-eye grid planner.
-- `control/`: Stanley steering and the speed law, all computed in metres on the ground.
-- `runtime/`: the dashboard worker thread, timing, benchmarks.
-- `visualization/`: the operator dashboard and window.
-- `pipeline.py` orders the stages; `main.py` owns the loop, safe stop and shutdown.
+- `contract.py`: the only types the harness and a stack share (`DrivingStack`, `SensorSpec`,
+  `Observation`, `StackOutput` and the visual primitives).
+- `main.py`: the harness loop, safe stop, manual override and shutdown.
+- `simulation/`: all BeamNG I/O. The only package that imports `beamngpy`. Attaches the
+  sensors the stack declares.
+- `runtime/`: the dashboard worker thread, timing, reference routes and ground-truth benchmarks.
+- `visualization/`: the operator dashboard and window, drawn only from visual primitives.
+- `stacks/`: one package per driving stack, each with a `build(stack_config)` function and
+  its own defaults.
+- `perception/`, `planning/`, `control/`: parts stacks may share; nothing requires them to.
 
 Rules that carry weight:
 
-- Nothing outside `simulation/` may import `beamngpy`, so the stack stays testable without
+- Nothing outside `simulation/` may import `beamngpy`, so every stack stays testable without
   a simulator.
-- The single GMSL2 dashcam supplies every stage. The dashboard consumes the same
-  inference snapshot and never captures a separate image.
+- The harness never imports a stack's internal types, and the dashboard and benchmark never
+  read them: a stack talks to the harness only through `contract.py`. Adding a stack must not
+  change the harness, dashboard or benchmark.
+- The benchmark scores from simulator ground truth, never from what a stack reports.
+- Safety stays in the harness. A stack may ask for a safe stop but can never disable one.
+- A stack's `step` must return within the loop budget; slow work belongs on its own worker,
+  and a costly debug image is an `ImageLayer` whose image is a function.
+- Each stack's own rules and checks are in `docs/stacks/<stack>/README.md`. Read it before
+  changing that stack, and keep it current when the stack changes.
 - `perception/__init__.py` must never import `RoadSegmenter`, because that pulls in Torch
   and Ultralytics for code that only needs geometry.
 - The control loop must never block on the dashboard.
-- Every tuning value lives in `configs/default.yaml` with its reason next to it, not as a
-  literal in code.
+- Every tuning value lives in a config with its reason next to it, not as a literal in code:
+  harness values in `configs/default.yaml`, stack values in that stack's own defaults.
+  Both are validated strictly, so a new key must be added there before it can be set.
 - Machine-specific simulator settings stay `auto` and resolve in `utils/environment.py`;
   never write a host, install path or transport for one machine into a config.
 
@@ -77,7 +88,6 @@ self.park()
 - Do not add infrastructure, dependencies, interfaces, or abstractions without a concrete
   need.
 - Add tests for meaningful behavior and failure cases.
-- Re-run `scripts/sbend_sim.py` after any change to the controller or its config.
 - Keep changes scoped to the task being implemented.
 - Update documentation when behavior or architecture changes.
 - Do not claim unfinished functionality is implemented, and do not quote performance
@@ -91,9 +101,10 @@ Run the relevant repository checks and fix all failures:
 ruff check src tests scripts
 ruff format --check src tests scripts
 pytest --cov
-python scripts/sbend_sim.py
 python -m build
 ```
+
+Also run the checks listed in the doc of any stack you changed.
 
 Review the final diff for unnecessary code, unused dependencies, style violations, secrets,
 and accidental scope expansion.

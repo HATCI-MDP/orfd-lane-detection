@@ -213,9 +213,9 @@ def test_explicit_config_never_inspects_the_machine(tmp_path):
 
 def test_connect_without_a_host_names_beamng_host():
     from offroad_autonomy.simulation.beamng_client import BeamNGClient
-    from offroad_autonomy.types import PipelineConfig
+    from offroad_autonomy.types import HarnessConfig
 
-    client = BeamNGClient(PipelineConfig(beamng_host=""))
+    client = BeamNGClient(HarnessConfig(beamng_host=""), [])
     with pytest.raises(RuntimeError, match="BEAMNG_HOST"):
         client.connect()
 

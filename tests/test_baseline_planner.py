@@ -55,9 +55,9 @@ def test_gate_rejects_low_confidence():
 def test_shipped_gate_accepts_connected_road_at_screenshot_confidence():
     from pathlib import Path
 
-    from offroad_autonomy.utils.config import load_config
+    from offroad_autonomy.stacks.mono_yoloe.config import load_pipeline_config_file
 
-    cfg = load_config(Path(__file__).resolve().parents[1] / "configs/default.yaml")
+    cfg = load_pipeline_config_file(Path(__file__).resolve().parents[1] / "configs/default.yaml")
     gate = PerceptionGate(cfg)
     assert gate.evaluate(_stabilized(_road(), confidences=(0.19,))).ok
     assert not gate.evaluate(_stabilized(_road(), confidences=(0.1,))).ok
@@ -159,9 +159,9 @@ def test_widening_road_above_hood_keeps_a_continuous_drivable_path(mirror):
     from pathlib import Path
 
     from offroad_autonomy.perception.ego_mask import EgoMask
-    from offroad_autonomy.utils.config import load_config
+    from offroad_autonomy.stacks.mono_yoloe.config import load_pipeline_config_file
 
-    config = load_config(Path(__file__).resolve().parents[1] / "configs/default.yaml")
+    config = load_pipeline_config_file(Path(__file__).resolve().parents[1] / "configs/default.yaml")
     valid = EgoMask(config.camera.ego_mask).valid_roi((H, W))
     mask = np.zeros((H, W), dtype=bool)
     for y in range(232, H):
@@ -190,9 +190,9 @@ def test_sideways_patch_without_visible_continuation_still_stops():
     from pathlib import Path
 
     from offroad_autonomy.perception.ego_mask import EgoMask
-    from offroad_autonomy.utils.config import load_config
+    from offroad_autonomy.stacks.mono_yoloe.config import load_pipeline_config_file
 
-    config = load_config(Path(__file__).resolve().parents[1] / "configs/default.yaml")
+    config = load_pipeline_config_file(Path(__file__).resolve().parents[1] / "configs/default.yaml")
     valid = EgoMask(config.camera.ego_mask).valid_roi((H, W))
     mask = np.zeros((H, W), dtype=bool)
     mask[310:, 280:440] = True

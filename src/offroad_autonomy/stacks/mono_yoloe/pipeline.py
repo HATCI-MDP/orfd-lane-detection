@@ -1,11 +1,9 @@
-"""Stage orchestration: preprocess, segment, stabilise, plan and control."""
+"""The mono_yoloe stages in order: preprocess, segment, stabilise, plan and control."""
 
 from __future__ import annotations
 
 import logging
 import time
-
-import numpy as np
 
 from offroad_autonomy.control.stanley_controller import StanleyController
 from offroad_autonomy.perception.perception_view import PerceptionView
@@ -13,23 +11,14 @@ from offroad_autonomy.perception.road_segmenter import RoadSegmenter
 from offroad_autonomy.planning.centerline_planner import CenterlinePlanner
 from offroad_autonomy.postprocessing.temporal_stabilizer import TemporalStabilizer
 from offroad_autonomy.preprocessing.image_preprocessor import ImagePreprocessor
-from offroad_autonomy.runtime.timing import RuntimeStats
-from offroad_autonomy.types import (
-    CameraFrame,
-    ControlCommand,
-    PipelineConfig,
-    PipelineStepResult,
-    VehicleState,
-)
+from offroad_autonomy.types import CameraFrame, PipelineConfig, PipelineStepResult, VehicleState
 
-logger = logging.getLogger("offroad_autonomy.pipeline")
+logger = logging.getLogger("offroad_autonomy.stacks.mono_yoloe")
 
 
 class AutonomyPipeline:
     def __init__(self, config: PipelineConfig) -> None:
         logger.info("Initialising pipeline stages")
-        self.stats = RuntimeStats()
-
         self.view = PerceptionView(config)
         self.valid_roi = self.view.valid_roi
         self.preprocessor = ImagePreprocessor(config, target_size=self.view.size)
@@ -42,34 +31,13 @@ class AutonomyPipeline:
     def ego_coverage(self) -> float:
         return self.view.ego_coverage
 
-    def has_input(self, frames: CameraFrame | np.ndarray) -> bool:
-        capture = self._as_capture(frames)
-        return capture.image is not None
-
-    def step(
-        self,
-        frames: CameraFrame | np.ndarray,
-        vehicle_state: VehicleState,
-    ) -> ControlCommand:
-        return self.step_result(frames, vehicle_state).command
-
-    def step_result(
-        self,
-        frames: CameraFrame | np.ndarray,
-        vehicle_state: VehicleState,
-    ) -> PipelineStepResult:
-        capture = self._as_capture(frames)
+    def step_result(self, capture: CameraFrame, vehicle_state: VehicleState) -> PipelineStepResult:
+        if capture.image is None:
+            raise ValueError("No frame available to segment")
         timings: dict[str, float] = {}
-
-        image = self.view.image(capture)
-        if image is None:
-            raise ValueError(
-                f"No frame available for '{self.view.mode}' segmentation; "
-                "check has_input() before stepping"
-            )
         t1 = time.perf_counter()
 
-        frame = self.preprocessor.process(image)
+        frame = self.preprocessor.process(capture.image)
         t2 = time.perf_counter()
         timings["preprocess"] = (t2 - t1) * 1000.0
 
@@ -81,18 +49,12 @@ class AutonomyPipeline:
         t4 = time.perf_counter()
         timings["postprocess"] = (t4 - t3) * 1000.0
 
-        plan = self.planner.plan(
-            stabilized,
-            vehicle_state=vehicle_state,
-        )
+        plan = self.planner.plan(stabilized, vehicle_state=vehicle_state)
         t5 = time.perf_counter()
         timings["planning"] = (t5 - t4) * 1000.0
 
         command = self.controller.compute(plan, vehicle_state)
-        t6 = time.perf_counter()
-        timings["control"] = (t6 - t5) * 1000.0
-
-        self.stats.record_many(timings)
+        timings["control"] = (time.perf_counter() - t5) * 1000.0
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -113,12 +75,6 @@ class AutonomyPipeline:
             capture=capture,
             timings_ms=timings,
         )
-
-    def _as_capture(self, frames: CameraFrame | np.ndarray) -> CameraFrame:
-        """Bare frames are accepted so monocular tools can drive the pipeline."""
-        if isinstance(frames, CameraFrame):
-            return frames
-        return CameraFrame(image=frames, timestamp=time.perf_counter())
 
     def reset(self) -> None:
         self.stabilizer.reset()

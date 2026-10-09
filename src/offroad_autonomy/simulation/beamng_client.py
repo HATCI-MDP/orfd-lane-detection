@@ -14,11 +14,12 @@ import zlib
 import cv2
 import numpy as np
 
+from offroad_autonomy.contract import SensorSpec, camera_spec, validate_sensors
 from offroad_autonomy.types import (
     CameraFrame,
     CameraSpec,
     ControlCommand,
-    PipelineConfig,
+    HarnessConfig,
     VehicleState,
 )
 from offroad_autonomy.utils.environment import LOCAL_HOSTS
@@ -34,8 +35,19 @@ class BeamNGConnectionError(RuntimeError):
 
 
 class BeamNGClient:
-    def __init__(self, config: PipelineConfig, orbit: bool = False) -> None:
+    def __init__(
+        self,
+        config: HarnessConfig,
+        sensors: list[SensorSpec],
+        orbit: bool = False,
+    ) -> None:
+        # Validated here, not on connect, so a stack asking for a sensor this
+        # adapter cannot attach fails before a map is loaded.
+        validate_sensors(sensors)
         self._config = config
+        self._specs: dict[str, CameraSpec] = {
+            sensor.name: camera_spec(sensor) for sensor in sensors
+        }
         # A flag rather than a config switch: the orbit camera costs capture
         # time in the loop, so only a run showing or recording a presentation pays it.
         self._orbit = orbit
@@ -43,7 +55,7 @@ class BeamNGClient:
         self._vehicle = None
         self._cameras: dict[str, object] = {}
         self._frame_id = 0
-        self._last_signature: int | None = None
+        self._last_signatures: dict[str, int | None] = {}
         self._shared_memory = config.beamng_camera_transport == "shared_memory"
 
     def connect(self) -> None:
@@ -115,11 +127,14 @@ class BeamNGClient:
         # render a bouncing horizon that the first plans would steer on.
         time.sleep(_PHYSICS_SETTLE_S)
 
-        spec = cfg.camera
-        self._cameras["dashcam"] = self._attach_camera(Camera, vehicle, spec)
-        logger.info(
-            "Attaching dashcam (%s): %s", cfg.beamng_camera_transport, spec.sensor.describe()
-        )
+        for name, spec in self._specs.items():
+            self._cameras[name] = self._attach_camera(Camera, vehicle, spec)
+            logger.info(
+                "Attaching camera '%s' (%s): %s",
+                name,
+                cfg.beamng_camera_transport,
+                spec.sensor.describe(),
+            )
         if self._orbit:
             orbit = cfg.orbit_camera
             self._cameras["orbit"] = self._attach_camera(Camera, vehicle, orbit)
@@ -154,25 +169,38 @@ class BeamNGClient:
             is_streaming=self._shared_memory,
         )
 
-    def capture_frame(self) -> CameraFrame | None:
+    def capture(self) -> dict[str, CameraFrame] | None:
+        """One reading of every sensor the stack declared, or None if any is
+        missing: a stack is never handed an observation with a hole in it."""
+        frames: dict[str, CameraFrame] = {}
+        for name, spec in self._specs.items():
+            frame = self._capture_camera(name, spec)
+            if frame is None:
+                return None
+            frames[name] = frame
+        self._frame_id += 1
+        for frame in frames.values():
+            frame.frame_id = self._frame_id
+        return frames
+
+    def _capture_camera(self, name: str, spec: CameraSpec) -> CameraFrame | None:
         # Copy shared memory before decoding so display and inference keep
         # the same immutable snapshot even when BeamNG renders again.
-        buffer = self._live_buffer("dashcam")
+        buffer = self._live_buffer(name)
         if buffer is None:
             return None
         timestamp = time.perf_counter()
         snapshot = bytes(buffer)
-        image = self._decode(snapshot, self._config.camera)
+        image = self._decode(snapshot, spec)
         if image is None:
             return None
         signature = frame_signature(snapshot)
-        is_new = signature != self._last_signature
-        self._last_signature = signature
-        self._frame_id += 1
-        return CameraFrame(image=image, timestamp=timestamp, frame_id=self._frame_id, is_new=is_new)
+        is_new = signature != self._last_signatures.get(name)
+        self._last_signatures[name] = signature
+        return CameraFrame(image=image, timestamp=timestamp, is_new=is_new)
 
     def capture_orbit(self) -> np.ndarray | None:
-        """For the presentation view and video; no pipeline stage reads it.
+        """For the presentation view and video; no stack reads it.
 
         Called from the main loop, never the dashboard thread: the socket
         transport is not thread safe."""
@@ -324,7 +352,7 @@ class BeamNGClient:
         self._vehicle = None
         logger.info("BeamNG session closed")
 
-    def _resolve_spawn(self, cfg: PipelineConfig) -> tuple[tuple, tuple]:
+    def _resolve_spawn(self, cfg: HarnessConfig) -> tuple[tuple, tuple]:
         map_cfg = cfg.map_spawns.get(cfg.beamng_map)
         if map_cfg and "spawns" in map_cfg:
             spawns = map_cfg["spawns"]

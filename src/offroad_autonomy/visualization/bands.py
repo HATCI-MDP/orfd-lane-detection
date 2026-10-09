@@ -24,15 +24,28 @@ def latency_level(p95_ms: float, budget_ms: float) -> str:
     return BAD
 
 
-def confidence_level(confidence: float, floor: float, good: float) -> str:
-    if confidence < floor:
+def gauge_level(value: float, thresholds: tuple[float, ...]) -> str | None:
+    """A stack gauge's level: below the first threshold is bad, below the
+    second a warning. ``None`` for a gauge with no thresholds, which is a
+    plain reading rather than a health measure."""
+    if not thresholds:
+        return None
+    if value < thresholds[0]:
         return BAD
-    if confidence < good:
+    if len(thresholds) > 1 and value < thresholds[1]:
         return WARN
     return GOOD
 
 
-def road_level(road_fraction: float, floor: float) -> str:
-    if road_fraction < floor:
-        return BAD
-    return GOOD
+def fps_note(level: str, target_fps: float) -> str:
+    if level == GOOD:
+        return "On Target"
+    if level == WARN:
+        return f"Slightly Below {target_fps:g} Fps Target"
+    return f"Below {target_fps:g} Fps Target"
+
+
+def latency_note(level: str, budget_ms: float) -> str:
+    if level == GOOD:
+        return f"Within {budget_ms:.0f} Ms Budget"
+    return f"Over {budget_ms:.0f} Ms Budget"

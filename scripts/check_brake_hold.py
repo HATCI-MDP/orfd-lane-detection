@@ -26,7 +26,8 @@ def main():
     parser.add_argument("--reproduce-arcade", action="store_true")
     parser.add_argument("--out", default="output/diagnostics/brake_hold.json")
     args = parser.parse_args()
-    client = BeamNGClient(load_config(args.config))
+    # No sensors: the test drives the vehicle blind and reads only its state.
+    client = BeamNGClient(load_config(args.config), [])
     rows = []
 
     def sample(phase, command, seconds):

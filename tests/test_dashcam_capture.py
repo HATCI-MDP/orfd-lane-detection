@@ -1,4 +1,4 @@
-"""Single-camera attachment and shared inference/display capture."""
+"""Sensor attachment from a stack's declaration, and shared capture."""
 
 from dataclasses import replace
 from unittest.mock import MagicMock, call, patch
@@ -6,8 +6,18 @@ from unittest.mock import MagicMock, call, patch
 import numpy as np
 import pytest
 
+from offroad_autonomy.contract import SensorSpec, camera_sensor
 from offroad_autonomy.simulation.beamng_client import BeamNGClient, BeamNGConnectionError
-from offroad_autonomy.types import PipelineConfig
+from offroad_autonomy.types import DEFAULT_CAMERA, HarnessConfig
+
+DASHCAM = camera_sensor(DEFAULT_CAMERA)
+
+
+def _small_dashcam(name: str = "dashcam") -> SensorSpec:
+    camera = replace(
+        DEFAULT_CAMERA, name=name, sensor=replace(DEFAULT_CAMERA.sensor, width=4, height=2)
+    )
+    return camera_sensor(camera)
 
 
 @pytest.mark.parametrize(
@@ -22,8 +32,8 @@ from offroad_autonomy.types import PipelineConfig
 def test_connection_failure_explains_endpoint_and_recovery(host, launch, hint, error_type):
     from beamngpy.logging import BNGDisconnectedError
 
-    cfg = PipelineConfig(beamng_host=host, beamng_port=65432, beamng_launch=launch)
-    client = BeamNGClient(cfg)
+    cfg = HarnessConfig(beamng_host=host, beamng_port=65432, beamng_launch=launch)
+    client = BeamNGClient(cfg, [DASHCAM])
     error = BNGDisconnectedError("refused") if error_type == "disconnected" else OSError("refused")
     with patch("beamngpy.BeamNGpy") as bng, patch("beamngpy.Scenario") as scenario:
         bng.return_value.open.side_effect = error
@@ -44,9 +54,9 @@ def test_connection_failure_explains_endpoint_and_recovery(host, launch, hint, e
 
 @pytest.mark.parametrize("headless", [True, False])
 @pytest.mark.parametrize("transport", ["shared_memory", "socket"])
-def test_connect_attaches_only_the_dashcam(headless, transport):
-    cfg = PipelineConfig(ui_headless=headless, beamng_camera_transport=transport)
-    client = BeamNGClient(cfg)
+def test_connect_attaches_only_the_declared_dashcam(headless, transport):
+    cfg = HarnessConfig(ui_headless=headless, beamng_camera_transport=transport)
+    client = BeamNGClient(cfg, [DASHCAM])
     with (
         patch("beamngpy.BeamNGpy"),
         patch("beamngpy.Scenario"),
@@ -59,9 +69,9 @@ def test_connect_attaches_only_the_dashcam(headless, transport):
         camera.assert_called_once()
         args = camera.call_args.kwargs
         assert args["name"] == "dashcam"
-        assert args["pos"] == cfg.camera.pos
+        assert args["pos"] == DEFAULT_CAMERA.pos
         assert args["resolution"] == (960, 620)
-        assert args["field_of_view_y"] == pytest.approx(cfg.camera.fov_y_deg)
+        assert args["field_of_view_y"] == pytest.approx(DEFAULT_CAMERA.fov_y_deg)
         assert args["is_render_colours"]
         assert not args["is_render_annotations"]
         assert not args["is_render_instance"]
@@ -74,11 +84,41 @@ def test_connect_attaches_only_the_dashcam(headless, transport):
         camera.return_value.remove.assert_called_once()
 
 
+def test_connect_attaches_every_camera_a_stack_declares():
+    left = camera_sensor(replace(DEFAULT_CAMERA, name="left", pos=(0.4, -0.3, 1.85)))
+    right = camera_sensor(replace(DEFAULT_CAMERA, name="right", pos=(-0.4, -0.3, 1.85)))
+    client = BeamNGClient(HarnessConfig(), [left, right])
+    with (
+        patch("beamngpy.BeamNGpy"),
+        patch("beamngpy.Scenario"),
+        patch("beamngpy.Vehicle") as vehicle_cls,
+        patch("beamngpy.sensors.camera.Camera") as camera,
+        patch("offroad_autonomy.simulation.beamng_client.time.sleep"),
+    ):
+        vehicle_cls.return_value.queue_lua_command.return_value = "manualGearbox"
+        client.connect()
+        attached = {call.kwargs["name"]: call.kwargs["pos"] for call in camera.call_args_list}
+        assert attached == {"left": (0.4, -0.3, 1.85), "right": (-0.4, -0.3, 1.85)}
+        client.disconnect()
+
+
+@pytest.mark.parametrize(
+    ("sensors", "match"),
+    [
+        ([SensorSpec("lidar", "lidar", {})], "supports"),
+        ([DASHCAM, DASHCAM], "unique"),
+        ([camera_sensor(replace(DEFAULT_CAMERA, name="orbit"))], "reserved"),
+        ([SensorSpec("dashcam", "camera", {"pos": (0, 0, 1)})], "missing"),
+    ],
+)
+def test_sensors_the_adapter_cannot_attach_fail_before_connecting(sensors, match):
+    with pytest.raises(ValueError, match=match):
+        BeamNGClient(HarnessConfig(), sensors)
+
+
 @pytest.mark.parametrize("transport", ["shared_memory", "socket"])
-def test_capture_reads_one_sensor_and_owns_its_pixels(transport):
-    cfg = PipelineConfig(beamng_camera_transport=transport)
-    cfg.camera = replace(cfg.camera, sensor=replace(cfg.camera.sensor, width=4, height=2))
-    client = BeamNGClient(cfg)
+def test_capture_reads_each_sensor_and_owns_its_pixels(transport):
+    client = BeamNGClient(HarnessConfig(beamng_camera_transport=transport), [_small_dashcam()])
     sensor = MagicMock()
     rgba = np.zeros((2, 4, 4), dtype=np.uint8)
     rgba[:] = (11, 22, 33, 255)
@@ -87,12 +127,12 @@ def test_capture_reads_one_sensor_and_owns_its_pixels(transport):
     sensor.poll_raw.return_value = {"colour": buffer}
     client._cameras = {"dashcam": sensor}
 
-    first = client.capture_frame()
+    first = client.capture()["dashcam"]
     assert first.is_new
     assert first.image[0, 0].tolist() == [33, 22, 11]
-    assert not client.capture_frame().is_new
+    assert not client.capture()["dashcam"].is_new
     buffer[0] = 99
-    third = client.capture_frame()
+    third = client.capture()["dashcam"]
     assert third.is_new
     assert third.frame_id == first.frame_id + 2
     assert first.image[0, 0].tolist() == [33, 22, 11]
@@ -105,20 +145,32 @@ def test_capture_reads_one_sensor_and_owns_its_pixels(transport):
         sensor.poll_raw.assert_not_called()
 
 
-def test_missing_or_malformed_dashcam_frame_is_rejected():
-    client = BeamNGClient(PipelineConfig())
-    assert client.capture_frame() is None
+def test_missing_or_malformed_frame_is_rejected():
+    client = BeamNGClient(HarnessConfig(), [DASHCAM])
+    assert client.capture() is None
     sensor = MagicMock()
     sensor.colour_shmem.read.return_value = b"bad frame"
     client._cameras = {"dashcam": sensor}
-    assert client.capture_frame() is None
+    assert client.capture() is None
+
+
+def test_one_missing_camera_withholds_the_whole_observation():
+    client = BeamNGClient(HarnessConfig(), [_small_dashcam("left"), _small_dashcam("right")])
+    good = MagicMock()
+    good.colour_shmem.read.return_value = np.zeros((2, 4, 4), dtype=np.uint8).tobytes()
+    missing = MagicMock()
+    missing.colour_shmem.read.return_value = None
+    client._cameras = {"left": good, "right": missing}
+
+    assert client.capture() is None
+    client._cameras["right"] = good
+    frames = client.capture()
+    assert set(frames) == {"left", "right"}
 
 
 @pytest.mark.parametrize("transport", ["shared_memory", "socket"])
 def test_annotation_depth_and_orbit_buffers_cannot_replace_dashcam_rgb(transport):
-    cfg = PipelineConfig(beamng_camera_transport=transport)
-    cfg.camera = replace(cfg.camera, sensor=replace(cfg.camera.sensor, width=4, height=2))
-    client = BeamNGClient(cfg)
+    client = BeamNGClient(HarnessConfig(beamng_camera_transport=transport), [_small_dashcam()])
     sensor, orbit = MagicMock(), MagicMock()
     rgb = np.full((2, 4, 4), [11, 22, 33, 255], dtype=np.uint8).tobytes()
     labels = np.full((2, 4, 4), 255, dtype=np.uint8).tobytes()
@@ -133,11 +185,11 @@ def test_annotation_depth_and_orbit_buffers_cannot_replace_dashcam_rgb(transport
         "depth": labels,
     }
     client._cameras = {"dashcam": sensor, "orbit": orbit}
-    captured = client.capture_frame()
+    captured = client.capture()["dashcam"]
     np.testing.assert_array_equal(captured.image, np.full((2, 4, 3), [33, 22, 11], dtype=np.uint8))
     sensor.colour_shmem.read.return_value = None
     sensor.poll_raw.return_value.pop("colour")
-    assert client.capture_frame() is None  # No fallback to the available privileged buffers.
+    assert client.capture() is None  # No fallback to the available privileged buffers.
     sensor.annotation_shmem.read.assert_not_called()
     sensor.instance_shmem.read.assert_not_called()
     sensor.depth_shmem.read.assert_not_called()
@@ -145,7 +197,7 @@ def test_annotation_depth_and_orbit_buffers_cannot_replace_dashcam_rgb(transport
 
 
 def test_presentation_camera_also_disables_ground_truth_render_buffers():
-    client = BeamNGClient(PipelineConfig())
+    client = BeamNGClient(HarnessConfig(), [DASHCAM])
     camera = MagicMock()
     client._attach_camera(camera, MagicMock(), client._config.orbit_camera)
     flags = camera.call_args.kwargs
@@ -157,7 +209,7 @@ def test_presentation_camera_also_disables_ground_truth_render_buffers():
 
 @pytest.mark.parametrize("kind,gear", [("manualGearbox", 1), ("automaticGearbox", 2)])
 def test_resume_selects_forward_before_releasing_brakes(kind, gear):
-    client = BeamNGClient(PipelineConfig())
+    client = BeamNGClient(HarnessConfig(), [])
     vehicle = MagicMock()
     client._vehicle = vehicle
     vehicle.queue_lua_command.return_value = kind
@@ -176,7 +228,7 @@ def test_resume_selects_forward_before_releasing_brakes(kind, gear):
 
 @pytest.mark.parametrize("failure_at", ["set_shift_mode", "queue_lua_command"])
 def test_failed_forward_setup_keeps_parking_brake_applied(failure_at):
-    client = BeamNGClient(PipelineConfig())
+    client = BeamNGClient(HarnessConfig(), [])
     vehicle = MagicMock()
     client._vehicle = vehicle
     getattr(vehicle, failure_at).side_effect = RuntimeError("connection lost")
@@ -186,7 +238,7 @@ def test_failed_forward_setup_keeps_parking_brake_applied(failure_at):
 
 
 def test_unknown_gearbox_is_not_released():
-    client = BeamNGClient(PipelineConfig())
+    client = BeamNGClient(HarnessConfig(), [])
     client._vehicle = MagicMock()
     client._vehicle.queue_lua_command.return_value = "unsupported"
     with pytest.raises(RuntimeError, match="Unsupported forward-drive gearbox"):

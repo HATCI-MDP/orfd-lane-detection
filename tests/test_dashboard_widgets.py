@@ -27,16 +27,20 @@ def test_latency_is_good_up_to_the_budget_and_bad_after():
 
 
 @pytest.mark.parametrize(
-    ("confidence", "expected"),
+    ("value", "expected"),
     [(0.17, bands.BAD), (0.18, bands.WARN), (0.49, bands.WARN), (0.5, bands.GOOD)],
 )
-def test_confidence_bands_follow_the_gate_floor(confidence, expected):
-    assert bands.confidence_level(confidence, 0.18, 0.5) == expected
+def test_two_thresholds_band_a_gauge_into_bad_warn_and_good(value, expected):
+    assert bands.gauge_level(value, (0.18, 0.5)) == expected
 
 
-def test_road_fraction_below_the_floor_is_bad():
-    assert bands.road_level(0.014, 0.015) == bands.BAD
-    assert bands.road_level(0.015, 0.015) == bands.GOOD
+def test_one_threshold_is_bad_below_and_good_from_it():
+    assert bands.gauge_level(0.014, (0.015,)) == bands.BAD
+    assert bands.gauge_level(0.015, (0.015,)) == bands.GOOD
+
+
+def test_a_gauge_without_thresholds_has_no_health_level():
+    assert bands.gauge_level(0.0, ()) is None
 
 
 def test_layout_regions_fit_the_canvas_and_do_not_overlap():
@@ -46,7 +50,7 @@ def test_layout_regions_fit_the_canvas_and_do_not_overlap():
         layout.viewport,
         layout.runtime,
         layout.vehicle,
-        layout.perception,
+        layout.stack,
     ]
 
     for rect in regions:

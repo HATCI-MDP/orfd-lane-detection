@@ -47,7 +47,7 @@ class Layout:
     viewport: Rect
     runtime: Rect
     vehicle: Rect
-    perception: Rect
+    stack: Rect
     autonomy_fps: Rect
     latency: Rect
     dashboard_fps: Rect
@@ -64,7 +64,7 @@ def build_layout(width: int, height: int) -> Layout:
 
     sidebar_x = PAD + main_w + GAP
     vehicle = Rect(sidebar_x, content_top, SIDEBAR_W, VEHICLE_CARD_H)
-    perception = Rect(
+    stack = Rect(
         sidebar_x,
         vehicle.bottom + CARD_GAP,
         SIDEBAR_W,
@@ -87,7 +87,7 @@ def build_layout(width: int, height: int) -> Layout:
         viewport=viewport,
         runtime=runtime,
         vehicle=vehicle,
-        perception=perception,
+        stack=stack,
         autonomy_fps=autonomy_fps,
         latency=latency,
         dashboard_fps=dashboard_fps,

@@ -1,25 +1,21 @@
-"""The 1920 x 1080 presentation video frame: orbit view, dashcam overlay, stats.
+"""The 1920 x 1080 presentation video frame: orbit view, the stack's main view, stats.
 
 Shown live with ``--presentation-view`` or recorded with ``--presentation``.
-The dashcam overlay comes from the operator dashboard, so both draw the same thing.
+The main view comes from the operator dashboard, so both draw the same thing
+for any stack.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-from offroad_autonomy.types import (
-    DEFAULT_DASHBOARD_COLORS,
-    CameraSensor,
-    DashboardThresholds,
-    PathPlan,
-    PipelineStepResult,
-)
+from offroad_autonomy.contract import Gauge, SensorSpec, StackOutput
+from offroad_autonomy.types import DEFAULT_DASHBOARD_COLORS, DashboardThresholds
 from offroad_autonomy.visualization import bands
 from offroad_autonomy.visualization.dashboard import (
-    EGO_LABEL,
     AutonomyDashboard,
     DashboardTelemetry,
+    Scene,
 )
 from offroad_autonomy.visualization.layout import Rect
 from offroad_autonomy.visualization.text import (
@@ -41,11 +37,10 @@ from offroad_autonomy.visualization.text import (
 from offroad_autonomy.visualization.widgets import (
     blend_rect,
     blit_cover,
-    chip_height,
     cover_point,
+    draw_autonomy_chip,
     draw_bar,
     draw_centered_bar,
-    draw_chip,
     fill_rect,
     outline_rect,
 )
@@ -111,7 +106,7 @@ class PresentationRenderer:
     def __init__(
         self,
         colors: dict[str, tuple[int, int, int]] | None = None,
-        sensor: CameraSensor | None = None,
+        sensors: list[SensorSpec] | None = None,
         thresholds: DashboardThresholds | None = None,
     ) -> None:
         self.width = PRESENTATION_WIDTH
@@ -123,8 +118,8 @@ class PresentationRenderer:
         if colors is not None:
             self._colors.update(colors)
         # Its own instance: the presentation is drawn on a different thread
-        # from the operator dashboard, and the overlay keeps per-frame state.
-        self._dashboard = AutonomyDashboard(colors=colors, sensor=sensor, thresholds=thresholds)
+        # from the operator dashboard, and the overlay keeps caches.
+        self._dashboard = AutonomyDashboard(colors=colors, sensors=sensors, thresholds=thresholds)
         # Loaded here so a missing font stops startup, not the first frame.
         self._text = TextRenderer()
         self._text.preload(_ALL_STYLES)
@@ -134,22 +129,17 @@ class PresentationRenderer:
 
     def render(
         self,
-        result: PipelineStepResult,
+        output: StackOutput,
         telemetry: DashboardTelemetry,
         orbit_image: np.ndarray | None,
-        plan: PathPlan | None,
-        valid_roi: np.ndarray | None,
     ) -> np.ndarray:
         canvas = self._static.copy()
         active = telemetry.autopilot_active
-        # The caller already withholds the plan under safe stop; this keeps
-        # the video from ever showing a path the stack is not steering on.
-        if not active:
-            plan = None
-        self._draw_status_chip(canvas, active)
+        scene = Scene.of(output)
+        draw_autonomy_chip(canvas, self._text, self._colors, HEADER, _HEADER_INSET, active)
         self._draw_orbit_view(canvas, orbit_image, active)
-        self._draw_dashcam_card(canvas, result, plan, valid_roi)
-        self._draw_stats(canvas, telemetry)
+        self._draw_dashcam_card(canvas, scene, active)
+        self._draw_stats(canvas, telemetry, scene.gauges)
         return canvas
 
     # ----------------------------------------------------------- static layer
@@ -199,7 +189,8 @@ class PresentationRenderer:
             BODY,
             colors["TEXT_SECONDARY"],
         )
-        labels = ("AUTONOMY FPS", "LATENCY MEAN / P95", "ROAD / VALID PX", "SEG. CONFIDENCE")
+        # The stack's two gauges are labelled per frame: their names are the stack's.
+        labels = ("AUTONOMY FPS", "LATENCY MEAN / P95")
         for index, label in enumerate(labels):
             block_x, block_y = _metric_origin(left, top, index)
             self._text.draw(
@@ -213,26 +204,6 @@ class PresentationRenderer:
         return canvas
 
     # ----------------------------------------------------------------- header
-
-    def _draw_status_chip(self, canvas: np.ndarray, active: bool) -> None:
-        text = "AUTONOMY ACTIVE"
-        color = self._colors["GOOD"]
-        solid = False
-        if not active:
-            text = "SAFE STOP | MANUAL CONTROL"
-            color = self._colors["BAD"]
-            solid = True
-        draw_chip(
-            canvas,
-            self._text,
-            HEADER.right - _HEADER_INSET,
-            HEADER.y + (HEADER.h - chip_height(self._text)) // 2,
-            text,
-            color,
-            self._colors["BG"],
-            solid=solid,
-            align="right",
-        )
 
     # ------------------------------------------------------------------ views
 
@@ -248,24 +219,21 @@ class PresentationRenderer:
             blend_rect(canvas, ORBIT_VIEW, colors["BAD"], _SAFE_STOP_ALPHA)
             outline_rect(canvas, ORBIT_VIEW, colors["BAD"], _SAFE_STOP_BORDER)
 
-    def _draw_dashcam_card(
-        self,
-        canvas: np.ndarray,
-        result: PipelineStepResult,
-        plan: PathPlan | None,
-        valid_roi: np.ndarray | None,
-    ) -> None:
+    def _draw_dashcam_card(self, canvas: np.ndarray, scene: Scene, active: bool) -> None:
         colors = self._colors
         card = DASHCAM_CARD
-        overlay = self._dashboard.dashcam_overlay(result, plan, valid_roi)
-        transform = blit_cover(canvas, overlay.image, card)
-        if overlay.ego_label_px is not None:
-            x, y = cover_point(transform, overlay.ego_label_px)
-            self._text.draw(
-                canvas, EGO_LABEL, x, y, LABEL_SPACED, colors["TEXT_PRIMARY"], align="center"
-            )
+        if scene.layers:
+            # Under safe stop the main view leaves paths off, so the video
+            # never shows a path the stack is not steering on.
+            view = self._dashboard.main_view(scene, active)
+            transform = blit_cover(canvas, view.image, card)
+            for text, anchor in view.labels:
+                x, y = cover_point(transform, anchor)
+                self._text.draw(
+                    canvas, text, x, y, LABEL_SPACED, colors["TEXT_PRIMARY"], align="center"
+                )
         self._draw_plate(canvas, card.x + 12, card.y + 12, "WHAT THE VEHICLE SEES")
-        self._draw_legend(canvas, plan)
+        self._draw_legend(canvas, self._dashboard.legend(scene, active))
         outline_rect(canvas, card, colors["CARD_BORDER"])
 
     def _draw_plate(self, canvas: np.ndarray, x: int, y: int, text: str) -> None:
@@ -276,16 +244,9 @@ class PresentationRenderer:
         blend_rect(canvas, plate, self._colors["BG"], _PLATE_ALPHA)
         self._text.draw(canvas, text, x + 12, y + pad_y + cap, PLATE, self._colors["TEXT_PRIMARY"])
 
-    def _draw_legend(self, canvas: np.ndarray, plan: PathPlan | None) -> None:
-        # Entries follow the dashboard's rules: no path swatch when no path is
-        # drawn, and a held path is named and coloured as one.
-        entries = [("Traversable Mask", self._colors["MASK_FILL"])]
-        if plan is not None:
-            if plan.fallback_active:
-                entries.append(("Held Path", self._colors["WARN"]))
-            else:
-                entries.append(("Planned Path", self._colors["PATH_CORE"]))
-
+    def _draw_legend(self, canvas: np.ndarray, entries: list[tuple[str, tuple]]) -> None:
+        if not entries:
+            return
         swatch = 12
         swatch_gap = 6
         entry_gap = 14
@@ -318,7 +279,9 @@ class PresentationRenderer:
 
     # ------------------------------------------------------------------ stats
 
-    def _draw_stats(self, canvas: np.ndarray, telemetry: DashboardTelemetry) -> None:
+    def _draw_stats(
+        self, canvas: np.ndarray, telemetry: DashboardTelemetry, gauges: list[Gauge]
+    ) -> None:
         colors = self._colors
         thresholds = self._thresholds
         left = STATS_CARD.x + _STATS_PAD_X
@@ -372,51 +335,53 @@ class PresentationRenderer:
             colors["TEXT_SECONDARY"],
         )
 
-        levels = _metric_levels(telemetry, thresholds)
-        fps_note = f"Below {thresholds.target_fps:g} Fps Target"
-        if levels["fps"] == bands.GOOD:
-            fps_note = "On Target"
-        elif levels["fps"] == bands.WARN:
-            fps_note = f"Slightly Below {thresholds.target_fps:g} Fps Target"
+        fps_level = bands.fps_level(
+            telemetry.fps, thresholds.target_fps, thresholds.fps_warn_fraction
+        )
+        latency_level = bands.latency_level(telemetry.latency_p95_ms, thresholds.latency_budget_ms)
 
-        latency_note = f"Over {thresholds.latency_budget_ms:.0f} Ms Budget"
-        if levels["latency"] == bands.GOOD:
-            latency_note = f"Within {thresholds.latency_budget_ms:.0f} Ms Budget"
-
-        blocks = (
+        blocks = [
             (
                 f"{telemetry.fps:.1f}",
-                levels["fps"],
+                colors[fps_level],
                 telemetry.fps / (thresholds.target_fps * thresholds.fps_bar_scale),
                 1.0 / thresholds.fps_bar_scale,
-                fps_note,
+                bands.fps_note(fps_level, thresholds.target_fps),
             ),
             (
                 f"{telemetry.latency_ms:.0f} / {telemetry.latency_p95_ms:.0f}",
-                levels["latency"],
+                colors[latency_level],
                 telemetry.latency_p95_ms
                 / (thresholds.latency_budget_ms * thresholds.latency_bar_scale),
                 1.0 / thresholds.latency_bar_scale,
-                latency_note,
+                bands.latency_note(latency_level, thresholds.latency_budget_ms),
             ),
-            (
-                f"{telemetry.road_fraction:.3f}",
-                levels["road"],
-                telemetry.road_fraction / thresholds.road_bar_full_scale,
-                thresholds.road_floor / thresholds.road_bar_full_scale,
-                "",
-            ),
-            (
-                f"{telemetry.perception_confidence:.2f}",
-                levels["confidence"],
-                telemetry.perception_confidence,
-                thresholds.confidence_floor,
-                "",
-            ),
-        )
-        for index, (value, level, fraction, tick, note) in enumerate(blocks):
+        ]
+        for gauge in gauges[:2]:
+            tick = None
+            if gauge.thresholds:
+                tick = self._dashboard.gauge_fraction(gauge, gauge.thresholds[0])
+            blocks.append(
+                (
+                    gauge.text or f"{gauge.value:.2f}",
+                    self._dashboard.gauge_color(gauge),
+                    self._dashboard.gauge_fraction(gauge, gauge.value),
+                    tick,
+                    "",
+                )
+            )
+            block_x, block_y = _metric_origin(left, top, len(blocks) - 1)
+            self._text.draw(
+                canvas,
+                gauge.name.upper(),
+                block_x,
+                block_y + _METRIC_LABEL_BASELINE,
+                LABEL_SPACED,
+                colors["TEXT_SECONDARY"],
+            )
+        for index, (value, color, fraction, tick, note) in enumerate(blocks):
             block_x, block_y = _metric_origin(left, top, index)
-            self._draw_metric(canvas, block_x, block_y, value, level, fraction, tick, note)
+            self._draw_metric(canvas, block_x, block_y, value, color, fraction, tick, note)
 
     def _draw_metric(
         self,
@@ -424,12 +389,11 @@ class PresentationRenderer:
         x: int,
         y: int,
         value: str,
-        level: str,
+        color: tuple[int, int, int],
         fraction: float,
-        tick: float,
+        tick: float | None,
         note: str,
     ) -> None:
-        color = self._colors[level]
         self._text.draw(canvas, value, x, y + _METRIC_VALUE_BASELINE, METRIC, color)
         draw_bar(
             canvas,
@@ -441,22 +405,6 @@ class PresentationRenderer:
             tick_color=self._colors["TEXT_PRIMARY"],
         )
         self._text.draw(canvas, note, x, y + _METRIC_NOTE_BASELINE, LABEL, color)
-
-
-def _metric_levels(
-    telemetry: DashboardTelemetry, thresholds: DashboardThresholds
-) -> dict[str, str]:
-    """The health level of each stat, by the same bands as the dashboard."""
-    return {
-        "fps": bands.fps_level(telemetry.fps, thresholds.target_fps, thresholds.fps_warn_fraction),
-        "latency": bands.latency_level(telemetry.latency_p95_ms, thresholds.latency_budget_ms),
-        "road": bands.road_level(telemetry.road_fraction, thresholds.road_floor),
-        "confidence": bands.confidence_level(
-            telemetry.perception_confidence,
-            thresholds.confidence_floor,
-            thresholds.confidence_good,
-        ),
-    }
 
 
 def _metric_origin(left: int, top: int, index: int) -> tuple[int, int]:

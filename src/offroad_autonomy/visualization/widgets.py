@@ -137,6 +137,31 @@ def draw_chip(
     return rect
 
 
+def draw_autonomy_chip(
+    canvas: np.ndarray,
+    text_renderer: TextRenderer,
+    colors: dict[str, Color],
+    header: Rect,
+    inset: int,
+    active: bool,
+) -> None:
+    """The header's autonomy state, solid red under safe stop so it reads at a glance."""
+    text, color, solid = "AUTONOMY ACTIVE", colors["GOOD"], False
+    if not active:
+        text, color, solid = "SAFE STOP | MANUAL CONTROL", colors["BAD"], True
+    draw_chip(
+        canvas,
+        text_renderer,
+        header.right - inset,
+        header.y + (header.h - chip_height(text_renderer)) // 2,
+        text,
+        color,
+        colors["BG"],
+        solid=solid,
+        align="right",
+    )
+
+
 def wrap_text(
     text_renderer: TextRenderer, text: str, style: TextStyle, max_width: int
 ) -> list[str]:
@@ -161,3 +186,57 @@ def _clamp01(value: float) -> float:
     if not math.isfinite(value):
         return 0.0
     return max(0.0, min(1.0, value))
+
+
+def as_bgr(image: np.ndarray) -> np.ndarray:
+    if image.ndim == 2:
+        return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    if image.shape[2] == 4:
+        return cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+    return image
+
+
+def as_mask(mask: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    """A boolean mask at ``shape``, resized without blending class edges."""
+    if mask.shape[:2] == shape and mask.dtype == bool:
+        return mask
+    mask_u8 = mask.astype(np.uint8)
+    if mask_u8.shape[:2] != shape:
+        mask_u8 = cv2.resize(mask_u8, (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST)
+    return mask_u8.astype(bool)
+
+
+def smooth_points(points: np.ndarray, samples: int = 120) -> np.ndarray:
+    if len(points) < 2:
+        return points
+    diffs = np.diff(points, axis=0)
+    lengths = np.linalg.norm(diffs, axis=1)
+    arc = np.concatenate(([0.0], np.cumsum(lengths)))
+    total = float(arc[-1])
+    if total <= 1e-6:
+        return points
+    q = np.linspace(0.0, total, max(samples, len(points)))
+    xs = np.interp(q, arc, points[:, 0])
+    ys = np.interp(q, arc, points[:, 1])
+    return np.stack([xs, ys], axis=1)
+
+
+def fit_image(
+    image: np.ndarray,
+    target_w: int,
+    target_h: int,
+    fill: Color,
+    interpolation: int = cv2.INTER_LINEAR,
+) -> np.ndarray:
+    """The whole image scaled to fit and centred, with ``fill`` around it."""
+    src_h, src_w = image.shape[:2]
+    scale = min(target_w / src_w, target_h / src_h)
+    new_w = max(1, int(round(src_w * scale)))
+    new_h = max(1, int(round(src_h * scale)))
+    resized = cv2.resize(image, (new_w, new_h), interpolation=interpolation)
+
+    out = np.full((target_h, target_w, 3), fill, dtype=np.uint8)
+    off_x = (target_w - new_w) // 2
+    off_y = (target_h - new_h) // 2
+    out[off_y : off_y + new_h, off_x : off_x + new_w] = resized
+    return out

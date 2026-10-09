@@ -1,5 +1,7 @@
-"""Entry point: connect to BeamNG and run the autonomy loop until stopped.
+"""The harness: connect to BeamNG and run the configured driving stack until stopped.
 
+The loop, safe stop, manual override, dashboard and scoring live here and are
+the same for every stack. The stack only turns observations into commands.
 The dashboard runs on its own thread, so this loop never waits for it.
 """
 
@@ -10,22 +12,22 @@ import logging
 import signal
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
-from offroad_autonomy.pipeline import AutonomyPipeline
+from offroad_autonomy.contract import DrivingStack, Observation, StackOutput, load_stack
 from offroad_autonomy.runtime.benchmark import BenchmarkRecorder
 from offroad_autonomy.runtime.display_worker import DisplayState, DisplayWorker
-from offroad_autonomy.runtime.timing import DISPLAY_STAGES, MAIN_STAGES
+from offroad_autonomy.runtime.route import Route, RouteRecorder, route_path
+from offroad_autonomy.runtime.timing import DISPLAY_STAGES, MAIN_STAGES, RuntimeStats
 from offroad_autonomy.runtime.video_recorder import VideoRecorder, default_video_path
 from offroad_autonomy.simulation.beamng_client import BeamNGClient, BeamNGConnectionError
 from offroad_autonomy.types import (
-    DEBUG_VIEW_KEYS,
+    MAX_DEBUG_PAGE,
     ControlCommand,
-    PathPlan,
-    PipelineConfig,
-    PipelineStepResult,
+    HarnessConfig,
     VehicleState,
 )
 from offroad_autonomy.utils.config import load_config
@@ -51,10 +53,6 @@ _DASHBOARD_HEIGHT = 900
 # dashboard recordings made while tuning.
 _PRESENTATION_DIR = "output/presentations"
 _MPH_PER_MPS = 2.2369362920544
-
-_STUCK_SPEED_MPS = 0.4
-_STUCK_THROTTLE_MIN = 0.15
-_STUCK_TIME_S = 3.0
 
 _MANUAL_STEER = 0.4
 _MANUAL_THROTTLE = 0.25
@@ -84,6 +82,10 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run without the dashboard window (overrides ui.headless).",
     )
+    parser.add_argument("--map", default="", help="BeamNG map (overrides beamng.map).")
+    parser.add_argument(
+        "--spawn", type=int, default=None, help="Spawn index (overrides beamng.spawn_index)."
+    )
     parser.add_argument(
         "--benchmark-seconds",
         type=float,
@@ -94,7 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--benchmark-warmup",
         type=float,
         default=5.0,
-        help="Seconds excluded from the report while models and caches warm up.",
+        help="Seconds excluded from the timing figures while models and caches warm up.",
     )
     parser.add_argument(
         "--benchmark-out",
@@ -105,6 +107,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--label",
         default="",
         help="Name for the benchmark run (default: the config file name).",
+    )
+    parser.add_argument(
+        "--record-route",
+        nargs="?",
+        const="",
+        default=None,
+        help=(
+            "Record the vehicle's true path as the reference route for this map and spawn, "
+            "saved on exit (default path: <benchmark.routes_dir>/<map>_spawn<index>.json). "
+            "Drive it cleanly, by the stack or by hand after E."
+        ),
     )
     parser.add_argument(
         "--record-video",
@@ -123,8 +136,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--presentation",
         action="store_true",
         help=(
-            "Record a 1920x1080 presentation video (orbit camera, dashcam overlay, key stats) "
-            "to its own mp4 (needs ffmpeg on PATH). Combine with --record-video to also "
+            "Record a 1920x1080 presentation video (orbit camera, the stack's main view, key "
+            "stats) to its own mp4 (needs ffmpeg on PATH). Combine with --record-video to also "
             "record the dashboard, to a separate file."
         ),
     )
@@ -132,7 +145,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--presentation-view",
         action="store_true",
         help=(
-            "Show the orbit camera, dashcam overlay and stats in the live window. "
+            "Show the orbit camera, the stack's main view and stats in the live window. "
             "Add --presentation to also record this view."
         ),
     )
@@ -144,7 +157,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _open_video(path: str | Path, width: int, height: int, config: PipelineConfig) -> VideoRecorder:
+def _open_video(path: str | Path, width: int, height: int, config: HarnessConfig) -> VideoRecorder:
     try:
         return VideoRecorder(
             path,
@@ -160,131 +173,91 @@ def _open_video(path: str | Path, width: int, height: int, config: PipelineConfi
 
 
 class _StuckDetector:
-    """Safe-stop trigger.
+    """The harness's own safe-stop trigger, the same for every stack: the
+    wheels are pushing and the vehicle is not moving."""
 
-    The no-road test watches the share of *valid* pixels that came back
-    traversable rather than a mean detection score, because a score drops as
-    soon as the segmenter spends detections on bodywork and would stop the
-    vehicle on a perfectly clear trail.
-    """
-
-    def __init__(
-        self,
-        min_road_fraction: float = 0.015,
-        no_road_time_s: float = 2.0,
-    ) -> None:
-        self._min_road_fraction = float(min_road_fraction)
-        self._no_road_time_s = float(no_road_time_s)
-        self._no_road_since: float | None = None
+    def __init__(self, speed_mps: float, throttle_min: float, time_s: float) -> None:
+        self._speed_mps = float(speed_mps)
+        self._throttle_min = float(throttle_min)
+        self._time_s = float(time_s)
         self._stuck_since: float | None = None
 
     def reset(self) -> None:
-        self._no_road_since = None
         self._stuck_since = None
 
-    def update(
-        self,
-        now: float,
-        road_fraction: float,
-        speed_mps: float,
-        throttle: float,
-    ) -> tuple[bool, str]:
-        if road_fraction < self._min_road_fraction:
-            if self._no_road_since is None:
-                self._no_road_since = now
-            elif now - self._no_road_since >= self._no_road_time_s:
-                self.reset()
-                return True, (f"no traversable road ({road_fraction:.1%} of valid pixels)")
-        else:
-            self._no_road_since = None
-
-        if speed_mps < _STUCK_SPEED_MPS and throttle > _STUCK_THROTTLE_MIN:
-            if self._stuck_since is None:
-                self._stuck_since = now
-            elif now - self._stuck_since >= _STUCK_TIME_S:
-                self.reset()
-                return True, "vehicle stuck"
-        else:
+    def update(self, now: float, speed_mps: float, throttle: float) -> tuple[bool, str]:
+        if speed_mps >= self._speed_mps or throttle <= self._throttle_min:
             self._stuck_since = None
+            return False, ""
+        if self._stuck_since is None:
+            self._stuck_since = now
+            return False, ""
+        if now - self._stuck_since < self._time_s:
+            return False, ""
+        self.reset()
+        return True, "vehicle stuck"
 
-        return False, ""
+
+@dataclass
+class _Control:
+    """What the operator and the safe stop have decided; keys and triggers change it."""
+
+    autopilot_active: bool = True
+    safe_stop_reason: str = ""
+    page: int = 0
+    timing_overlay: bool = False
 
 
-def _mean_confidence(values: list[float]) -> float:
-    if not values:
-        return 0.0
-    return sum(values) / len(values)
+def _timing_lines(stats: RuntimeStats, output: StackOutput, display: DisplayWorker) -> list[str]:
+    """One heading per thread, so a slow dashboard can never be mistaken for
+    a slow vehicle, and the stack's own stages under the loop that ran them."""
+    lines = ["AUTONOMY LOOP"] + stats.format_lines(MAIN_STAGES)
+    stack_lines = [
+        f"{name[:-3]:<16} last {value:6.1f} ms"
+        for name, value in output.metrics.items()
+        if name.endswith("_ms")
+    ]
+    if stack_lines:
+        lines += ["", "STACK"] + stack_lines
+    return lines + ["", "DASHBOARD"] + display.stats.format_lines(DISPLAY_STAGES)
 
 
 def _build_dashboard_telemetry(
     state: VehicleState,
     command: ControlCommand,
-    result: PipelineStepResult,
-    plan: PathPlan | None,
-    pipeline: AutonomyPipeline,
-    autopilot_active: bool,
-    timing_overlay: bool,
+    output: StackOutput,
+    stats: RuntimeStats,
+    control: _Control,
     display: DisplayWorker,
 ) -> DashboardTelemetry:
-    main_stats = pipeline.stats
-    primary = main_stats.stage("primary_loop")
-    kalman = bool(plan is not None and plan.kalman_active)
-
-    # Read the gate off the pipeline's own plan, not ``plan``: that one is
-    # withheld under safe stop, which would hide the gate exactly when the
-    # stack has given up.
-    fallback = []
-    if not autopilot_active:
-        fallback.append("SAFE STOP")
-    if result.plan.fallback_active:
-        if result.plan.speed_scale > 0.0:
-            fallback.append("GATE HOLD")
-        else:
-            fallback.append("GATE STOP")
-    if kalman:
-        fallback.append("KALMAN")
-    fallback_state = "NONE"
-    if fallback:
-        fallback_state = " + ".join(fallback)
-
+    primary = stats.stage("primary_loop")
     telemetry = DashboardTelemetry(
         speed_mph=state.speed_mps * _MPH_PER_MPS,
         steering=command.steering,
         throttle=command.throttle,
         brake=command.brake,
-        perception_confidence=_mean_confidence(result.perception.confidences),
-        stability_score=result.stabilized.stability_score,
-        kalman_active=kalman,
-        fps=main_stats.fps(),
+        fps=stats.fps(),
         latency_ms=primary.mean_ms,
         latency_p95_ms=primary.p95_ms,
-        autopilot_active=autopilot_active,
-        road_fraction=result.stabilized.road_fraction,
-        ego_coverage=pipeline.ego_coverage,
-        segmentation_mode=pipeline.view.mode,
-        fallback_state=fallback_state,
-        fallback_reason=result.plan.fallback_reason,
+        autopilot_active=control.autopilot_active,
+        safe_stop_reason=control.safe_stop_reason,
         dashboard_fps=display.fps(),
     )
-
-    if timing_overlay:
-        # One heading per thread, so a slow dashboard can never be mistaken
-        # for a slow vehicle.
-        lines = ["AUTONOMY LOOP"] + main_stats.format_lines(MAIN_STAGES)
-        lines += ["", "DASHBOARD"] + display.stats.format_lines(DISPLAY_STAGES)
-        telemetry.timing_lines = lines
+    if control.timing_overlay:
+        telemetry.timing_lines = _timing_lines(stats, output, display)
     return telemetry
 
 
 def _log_runtime(
-    pipeline: AutonomyPipeline,
+    stats: RuntimeStats,
     display: DisplayWorker | None = None,
     presentation: DisplayWorker | None = None,
 ) -> None:
-    primary = pipeline.stats.stage("primary_loop")
+    primary = stats.stage("primary_loop")
+    step = stats.stage("stack_step")
     message = (
-        f"autonomy {pipeline.stats.fps():.1f} FPS  primary {primary.mean_ms:.1f}/"
-        f"{primary.p95_ms:.1f} ms (mean/p95)"
+        f"autonomy {stats.fps():.1f} FPS  primary {primary.mean_ms:.1f}/"
+        f"{primary.p95_ms:.1f} ms  stack step {step.mean_ms:.1f}/{step.p95_ms:.1f} ms (mean/p95)"
     )
     if display is not None:
         total = display.stats.stage("dashboard_total")
@@ -300,7 +273,7 @@ def _log_runtime(
             f"superseded {presentation.dropped})"
         )
     logger.info(message)
-    for line in pipeline.stats.format_lines(MAIN_STAGES):
+    for line in stats.format_lines(MAIN_STAGES):
         logger.debug("  %s", line)
     if display is not None:
         for line in display.stats.format_lines(DISPLAY_STAGES):
@@ -318,12 +291,10 @@ def _manual_command(held: set[str]) -> ControlCommand:
     if "space" in held:
         return ControlCommand(steering=steer, throttle=0.0, brake=1.0, parkingbrake=1.0)
     if "w" in held:
-        return ControlCommand(
-            steering=steer, throttle=_MANUAL_THROTTLE, brake=0.0, parkingbrake=0.0
-        )
+        return ControlCommand(steering=steer, throttle=_MANUAL_THROTTLE)
     if "s" in held:
-        return ControlCommand(steering=steer, throttle=0.0, brake=_MANUAL_BRAKE, parkingbrake=0.0)
-    return ControlCommand(steering=steer, throttle=0.0, brake=0.0, parkingbrake=0.0)
+        return ControlCommand(steering=steer, brake=_MANUAL_BRAKE)
+    return ControlCommand(steering=steer)
 
 
 def _open_window(width: int, height: int) -> DashboardWindow | None:
@@ -336,22 +307,138 @@ def _open_window(width: int, height: int) -> DashboardWindow | None:
         return None
 
 
-def _handle_key(
-    key: int,
-    autopilot_active: bool,
+def _display_worker(
+    render, window: DashboardWindow | None, record, config: HarnessConfig
+) -> DisplayWorker:
+    """Off-screen drawing always gets its own thread. A window gets one only
+    on the OpenCV backend: Tkinter's event loop belongs to the thread that
+    built the root window."""
+    show = lambda canvas: True
+    read_key = lambda: -1
+    asynchronous = True
+    if window is not None:
+        show = window.show
+        read_key = lambda: window.last_key
+        asynchronous = config.ui_display_async and window.backend == "opencv"
+    worker = DisplayWorker(
+        render=render,
+        show=show,
+        read_key=read_key,
+        record=record,
+        rate_hz=config.ui_display_rate_hz,
+        asynchronous=asynchronous,
+    )
+    worker.start()
+    return worker
+
+
+def _start_displays(
+    args: argparse.Namespace,
+    config: HarnessConfig,
+    sensors: list,
+    video: VideoRecorder | None,
+    presentation_video: VideoRecorder | None,
+) -> tuple[DashboardWindow | None, DisplayWorker | None, DisplayWorker | None]:
+    """The operator dashboard and the presentation, each live in a window,
+    recorded, or both. Returns the window whose keys drive the vehicle."""
+    show_presentation = args.presentation_view and not config.ui_headless
+    show_dashboard = not config.ui_headless and not show_presentation
+    record = None
+    if video is not None:
+        record = video.write
+    window = None
+    display = None
+    if show_dashboard or video is not None:
+        dashboard = AutonomyDashboard(
+            width=_DASHBOARD_WIDTH,
+            height=_DASHBOARD_HEIGHT,
+            colors=config.dashboard_colors,
+            sensors=sensors,
+            thresholds=config.dashboard_thresholds,
+            stack_name=stack_name(config.stack),
+        )
+        if show_dashboard:
+            window = _open_window(dashboard.width, dashboard.height)
+
+        def render(state: DisplayState) -> np.ndarray:
+            return dashboard.render(
+                state.output, state.telemetry, page=state.page, timing_overlay=state.timing_overlay
+            )
+
+    if window is not None or video is not None:
+        display = _display_worker(render, window, record, config)
+        if window is not None:
+            if config.ui_display_async and not display.asynchronous:
+                logger.warning(
+                    "Dashboard is running inline: the '%s' window backend cannot be "
+                    "driven from another thread, so rendering is part of the loop period",
+                    window.backend,
+                )
+            logger.info(
+                "Keys: E safe stop, P resume, 0 main view, 1-%d the stack's layers, "
+                "T timing overlay",
+                MAX_DEBUG_PAGE,
+            )
+        else:
+            logger.info("No window: dashboard drawn off screen for the recording only")
+    elif not show_presentation:
+        logger.info("Headless: no dashboard; manual control is unavailable")
+
+    presentation_display = None
+    if args.presentation or show_presentation:
+        presentation = PresentationRenderer(
+            colors=config.dashboard_colors,
+            sensors=sensors,
+            thresholds=config.dashboard_thresholds,
+        )
+
+        def render_presentation(state: DisplayState) -> np.ndarray:
+            return presentation.render(state.output, state.telemetry, state.orbit)
+
+        presentation_window = None
+        if show_presentation:
+            presentation_window = _open_window(PRESENTATION_WIDTH, PRESENTATION_HEIGHT)
+            window = presentation_window
+        record = None
+        if presentation_video is not None:
+            record = presentation_video.write
+        presentation_display = _display_worker(
+            render_presentation, presentation_window, record, config
+        )
+        if presentation_window:
+            logger.info("Live presentation view: E safe stop, P resume, Q quit")
+        elif presentation_video:
+            logger.info("Presentation video drawn off screen for the recording only")
+    return window, display, presentation_display
+
+
+def _handle_keys(
+    worker: DisplayWorker,
+    control: _Control,
     client: BeamNGClient,
     stuck_detector: _StuckDetector,
-) -> bool:
-    if key in (ord("e"), ord("E")) and autopilot_active:
-        client.park()
-        logger.info("Safe stop triggered - autopilot disabled, manual control required")
-        return False
-    if key in (ord("p"), ord("P")) and not autopilot_active:
-        client.release_park()
-        stuck_detector.reset()
-        logger.info("Autopilot resumed")
-        return True
-    return autopilot_active
+    stack: DrivingStack,
+) -> None:
+    for key in worker.drain_keys():
+        if key in (ord("t"), ord("T")):
+            control.timing_overlay = not control.timing_overlay
+        elif ord("0") <= key <= ord("0") + MAX_DEBUG_PAGE:
+            control.page = key - ord("0")
+            logger.info("Dashboard page %d", control.page)
+        elif key in (ord("e"), ord("E")) and control.autopilot_active:
+            client.park()
+            control.autopilot_active = False
+            control.safe_stop_reason = "operator pressed E"
+            logger.info("Safe stop triggered - autopilot disabled, manual control required")
+        elif key in (ord("p"), ord("P")) and not control.autopilot_active:
+            client.release_park()
+            stuck_detector.reset()
+            # The operator may have moved the vehicle, so whatever the stack
+            # remembered about the road behind it no longer applies.
+            stack.reset()
+            control.autopilot_active = True
+            control.safe_stop_reason = ""
+            logger.info("Autopilot resumed")
 
 
 def video_paths(args: argparse.Namespace, label: str) -> tuple[Path, Path]:
@@ -380,6 +467,66 @@ def _log_video(video: VideoRecorder) -> None:
     )
 
 
+def stack_name(path: str) -> str:
+    """The short name a run is labelled with: the stack's package."""
+    return path.partition(":")[0].rsplit(".", 1)[-1]
+
+
+def _observation(frames: dict, state: VehicleState) -> Observation:
+    first = next(iter(frames.values()))
+    return Observation(
+        sensors={name: frame.image for name, frame in frames.items()},
+        vehicle=state,
+        timestamp=min(frame.timestamp for frame in frames.values()),
+        frame_id=first.frame_id,
+    )
+
+
+def _benchmark_recorder(
+    args: argparse.Namespace, config: HarnessConfig, label: str, config_path: Path
+) -> BenchmarkRecorder:
+    path = route_path(config.benchmark_routes_dir, config.beamng_map, config.beamng_spawn_index)
+    route = None
+    if path.exists():
+        route = Route.load(path)
+        logger.info("Scoring against route %s (%.0f m)", path, route.length_m)
+    else:
+        logger.warning(
+            "No reference route at %s: cross-track, completion and departures will be null. "
+            "Record one with --record-route.",
+            path,
+        )
+    return BenchmarkRecorder(label, str(config_path), config, route, args.benchmark_warmup)
+
+
+def _write_benchmark(args: argparse.Namespace, recorder: BenchmarkRecorder, stats) -> None:
+    report = recorder.report(stats)
+    path = recorder.save(args.benchmark_out or f"output/benchmarks/{recorder.label}.json", report)
+    logger.info("Benchmark report written to %s", path)
+    logger.info(
+        "  %.1f FPS  primary p95 %s ms  distance %s m  cross-track mean %s m  "
+        "departures %s  safe stops %d",
+        report["main_fps"] or 0.0,
+        report["primary_latency_p95_ms"],
+        report["distance_m"],
+        report["cross_track_mean_m"],
+        report["departures"],
+        report["safe_stops"],
+    )
+
+
+def _save_route(args: argparse.Namespace, config: HarnessConfig, recorder: RouteRecorder) -> None:
+    out = args.record_route or route_path(
+        config.benchmark_routes_dir, config.beamng_map, config.beamng_spawn_index
+    )
+    try:
+        path = recorder.save(out, config.beamng_map, config.beamng_spawn_index)
+    except ValueError as exc:
+        logger.error("Route not saved: %s", exc)
+        return
+    logger.info("Reference route saved to %s (%d points)", path, len(recorder.points))
+
+
 def main() -> None:
     global _shutdown
     _shutdown = False
@@ -394,49 +541,43 @@ def main() -> None:
     config = load_config(config_path)
     if args.headless:
         config.ui_headless = True
-    logger.info("Configuration loaded from %s", config_path)
+    if args.map:
+        config.beamng_map = args.map
+    if args.spawn is not None:
+        config.beamng_spawn_index = args.spawn
+    logger.info("Configuration loaded from %s; stack %s", config_path, config.stack)
 
     # SIGTERM is what `docker stop` sends; without a handler the process dies
     # mid-loop and the vehicle is never parked.
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
+    stack = load_stack(config.stack, config.stack_config)
+    sensors = stack.sensors()
     show_presentation = args.presentation_view and not config.ui_headless
     use_presentation = args.presentation or show_presentation
-    client = BeamNGClient(config, orbit=use_presentation)
-    pipeline = AutonomyPipeline(config)
-    dashboard_window: DashboardWindow | None = None
-    display: DisplayWorker | None = None
-    presentation_display: DisplayWorker | None = None
-    video: VideoRecorder | None = None
-    presentation_video: VideoRecorder | None = None
-    stats = pipeline.stats
-
-    debug_view = config.ui_debug_view
-    timing_overlay = config.ui_timing_overlay
-    render_every = max(1, config.ui_render_every_n)
-
-    recorder: BenchmarkRecorder | None = None
-    if args.benchmark_seconds > 0 or args.benchmark_out:
-        recorder = BenchmarkRecorder(
-            label=args.label or config_path.stem,
-            config_path=str(config_path),
-            valid_roi=pipeline.valid_roi,
-            warmup_s=args.benchmark_warmup,
-        )
-
-    frame_count = 0
-    t_start = time.perf_counter()
-    t_last_log = t_start
-    autopilot_active = True
+    client = BeamNGClient(config, sensors, orbit=use_presentation)
+    stats = RuntimeStats()
+    control = _Control(page=config.ui_debug_page, timing_overlay=config.ui_timing_overlay)
     stuck_detector = _StuckDetector(
-        min_road_fraction=config.safety_min_road_fraction,
-        no_road_time_s=config.safety_no_road_time_s,
+        speed_mps=config.safety_stuck_speed_mps,
+        throttle_min=config.safety_stuck_throttle_min,
+        time_s=config.safety_stuck_time_s,
     )
+    step_budget_ms = config.dashboard_thresholds.latency_budget_ms
+
+    label = args.label or config_path.stem
+    recorder = None
+    if args.benchmark_seconds > 0 or args.benchmark_out:
+        recorder = _benchmark_recorder(args, config, label, config_path)
+    route_recorder = None
+    if args.record_route is not None:
+        route_recorder = RouteRecorder(config.benchmark_route_spacing_m)
 
     # Opened before connecting so a missing ffmpeg stops the run before a map
     # is loaded and a vehicle spawned for nothing.
-    label = args.label or config_path.stem
+    video = None
+    presentation_video = None
     video_path, presentation_path = video_paths(args, label)
     if args.record_video:
         video = _open_video(video_path, _DASHBOARD_WIDTH, _DASHBOARD_HEIGHT, config)
@@ -447,119 +588,24 @@ def main() -> None:
         )
         logger.info("Recording the presentation video to %s", presentation_video.path)
 
+    window = None
+    display = None
+    presentation_display = None
+    frame_count = 0
+    overruns = 0
+    t_start = time.perf_counter()
+    t_last_log = t_start
     try:
         client.connect()
-
-        record_dashboard = video is not None
-        record = None
-        if record_dashboard:
-            record = video.write
-
-        show_dashboard = not config.ui_headless and not show_presentation
-        if show_dashboard or record_dashboard:
-            dashboard = AutonomyDashboard(
-                width=_DASHBOARD_WIDTH,
-                height=_DASHBOARD_HEIGHT,
-                colors=config.dashboard_colors,
-                sensor=config.camera.sensor,
-                thresholds=config.dashboard_thresholds,
-            )
-            if show_dashboard:
-                dashboard_window = _open_window(dashboard.width, dashboard.height)
-
-            def _render(state: DisplayState) -> np.ndarray:
-                return dashboard.render(
-                    state.result,
-                    state.telemetry,
-                    plan=state.plan,
-                    valid_roi=state.valid_roi,
-                    debug_view=state.debug_view,
-                    timing_overlay=state.timing_overlay,
-                )
-
-        if dashboard_window is not None:
-            window = dashboard_window
-            # Tkinter's event loop belongs to the thread that built the root
-            # window, so only the OpenCV backend can be driven off-thread.
-            display = DisplayWorker(
-                render=_render,
-                show=window.show,
-                read_key=lambda: window.last_key,
-                record=record,
-                rate_hz=config.ui_display_rate_hz,
-                asynchronous=config.ui_display_async and window.backend == "opencv",
-            )
-            if config.ui_display_async and not display.asynchronous:
-                logger.warning(
-                    "Dashboard is running inline: the '%s' window backend cannot be "
-                    "driven from another thread, so rendering is part of the loop period",
-                    window.backend,
-                )
-            display.start()
-            logger.info(
-                "Keys: E safe stop, P resume, 0/1/6/9 debug view (%s), T timing overlay",
-                " ".join(f"{i}={name}" for i, name in DEBUG_VIEW_KEYS.items()),
-            )
-        elif record_dashboard:
-            # No window to keep on its own thread, so the off-screen dashboard
-            # always renders asynchronously, whatever ui.display_async says.
-            display = DisplayWorker(
-                render=_render,
-                show=lambda canvas: True,
-                read_key=lambda: -1,
-                record=record,
-                rate_hz=config.ui_display_rate_hz,
-                asynchronous=True,
-            )
-            display.start()
-            logger.info("No window: dashboard drawn off screen for the recording only")
-        elif not show_presentation:
-            logger.info("Headless: no dashboard; manual control is unavailable")
-
-        if use_presentation:
-            presentation = PresentationRenderer(
-                colors=config.dashboard_colors,
-                sensor=config.camera.sensor,
-                thresholds=config.dashboard_thresholds,
-            )
-
-            def _render_presentation(state: DisplayState) -> np.ndarray:
-                return presentation.render(
-                    state.result,
-                    state.telemetry,
-                    state.orbit,
-                    state.plan,
-                    state.valid_roi,
-                )
-
-            presentation_window = None
-            if show_presentation:
-                presentation_window = _open_window(PRESENTATION_WIDTH, PRESENTATION_HEIGHT)
-                dashboard_window = presentation_window
-            # Record-only rendering runs off-thread. A live Tkinter window
-            # must render on the main thread, just like the operator dashboard.
-            presentation_display = DisplayWorker(
-                render=_render_presentation,
-                show=presentation_window.show if presentation_window else lambda canvas: True,
-                read_key=lambda: presentation_window.last_key if presentation_window else -1,
-                record=presentation_video.write if presentation_video else None,
-                rate_hz=config.ui_display_rate_hz,
-                asynchronous=(
-                    not presentation_window
-                    or (config.ui_display_async and presentation_window.backend == "opencv")
-                ),
-            )
-            presentation_display.start()
-            if presentation_window:
-                logger.info("Live presentation view: E safe stop, P resume, Q quit")
-            elif presentation_video:
-                logger.info("Presentation video drawn off screen for the recording only")
-
-        logger.info(
-            "Perception on the '%s' camera; ego-vehicle exclusion %.1f%% of that view",
-            pipeline.view.mode,
-            pipeline.ego_coverage * 100.0,
+        window, display, presentation_display = _start_displays(
+            args, config, sensors, video, presentation_video
         )
+        workers = [worker for worker in (display, presentation_display) if worker is not None]
+        # Keys come from whichever window the operator is looking at.
+        key_source = display
+        if show_presentation:
+            key_source = presentation_display
+
         logger.info("Entering main loop - Ctrl+C or SIGTERM to stop")
         t_start = time.perf_counter()
         orbit_image: np.ndarray | None = None
@@ -567,8 +613,8 @@ def main() -> None:
         while not _shutdown:
             t_iter = time.perf_counter()
             with stats.time("capture"):
-                capture = client.capture_frame()
-            if capture is None or not pipeline.has_input(capture):
+                frames = client.capture()
+            if frames is None:
                 time.sleep(0.005)
                 continue
 
@@ -584,33 +630,33 @@ def main() -> None:
             with stats.time("vehicle_state"):
                 state = client.get_vehicle_state()
 
-            # Perception keeps running under safe stop so the operator can see
+            # The stack keeps running under safe stop so the operator can see
             # the road come back before handing control over again.
-            result = pipeline.step_result(capture, state)
-            plan = result.plan
+            t_step = time.perf_counter()
+            output = stack.step(_observation(frames, state))
+            step_ms = (time.perf_counter() - t_step) * 1000.0
+            stats.record("stack_step", step_ms)
+            if step_ms > step_budget_ms:
+                overruns += 1
 
-            if autopilot_active:
-                command = result.command
+            if control.autopilot_active:
+                command = output.command
                 triggered, reason = stuck_detector.update(
-                    now=t_iter,
-                    road_fraction=result.stabilized.road_fraction,
-                    speed_mps=state.speed_mps,
-                    throttle=command.throttle,
+                    now=t_iter, speed_mps=state.speed_mps, throttle=command.throttle
                 )
+                if not triggered and output.safe_stop:
+                    triggered, reason = True, output.safe_stop
                 if triggered:
-                    autopilot_active = False
+                    control.autopilot_active = False
+                    control.safe_stop_reason = reason
                     client.park()
                     command = _SAFE_STOP_COMMAND
-                    plan = None
                     logger.warning("Safe stop triggered automatically: %s", reason)
             else:
                 held: set[str] = set()
-                if dashboard_window is not None:
-                    held = dashboard_window.held_keys
+                if window is not None:
+                    held = window.held_keys
                 command = _manual_command(held)
-                # Withholding the plan keeps the dashboard from suggesting the
-                # stack is steering while it is not.
-                plan = None
 
             with stats.time("actuation"):
                 client.send_controls(command)
@@ -619,45 +665,25 @@ def main() -> None:
 
             # The command has already gone out and primary_loop is recorded,
             # so nothing below counts as autonomy latency.
-            workers = [worker for worker in (display, presentation_display) if worker is not None]
-            if workers and frame_count % render_every == 0:
+            if workers and frame_count % config.ui_render_every_n == 0:
                 telemetry = _build_dashboard_telemetry(
-                    state,
-                    command,
-                    result,
-                    plan,
-                    pipeline,
-                    autopilot_active,
-                    timing_overlay,
-                    workers[0],
+                    state, command, output, stats, control, workers[0]
                 )
                 # One snapshot for both: each worker only reads it.
                 snapshot = DisplayState(
-                    result=result,
+                    output=output,
                     telemetry=telemetry,
-                    plan=plan,
-                    valid_roi=pipeline.valid_roi,
-                    debug_view=debug_view,
-                    timing_overlay=timing_overlay,
+                    page=control.page,
+                    timing_overlay=control.timing_overlay,
                     orbit=orbit_image,
                 )
                 for worker in workers:
                     worker.publish(snapshot)
 
-            active_display = presentation_display if show_presentation else display
-            if active_display is not None:
-                if active_display.closed:
+            if key_source is not None:
+                if key_source.closed:
                     _shutdown = True
-                for key in active_display.drain_keys():
-                    if key in (ord("t"), ord("T")):
-                        timing_overlay = not timing_overlay
-                    elif ord("0") <= key <= ord("9") and key - ord("0") in DEBUG_VIEW_KEYS:
-                        debug_view = DEBUG_VIEW_KEYS[key - ord("0")]
-                        logger.info("Debug view: %s", debug_view)
-                    else:
-                        autopilot_active = _handle_key(
-                            key, autopilot_active, client, stuck_detector
-                        )
+                _handle_keys(key_source, control, client, stuck_detector, stack)
 
             full_ms = (time.perf_counter() - t_iter) * 1000.0
             stats.record("full_loop", full_ms)
@@ -667,16 +693,28 @@ def main() -> None:
             if recorder is not None:
                 recorder.add(
                     now=time.perf_counter(),
+                    state=state,
+                    command=command,
+                    autopilot_active=control.autopilot_active,
                     primary_ms=primary_ms,
+                    step_ms=step_ms,
                     full_ms=full_ms,
-                    confidence=_mean_confidence(result.perception.confidences),
-                    mask=result.stabilized.mask,
-                    plan=result.plan,
+                    stack_metrics=output.metrics,
                 )
+            if route_recorder is not None:
+                route_recorder.add(state)
 
             now = time.perf_counter()
             if now - t_last_log >= config.runtime_log_interval_s:
-                _log_runtime(pipeline, display, presentation_display)
+                _log_runtime(stats, display, presentation_display)
+                if overruns:
+                    logger.warning(
+                        "Stack step exceeded the %.0f ms loop budget %d times since the last "
+                        "report; move slow work onto the stack's own worker",
+                        step_budget_ms,
+                        overruns,
+                    )
+                    overruns = 0
                 t_last_log = now
             if args.benchmark_seconds > 0 and now - t_start >= args.benchmark_seconds:
                 logger.info("Benchmark duration reached")
@@ -689,33 +727,23 @@ def main() -> None:
         logger.info("Interrupted by user")
     finally:
         # Stop drawing before the window is torn down and the video is closed.
-        if display is not None:
-            display.stop()
-        if presentation_display is not None:
-            presentation_display.stop()
+        for worker in (display, presentation_display):
+            if worker is not None:
+                worker.stop()
         for recording in (video, presentation_video):
             if recording is not None:
                 recording.close()
                 _log_video(recording)
-        if dashboard_window is not None:
-            dashboard_window.close()
+        if window is not None:
+            window.close()
         client.disconnect()
         elapsed = time.perf_counter() - t_start
         logger.info("Session ended - %d frames in %.1f s", frame_count, elapsed)
-        _log_runtime(pipeline, display, presentation_display)
+        _log_runtime(stats, display, presentation_display)
+        if route_recorder is not None:
+            _save_route(args, config, route_recorder)
         if recorder is not None:
-            report = recorder.report(stats)
-            out = args.benchmark_out or f"output/benchmarks/{recorder.label}.json"
-            path = recorder.save(out, report)
-            logger.info("Benchmark report written to %s", path)
-            logger.info(
-                "  %.1f FPS  primary %s/%s ms  jitter %s  departures %d",
-                report["main_fps"] or 0.0,
-                report["primary_latency_mean_ms"],
-                report["primary_latency_p95_ms"],
-                report["path_jitter_pct"],
-                report["lane_departures"],
-            )
+            _write_benchmark(args, recorder, stats)
 
 
 if __name__ == "__main__":

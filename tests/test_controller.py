@@ -104,8 +104,9 @@ def test_hidden_near_path_does_not_reverse_the_visible_turn(direction, held):
     from unittest.mock import Mock
 
     from offroad_autonomy.simulation.beamng_client import BeamNGClient
+    from offroad_autonomy.types import HarnessConfig
 
-    client = BeamNGClient(config)
+    client = BeamNGClient(HarnessConfig(), [])
     client._vehicle = Mock()
     client.send_controls(command)
     assert direction * client._vehicle.control.call_args.kwargs["steering"] > 0.0
@@ -224,10 +225,12 @@ def test_s_bend_is_completed_without_lock(radius):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
     from sbend_sim import simulate
 
-    from offroad_autonomy.utils.config import load_config
+    from offroad_autonomy.stacks.mono_yoloe.config import load_pipeline_config_file
 
     # The shipped tuning, not dataclass defaults: this guards configs/default.yaml.
-    shipped = load_config(Path(__file__).resolve().parents[1] / "configs/default.yaml")
+    shipped = load_pipeline_config_file(
+        Path(__file__).resolve().parents[1] / "configs/default.yaml"
+    )
     result = simulate(shipped, radius=radius, fps=4.0)
     assert result.completed
     assert result.frames_at_lock == 0

@@ -11,7 +11,9 @@ tracking can be judged from numbers rather than by eye::
 
 ``--snap-from T`` also saves the pipeline debug view (raw | mask | planner
 input | trajectory + control) every other frame after T seconds, next to the
-CSV. Uses the application's stuck/no-road detector and a camera watchdog.
+CSV. Uses the harness's stuck detector, the stack's no-road monitor and a
+camera watchdog. It reads the mono_yoloe stack's internals, so the config
+must run that stack.
 """
 
 from __future__ import annotations
@@ -27,9 +29,13 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from offroad_autonomy.contract import camera_sensor
 from offroad_autonomy.main import _StuckDetector
-from offroad_autonomy.pipeline import AutonomyPipeline
 from offroad_autonomy.simulation.beamng_client import BeamNGClient
+from offroad_autonomy.stacks.mono_yoloe.config import load_pipeline_config
+from offroad_autonomy.stacks.mono_yoloe.debug_view import pipeline_grid
+from offroad_autonomy.stacks.mono_yoloe.pipeline import AutonomyPipeline
+from offroad_autonomy.stacks.mono_yoloe.stack import NoRoadMonitor
 from offroad_autonomy.utils.config import load_config
 
 _DEBUG_FIELDS = (
@@ -115,25 +121,26 @@ def main() -> None:
     parser.add_argument("--summary", action="store_true")
     args = parser.parse_args()
 
-    cfg = load_config(args.config)
+    harness = load_config(args.config)
+    cfg = load_pipeline_config(harness.stack_config)
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    dash = snap_dir = None
+    snap_dir = None
     if args.snap_from is not None:
         import cv2
 
-        from offroad_autonomy.visualization import AutonomyDashboard
-
-        dash = AutonomyDashboard(
-            width=1600, height=900, colors=cfg.dashboard_colors, sensor=cfg.camera.sensor
-        )
         snap_dir = out.with_suffix("")
         snap_dir.mkdir(parents=True, exist_ok=True)
 
-    client = BeamNGClient(cfg)
+    client = BeamNGClient(harness, [camera_sensor(cfg.camera)])
     pipe = AutonomyPipeline(cfg)
     rows: list[dict] = []
-    detector = _StuckDetector(cfg.safety_min_road_fraction, cfg.safety_no_road_time_s)
+    stuck = _StuckDetector(
+        harness.safety_stuck_speed_mps,
+        harness.safety_stuck_throttle_min,
+        harness.safety_stuck_time_s,
+    )
+    no_road = NoRoadMonitor(cfg.safety_min_road_fraction, cfg.safety_no_road_time_s)
     try:
         client.connect()
         client.release_park()
@@ -141,8 +148,11 @@ def main() -> None:
         last_frame = t0
         while time.perf_counter() - t0 < args.seconds:
             loop_started = time.perf_counter()
-            capture = client.capture_frame()
-            if capture is None or not pipe.has_input(capture) or not capture.is_new:
+            frames = client.capture()
+            capture = None
+            if frames is not None:
+                capture = frames[cfg.camera.name]
+            if capture is None or not capture.is_new:
                 if time.perf_counter() - last_frame > cfg.safety_no_road_time_s:
                     print("Camera watchdog: parking")
                     client.park()
@@ -156,20 +166,19 @@ def main() -> None:
                 print("Invalid vehicle state: parking")
                 break
             res = pipe.step_result(capture, state)
-            stop, reason = detector.update(
-                time.perf_counter(),
-                res.stabilized.road_fraction,
-                state.speed_mps,
-                res.command.throttle,
-            )
+            now = time.perf_counter()
+            stop, reason = stuck.update(now, state.speed_mps, res.command.throttle)
+            if not stop:
+                reason = no_road.update(now, res.stabilized.road_fraction)
+                stop = bool(reason)
             if stop:
                 client.park()
                 print(f"Safe stop: {reason}")
                 break
             client.send_controls(res.command)
             elapsed = time.perf_counter() - t0
-            if dash is not None and elapsed >= args.snap_from and len(rows) % 2 == 0:
-                cv2.imwrite(str(snap_dir / f"{len(rows):04d}.jpg"), dash._render_pipeline_view(res))
+            if snap_dir is not None and elapsed >= args.snap_from and len(rows) % 2 == 0:
+                cv2.imwrite(str(snap_dir / f"{len(rows):04d}.jpg"), pipeline_grid(res))
             gate = "ok"
             if res.plan.fallback_active:
                 gate = res.plan.fallback_reason

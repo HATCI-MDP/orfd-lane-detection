@@ -10,6 +10,14 @@ real ``StanleyController``. No BeamNG, no perception: this isolates the
 controller, so gains can be tuned in seconds and regressions caught in CI.
 
     python scripts/sbend_sim.py --radius 9 --fps 4
+
+Several configs run on the same plant and print one comparison table, so
+controller settings are compared with no simulator:
+
+    python scripts/sbend_sim.py --config configs/default.yaml configs/grid.yaml
+
+The controller and its settings belong to the mono_yoloe stack, so every
+config must run that stack.
 """
 
 from __future__ import annotations
@@ -29,8 +37,9 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from offroad_autonomy.control.stanley_controller import StanleyController
 from offroad_autonomy.perception.camera_geometry import CameraModel
+from offroad_autonomy.runtime.benchmark import comparison_table
+from offroad_autonomy.stacks.mono_yoloe.config import load_pipeline_config_file
 from offroad_autonomy.types import PathPlan, PipelineConfig, VehicleState
-from offroad_autonomy.utils.config import load_config
 
 
 def s_bend(radius: float, straight: float = 30.0, step: float = 0.1) -> np.ndarray:
@@ -249,34 +258,72 @@ def simulate(
     return _finish(log, max_err, lock_frames, False, trail_width)
 
 
+_COLUMNS = (
+    ("config", "label"),
+    ("done", "completed"),
+    ("max|steer|", "max_abs_steer"),
+    ("lock", "frames_at_lock"),
+    ("max off m", "max_lateral_error"),
+    ("mean off m", "mean_abs_error"),
+    ("p95 off m", "p95_error"),
+    ("edge frames", "edge_frames"),
+    ("steer jerk", "steer_jerk"),
+)
+
+
+def _report(label: str, res: SimResult) -> dict:
+    return {
+        "label": label,
+        "completed": res.completed,
+        "max_abs_steer": res.max_abs_steer,
+        "frames_at_lock": res.frames_at_lock,
+        "max_lateral_error": res.max_lateral_error,
+        "mean_abs_error": res.mean_abs_error,
+        "p95_error": res.p95_error,
+        "edge_frames": res.edge_frames,
+        "steer_jerk": res.steer_jerk,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--config", default=str(ROOT / "configs/default.yaml"))
+    parser.add_argument("--config", nargs="+", default=[str(ROOT / "configs/default.yaml")])
     parser.add_argument("--radius", type=float, default=9.0)
     parser.add_argument("--fps", type=float, default=4.0)
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
-    config = load_config(args.config)
-    res = simulate(config, radius=args.radius, fps=args.fps)
-    print(
-        f"radius {args.radius} m @ {args.fps} FPS: completed={res.completed} "
-        f"max|steer|={res.max_abs_steer:.2f} lock frames={res.frames_at_lock} "
-        f"max off-centre={res.max_lateral_error:.2f} m speed {res.min_speed:.1f}-{res.max_speed:.1f} m/s"
-    )
-    print(
-        f"  centring: mean {res.mean_abs_error:.2f} m  p95 {res.p95_error:.2f} m  "
-        f"edge frames {res.edge_frames}  steer jerk {res.steer_jerk:.3f}/frame"
-    )
-    if args.verbose:
-        for i, e in enumerate(res.log[::2]):
-            print(
-                f"{2 * i:4d} v={e['v']:.2f} tgt={e['target']:.2f} ({e['reason']:10s}) "
-                f"steer={e['steer']:+.2f} kappa={e['kappa']:+.3f} la={e['la']:.1f} sat={e['sat']:.2f} err={e['err']:.2f}"
-            )
+    reports = []
+    failed = False
+    for path in args.config:
+        config = load_pipeline_config_file(path)
+        res = simulate(config, radius=args.radius, fps=args.fps)
+        print(
+            f"{Path(path).name}: radius {args.radius} m @ {args.fps} FPS: "
+            f"completed={res.completed} max|steer|={res.max_abs_steer:.2f} "
+            f"lock frames={res.frames_at_lock} max off-centre={res.max_lateral_error:.2f} m "
+            f"speed {res.min_speed:.1f}-{res.max_speed:.1f} m/s"
+        )
+        print(
+            f"  centring: mean {res.mean_abs_error:.2f} m  p95 {res.p95_error:.2f} m  "
+            f"edge frames {res.edge_frames}  steer jerk {res.steer_jerk:.3f}/frame"
+        )
+        if args.verbose:
+            for i, e in enumerate(res.log[::2]):
+                print(
+                    f"{2 * i:4d} v={e['v']:.2f} tgt={e['target']:.2f} ({e['reason']:10s}) "
+                    f"steer={e['steer']:+.2f} kappa={e['kappa']:+.3f} la={e['la']:.1f} "
+                    f"sat={e['sat']:.2f} err={e['err']:.2f}"
+                )
+        reports.append(_report(Path(path).stem, res))
+        failed = failed or not res.completed or res.edge_frames > 0
+    if len(reports) > 1:
+        print()
+        for line in comparison_table(reports, columns=_COLUMNS):
+            print(line)
     # A non-zero exit lets CI reject a tuning change that leaves the trail.
-    if not res.completed or res.edge_frames > 0:
+    if failed:
         sys.exit(1)
 
 

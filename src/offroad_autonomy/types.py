@@ -45,33 +45,21 @@ DEFAULT_DASHBOARD_COLORS = {
 
 @dataclass(frozen=True)
 class DashboardThresholds:
-    """What the dashboard colours its health readouts against.
+    """What the dashboard colours the harness's own readouts against.
 
-    ``confidence_floor`` and ``road_floor`` are copied from the gate and the
-    safe stop at load time, so the ticks on the bars cannot drift from the
-    values that actually trigger them.
+    Stack readouts carry their thresholds in their ``Gauge``, so these cover
+    only what every stack shares: loop rate and latency.
     """
 
     target_fps: float = 7.0
     fps_warn_fraction: float = 0.8
     latency_budget_ms: float = 143.0
-    confidence_floor: float = 0.18
-    confidence_good: float = 0.5
-    road_floor: float = 0.015
     fps_bar_scale: float = 2.0
     latency_bar_scale: float = 1.4
-    road_bar_full_scale: float = 0.2
 
 
-DEBUG_VIEWS = (
-    "default",
-    "raw",
-    "mask",
-    "pipeline",
-)
-
-#: Keep the existing keys when depth-specific views are removed.
-DEBUG_VIEW_KEYS = {0: "default", 1: "raw", 6: "mask", 9: "pipeline"}
+#: Keys 1-9 show the stack's layers in the order it emits them; 0 is the main view.
+MAX_DEBUG_PAGE = 9
 
 #: ``shared_memory`` only works when BeamNG runs on the same machine; a
 #: remote client (e.g. a Jetson) has to pull frames over the socket.
@@ -369,24 +357,13 @@ class PipelineStepResult:
 
 @dataclass
 class PipelineConfig:
-    """Structured representation of the full configuration.
+    """The ``mono_yoloe`` stack's settings, shared by the perception,
+    planning and control parts it is built from.
 
-    Every tuning rationale lives next to its key in ``configs/default.yaml``.
+    Every tuning rationale lives next to its key in the stack's ``default.yaml``.
     """
 
-    beamng_home: str = ""
-    beamng_host: str = "localhost"
-    beamng_port: int = 64256
-    #: False when attaching to an already running (usually remote) simulator.
-    beamng_launch: bool = True
-    beamng_camera_transport: str = "shared_memory"
-    beamng_map: str = "automation_test_track"
-    beamng_vehicle: str = "pickup"
-    beamng_spawn_index: int = 0
     camera: CameraSpec = field(default_factory=lambda: replace(DEFAULT_CAMERA))
-    #: Attached only with --presentation.
-    orbit_camera: CameraSpec = field(default_factory=lambda: replace(DEFAULT_ORBIT_CAMERA))
-    map_spawns: dict = field(default_factory=dict)
 
     model_weights: str = "models/yoloe-26x-seg.pt"
     confidence_threshold: float = 0.25
@@ -485,6 +462,44 @@ class PipelineConfig:
     speed_kp: float = 0.22
     clearance_slow_m: float = 6.0
     clearance_stop_m: float = 2.5
+    #: The stack card's bars; their floors are the gate and safe stop values.
+    gauge_confidence_good: float = 0.5
+    gauge_road_full_scale: float = 0.2
+
+
+@dataclass
+class HarnessConfig:
+    """Everything that must be the same for two stacks to be compared fairly.
+
+    The stack's own settings stay raw in ``stack_config``: only the stack
+    knows their shape, and it validates them itself.
+    """
+
+    beamng_home: str = ""
+    beamng_host: str = "localhost"
+    beamng_port: int = 64256
+    #: False when attaching to an already running (usually remote) simulator.
+    beamng_launch: bool = True
+    beamng_camera_transport: str = "shared_memory"
+    beamng_map: str = "automation_test_track"
+    beamng_vehicle: str = "pickup"
+    beamng_spawn_index: int = 0
+    map_spawns: dict = field(default_factory=dict)
+    #: Attached only with --presentation.
+    orbit_camera: CameraSpec = field(default_factory=lambda: replace(DEFAULT_ORBIT_CAMERA))
+
+    stack: str = "offroad_autonomy.stacks.mono_yoloe:build"
+    stack_config: dict = field(default_factory=dict)
+
+    safety_stuck_speed_mps: float = 0.4
+    safety_stuck_throttle_min: float = 0.15
+    safety_stuck_time_s: float = 3.0
+
+    benchmark_routes_dir: str = "routes"
+    benchmark_route_spacing_m: float = 0.5
+    benchmark_departure_cross_track_m: float = 2.0
+    benchmark_steer_sign_deadband: float = 0.05
+
     dashboard_colors: dict[str, tuple[int, int, int]] = field(
         default_factory=lambda: DEFAULT_DASHBOARD_COLORS.copy()
     )
@@ -492,7 +507,7 @@ class PipelineConfig:
     #: No window at all: for containers and remote runs without a display.
     ui_headless: bool = False
     ui_render_every_n: int = 1
-    ui_debug_view: str = "default"
+    ui_debug_page: int = 0
     ui_timing_overlay: bool = False
     ui_display_async: bool = True
     ui_display_rate_hz: float = 20.0

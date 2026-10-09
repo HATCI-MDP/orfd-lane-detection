@@ -32,11 +32,11 @@ def _make_config(**overrides) -> PipelineConfig:
 
 
 _STAGE_PATCHES = (
-    "offroad_autonomy.pipeline.ImagePreprocessor",
-    "offroad_autonomy.pipeline.RoadSegmenter",
-    "offroad_autonomy.pipeline.TemporalStabilizer",
-    "offroad_autonomy.pipeline.CenterlinePlanner",
-    "offroad_autonomy.pipeline.StanleyController",
+    "offroad_autonomy.stacks.mono_yoloe.pipeline.ImagePreprocessor",
+    "offroad_autonomy.stacks.mono_yoloe.pipeline.RoadSegmenter",
+    "offroad_autonomy.stacks.mono_yoloe.pipeline.TemporalStabilizer",
+    "offroad_autonomy.stacks.mono_yoloe.pipeline.CenterlinePlanner",
+    "offroad_autonomy.stacks.mono_yoloe.pipeline.StanleyController",
 )
 
 
@@ -82,14 +82,14 @@ def _capture(**overrides) -> CameraFrame:
 def _pipeline(stack, config):
     mocks = [stack.enter_context(patch(target)) for target in _STAGE_PATCHES]
     outputs = _wire(mocks)
-    from offroad_autonomy.pipeline import AutonomyPipeline
+    from offroad_autonomy.stacks.mono_yoloe.pipeline import AutonomyPipeline
 
     return AutonomyPipeline(config), mocks, outputs
 
 
 def test_pipeline_uses_stanley_with_the_perception_camera():
     from offroad_autonomy.control.stanley_controller import StanleyController
-    from offroad_autonomy.pipeline import AutonomyPipeline
+    from offroad_autonomy.stacks.mono_yoloe.pipeline import AutonomyPipeline
 
     with ExitStack() as stack:
         for target in _STAGE_PATCHES[:-1]:
@@ -100,58 +100,22 @@ def test_pipeline_uses_stanley_with_the_perception_camera():
     assert pipeline.controller._camera is pipeline.view.camera
 
 
-def test_pipeline_step_produces_control_command():
+def test_each_stage_receives_the_previous_stage_output():
     with ExitStack() as stack:
-        pipeline, mocks, _ = _pipeline(stack, _make_config())
-        command = pipeline.step(np.zeros((620, 960, 3), dtype=np.uint8), VehicleState())
-
-        assert isinstance(command, ControlCommand)
-        assert command.throttle == 0.3
-        for mock in mocks:
-            assert mock.return_value.method_calls
-
-
-def test_pipeline_step_result_exposes_stage_outputs():
-    with ExitStack() as stack:
-        pipeline, _, outputs = _pipeline(stack, _make_config())
-        packet, _, stabilized, plan, command = outputs
-
-        result = pipeline.step_result(_capture(), VehicleState())
-
-        assert isinstance(result, PipelineStepResult)
-        assert result.frame is packet
-        assert result.stabilized is stabilized
-        assert result.plan is plan
-        assert result.command is command
-        assert "segmentation" in result.timings_ms
-        assert "planning" in result.timings_ms
-
-
-@pytest.mark.parametrize(
-    "capture_kwargs",
-    [
-        {},
-        {"is_new": False},
-    ],
-)
-def test_rgb_stage_outputs_reach_control_without_depth(capture_kwargs):
-    with ExitStack() as stack:
-        matcher = stack.enter_context(patch("cv2.StereoSGBM_create"))
         pipeline, mocks, outputs = _pipeline(stack, _make_config())
         packet, perception, stabilized, plan, command = outputs
-        capture = _capture(**capture_kwargs)
+        capture = _capture()
         state = VehicleState(speed_mps=4.0)
 
-        assert pipeline.has_input(capture)
         result = pipeline.step_result(capture, state)
 
-        matcher.assert_not_called()
         mocks[0].return_value.process.assert_called_once_with(capture.image)
         mocks[1].return_value.predict.assert_called_once_with(packet, pipeline.valid_roi)
         mocks[2].return_value.stabilize.assert_called_once_with(perception)
         mocks[3].return_value.plan.assert_called_once_with(stabilized, vehicle_state=state)
         mocks[4].return_value.compute.assert_called_once_with(plan, state)
-        assert result.perception is perception
+        assert isinstance(result, PipelineStepResult)
+        assert (result.frame, result.stabilized, result.plan) == (packet, stabilized, plan)
         assert result.command is command
         assert set(result.timings_ms) == {
             "preprocess",
@@ -160,8 +124,6 @@ def test_rgb_stage_outputs_reach_control_without_depth(capture_kwargs):
             "planning",
             "control",
         }
-        assert not hasattr(result, "depth")
-        assert not hasattr(pipeline, "stereo_worker")
 
 
 def test_reset_clears_the_remaining_stateful_stages():
@@ -176,7 +138,6 @@ def test_missing_dashcam_is_not_accepted():
     with ExitStack() as stack:
         pipeline, _, _ = _pipeline(stack, _make_config())
         capture = _capture(image=None)
-        assert not pipeline.has_input(capture)
         with pytest.raises(ValueError, match="No frame available"):
             pipeline.step_result(capture, VehicleState())
 
@@ -184,7 +145,7 @@ def test_missing_dashcam_is_not_accepted():
 @pytest.mark.parametrize("planner_mode", ["baseline", "advanced"])
 @pytest.mark.parametrize("road_half_width", [120, 300])
 def test_rgb_pipeline_plans_and_controls_in_every_mode(planner_mode, road_half_width):
-    from offroad_autonomy.pipeline import AutonomyPipeline
+    from offroad_autonomy.stacks.mono_yoloe.pipeline import AutonomyPipeline
 
     config = _make_config(planner_mode=planner_mode)
 
@@ -201,7 +162,7 @@ def test_rgb_pipeline_plans_and_controls_in_every_mode(planner_mode, road_half_w
             road_fraction=float(mask.sum() / valid_roi.sum()),
         )
 
-    with patch("offroad_autonomy.pipeline.RoadSegmenter") as segmenter:
+    with patch("offroad_autonomy.stacks.mono_yoloe.pipeline.RoadSegmenter") as segmenter:
         segmenter.return_value.predict.side_effect = segment
         pipeline = AutonomyPipeline(config)
         result = pipeline.step_result(_capture(), VehicleState(speed_mps=1.0))
@@ -216,30 +177,6 @@ def test_rgb_pipeline_plans_and_controls_in_every_mode(planner_mode, road_half_w
     # A symmetric road must not produce a turn around the hood's silhouette.
     np.testing.assert_allclose(result.plan.centerline[:, 0], W / 2, atol=8)
     assert abs(result.command.steering) < 0.1
-
-
-def test_dashboard_telemetry_uses_only_rgb_and_display_runtime():
-    from offroad_autonomy.main import _build_dashboard_telemetry, _log_runtime
-    from offroad_autonomy.runtime.display_worker import DisplayWorker
-
-    with ExitStack() as stack:
-        pipeline, _, _ = _pipeline(stack, _make_config())
-        state = VehicleState(speed_mps=1.0)
-        result = pipeline.step_result(_capture(), state)
-        display = DisplayWorker(
-            render=lambda state: state.result.frame.raw,
-            show=lambda frame: True,
-            read_key=lambda: -1,
-        )
-        telemetry = _build_dashboard_telemetry(
-            state, result.command, result, result.plan, pipeline, True, True, display
-        )
-        _log_runtime(pipeline, display)
-
-    assert telemetry.fallback_state == "NONE"
-    assert "AUTONOMY LOOP" in telemetry.timing_lines
-    assert "DASHBOARD" in telemetry.timing_lines
-    assert all("stereo" not in line.lower() for line in telemetry.timing_lines)
 
 
 def test_dashcam_geometry_and_capture_reach_all_stages():

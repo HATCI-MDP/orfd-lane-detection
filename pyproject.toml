@@ -39,7 +39,8 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 # The dashboard loads its fonts from disk at startup and never falls back to another face.
-offroad_autonomy = ["visualization/fonts/*"]
+# Each stack's default.yaml is also its config schema, so it must ship with the code.
+offroad_autonomy = ["visualization/fonts/*", "stacks/*/default.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

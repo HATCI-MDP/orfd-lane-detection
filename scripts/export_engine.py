@@ -14,7 +14,7 @@ from pathlib import Path
 
 from ultralytics import YOLO
 
-from offroad_autonomy.utils.config import load_config
+from offroad_autonomy.stacks.mono_yoloe.config import load_pipeline_config_file
 
 
 def main() -> None:
@@ -30,7 +30,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    config = load_config(args.config)
+    config = load_pipeline_config_file(args.config)
     model = YOLO(args.weights)
     # An engine cannot be re-prompted at runtime, so the classes must be set
     # before export or the engine segments the checkpoint's default classes.

@@ -1,0 +1,341 @@
+# Settings for the mono_yoloe stack: one GMSL2 dashcam, YOLOE-26 road
+# segmentation, a ground-plane planner and Stanley steering.
+#
+# This file is the stack's schema as well as its defaults: a key under
+# stack_config in any run config is valid only if it is set here, so a
+# misspelled or outdated key stops the run at startup.
+#
+# Perception uses RGB only, and the dashcam below supplies every stage,
+# including the dashboard's main view.
+
+# One dashcam supplies inference, ground-plane planning, control and display.
+# BeamNG vehicle space: +X left, -Y forward, +Z up.
+camera:
+  name: dashcam
+  height_m: 1.85
+  forward_offset_m: -0.30
+  lateral_offset_m: 0.0
+  pitch_deg: -8.0
+  roll_deg: 0.0
+  yaw_deg: 0.0
+  sensor:
+    model: GMSL2
+    # One-third native resolution, uniformly resized to 720x465 for inference.
+    width: 960
+    height: 620
+    # Horizontal FOV; the simulator's vertical FOV is derived from aspect ratio.
+    fov_h: 120.0
+    target_fps: 30.0
+  # Regenerate after moving the camera: python scripts/derive_ego_mask.py
+  ego_mask:
+    enabled: true
+    margin_px: 1
+    polygon:
+      - [0.1794, 1.0000]
+      - [0.8220, 1.0000]
+      - [0.6871, 0.7888]
+      - [0.6314, 0.7134]
+      - [0.5007, 0.6983]
+      - [0.3700, 0.7134]
+      - [0.3143, 0.7888]
+
+perception:
+  # 26x costs ~40 ms/frame on an RTX 3060 Laptop even with BeamNG idle - on
+  # its own most of the 50 ms budget. 26l is ~25 ms, 26s ~15 ms. See README.
+  model_weights: "models/yoloe-26x-seg.pt"
+  # Semantic checkpoints use per-pixel confidence; prompts select fixed road
+  # class names (e.g. "traversable road") and never include background.
+  # SEGMENTATION_THRESHOLD: per-instance score the model must reach for an
+  # instance to enter the mask. Was 0.25 - measured on BeamNG frames
+  # (scripts/diagnose_perception.py) the correct road instance scores
+  # 0.11-0.78 and often 0.24-0.33, so 0.25 dropped whole frames at random.
+  # Frame-level trust is decided by planning.gate.confidence_threshold.
+  segmentation_threshold: 0.15
+  input_size: 640
+  prompts:
+    - "traversable road"
+    - "dirt road"
+    - "off-road trail"
+    - "drivable terrain"
+    - "gravel path"
+
+# When the stack asks the harness for a safe stop because it can no longer
+# see a road. The fraction is measured
+# over VALID pixels only (ego mask excluded), so bodywork in frame cannot trip
+# it - only a genuinely empty trail can.
+safety:
+  min_road_fraction: 0.015
+  no_road_time_s: 2.0
+
+preprocessing:
+  # Exactly 3/4 of the 960x620 capture (1/4 of the 2880x1860 imager), so the
+  # segmentation mask, planner and dashboard overlays share one grid.
+  target_width: 720
+  target_height: 465
+  enable_clahe: true
+  clahe_clip_limit: 2.0
+  clahe_grid_size: 8
+
+postprocessing:
+  # Re-enable ONE stage at a time, once the baseline drives cleanly:
+  #   stage 1 enable_morphology   stage 2 enable_ema
+  #   stage 3 planning.baseline_temporal_blend   stage 4 planning.mode: advanced
+  #   stage 5 control tuning
+  enable_morphology: false
+  enable_ema: false
+  ema_alpha: 0.7
+  min_mask_area_fraction: 0.001
+  morphology_kernel_size: 5
+
+planning:
+  # baseline: largest road component touching the vehicle -> centre of each
+  #           sampled row -> one quadratic fit. No scoring, clearance, Kalman
+  #           or straightening.
+  # advanced: the scoring / clearance / Kalman planner configured below.
+  # grid:     bird's-eye traversability grid with memory + arc planner, see
+  #           planning.grid. configs/grid.yaml switches to it.
+  mode: baseline
+  # ROI_HEIGHT: share of the frame, up from the bottom edge, the planner reads.
+  # Dashcam at 1.85 m, pitch -8 deg, 120 deg horizontal FOV:
+  # ROI starts at row 232, about 13 m ahead and below the horizon (row 203).
+  roi_height: 0.50
+  # Stage 3 - trajectory smoothing, done on the ground in metres: weight of
+  # the previous path at equal distances ahead (0 = each frame stands alone),
+  # plus a cap on how far the path may move sideways per frame at ANY range.
+  # Keeps the road's curvature, removes frame-to-frame jumps.
+  baseline_temporal_blend: 0.4
+  baseline_max_shift_m: 0.5
+  # A frame that fails any check produces NO new path: the last good path is
+  # reused for hold_frames at hold_speed_scale x speed, then the car brakes.
+  gate:
+    confidence_threshold: 0.18 # accept a connected road at 0.19; matches PipelineConfig
+    min_mask_area: 0.05 # MIN_MASK_AREA: road component / planner ROI
+    hold_frames: 10 # ~0.5 s at 20 Hz
+    hold_speed_scale: 0.4
+  # --- advanced mode only below, except min_road_pixels (also a gate check)
+  centerline_samples: 20
+  backend: heuristic
+  horizon_fraction: 0.82
+  smoothing_window: 7
+  clearance_weight: 0.65
+  prior_std_fraction: 0.14
+  min_confidence: 0.18
+  segment_center_weight: 0.68
+  temporal_blend: 0.65
+  max_lateral_step_px: 32.0
+  straight_blend: 0.72
+  straight_residual_px: 4.0
+  straight_heading_threshold: 0.08
+  kalman_process_noise: 5.0e-4
+  kalman_measurement_noise: 1.0e-1
+  fallback_after_n_misses: 3
+  min_road_pixels: 2000 # valid traversable pixels inside the ROI
+  # --- grid mode only: bird's-eye traversability grid + arc ("tentacle") planner.
+  # The road mask is projected onto flat ground, fused over time with the
+  # vehicle's motion, and a fan of steerable arcs is scored on it. Cells the
+  # camera cannot see (under the hood, off the image sides) are unknown, never
+  # "not road", and memory carries the road the hood now hides. Values below
+  # were checked on one recorded run only; judge them on a multi-map set.
+  grid:
+    # 0.1 m cells: a 1.9 m wide vehicle spans 19 cells. A 200 x 200 grid
+    # planned in about 3 ms per frame on an i9-12900K in an offline replay.
+    cell_m: 0.10
+    # The gate ROI ends ~13.4 m ahead, so 16 m holds every observed cell.
+    ahead_m: 16.0
+    # Behind the camera: the rear axle (control.camera_ahead_of_rear_axle_m)
+    # plus the road the vehicle has just driven over.
+    behind_m: 4.0
+    # Wider than any trail; a full-lock arc (4.2 m radius) stays within 8.4 m sideways.
+    half_width_m: 10.0
+    # Evidence fades with this time constant. At 4 m/s the 3 m hidden by the
+    # hood was in view 0.75 s earlier, well inside the memory.
+    memory_s: 2.0
+    # Log-odds added per frame for road / not road. One frame is enough to
+    # mark a cell; the stabilizer's EMA has already smoothed the mask.
+    road_logodds: 0.85
+    offroad_logodds: -0.85
+    logodds_limit: 4.0
+    # A cell is road above road_threshold and an obstacle below
+    # blocked_threshold; between them it is unknown.
+    road_threshold: 0.5
+    blocked_threshold: -0.5
+    # Odd so the straight arc is a candidate. 41 arcs over full lock is a
+    # 0.012 /m curvature step, ~0.5 m sideways at 8 m; finer sets flipped
+    # between near-equal arcs more often on the recorded run.
+    arc_count: 41
+    lookahead_m: 14.0
+    # Under a third of the vehicle width, so an arc cannot step over an edge.
+    step_m: 0.25
+    # The path starts 1 m ahead of the camera; nearer points are under the car.
+    start_m: 1.0
+    # A supported arc shorter than this is not a path: the gate holds, then stops.
+    min_path_m: 4.0
+    # Required clearance = control.vehicle_half_width_m + this margin.
+    clearance_margin_m: 0.1
+    # Clearance counts up to half a wide trail. A 2 m cap saturated on wide
+    # roads and the planner stopped centring.
+    clearance_cap_m: 4.0
+    # Score = length seen as road + clearance - change from last arc - bend.
+    weight_length: 1.0
+    weight_clearance: 1.0
+    # Only breaks near-ties; at 0.4 it locked onto the first arc it picked.
+    weight_consistency: 0.2
+    weight_curvature: 0.1
+    weight_trajectory_distance: 0.35 # penalty per metre from the motion-compensated prior path
+
+control:
+  # Half the vehicle width keeps the road-edge margin outside the bodywork.
+  vehicle_half_width_m: 0.95
+  # Everything below runs on the ground plane: the path is projected into
+  # metres and fitted as right(f) = a + b*f + c*f^2 (see stanley_controller).
+  #
+  # ---- Steering: wheel = atan(L*kappa_ff) + k_psi*psi + atan(k*e/rejoin)
+  # psi and e are read at the pose the car will have when the command lands
+  # (speed * latency along its current arc) - see latency_pose_prediction.
+  # Curvature feedforward weight: 1.0 steers exactly for the path's arc, so
+  # turning starts as the bend arrives instead of after the error builds up.
+  curvature_feedforward_gain: 1.0
+  stanley_heading_gain: 0.85
+  # Cross-track gain per metre of offset past the deadzone, over the rejoin
+  # distance below. Was 1.0: with latency prediction on, 1.5 is stable even
+  # at 3 FPS / 3-frame delay; 2.0 was not (scripts/sbend_sim.py sweeps).
+  stanley_gain_k: 1.5
+  stanley_softening: 2.4
+  # Cross-track deadzone, was a hard 0.5 m band. A hard band let the car
+  # drift to its edge and then kicked it back (a 3-4 s, ~0.9 m weave), so it
+  # is now soft: e - tol*tanh(e/tol) - ~0 for small offsets, e - tol for
+  # real ones, nothing switching in between.
+  cross_track_tolerance_m: 0.3
+  cross_track_soft_deadzone: true
+  # Read heading AND cross-track at the pose after the loop latency. Reading
+  # the offset at the bumper "now" left ~0.8 s of delay uncompensated and was
+  # the main source of drift: mean off-centre 0.54 -> 0.43 m on its own.
+  latency_pose_prediction: true
+  # Capture-to-actuation delay. Heading and curvature are read where the car
+  # will be when the command lands (speed * latency ahead), not where it was.
+  control_latency_s: 0.35
+  #
+  # ---- Adaptive lookahead: clip(base + time*v, min, max), then shrunk as
+  # base / (1 + gain * |kappa| * base). Straight road at 10 mph: ~5.7 m;
+  # a 10 m radius bend at 5 mph: ~2.7 m, so the feedforward averages over the
+  # bend the car is in, not the reverse half of an S behind it.
+  lookahead_base_m: 3.0
+  lookahead_time_s: 0.6
+  lookahead_min_m: 2.0
+  lookahead_max_m: 8.0
+  lookahead_curvature_gain: 2.0
+  #
+  # ---- Speed: min of cruise, curve profile, path end, saturation.
+  # Straights run at this (was 8 mph; bends now slow themselves down).
+  target_speed_mph: 10.0
+  speed_limit_mph: 15.0
+  # Curve speed v = sqrt(a_lat / |kappa|): 10 m radius -> 2.2 m/s, 5 m radius
+  # -> crawl. Low on purpose: at ~4 FPS the loop's latency is the limit, and
+  # slower bends were what kept the S-bend sim stable at 3 FPS (10/12 runs vs
+  # 6/12 at 1.0).
+  max_lateral_accel_mps2: 0.5
+  # Brake toward each bend's speed at this rate from wherever it is seen, so
+  # the car is already slow on entry.
+  curve_decel_mps2: 0.8
+  # Floor for curve/saturation slow-downs (crawl, still steerable).
+  min_turn_speed_mph: 3.0
+  #
+  # ---- Saturation: saturation = max(|applied steer|, steer the sharpest
+  # bend ahead needs). Above `start` the target speed AND the throttle
+  # ceiling are cut linearly, to `min_speed_scale` of cruise at full lock.
+  saturation_start: 0.5
+  saturation_min_speed_scale: 0.35
+  # Full lock is for crawling: the steering cap is 1.0 up to 2 m/s and
+  # falls to 0.6 at 5 m/s. Asking for more saturates -> the car slows ->
+  # the cap relaxes. Never full lock at speed.
+  steer_cap_full_speed_mps: 2.0
+  steer_cap_high_speed_mps: 5.0
+  steer_cap_at_high_speed: 0.6
+  # After a bend, the target speed rises by at most this per control frame
+  # (~0.4 m/s^2 at 4 FPS). Between the two halves of an S the fitted path
+  # looks straight for a moment; without this the car sprinted into the
+  # reverse bend and braked inside it.
+  max_target_speed_increase_mps: 0.1
+  # Routine slow-downs (bend, saturation) brake at most this hard; hard
+  # braking pitched the camera and shook the path. Path end and
+  # clearance still get max_brake.
+  comfort_brake: 0.35
+  # Curvature is always clamped to the full-lock curvature
+  # tan(max_wheel_angle) / wheelbase (~0.24 /m, a 4.2 m radius) - in BeamNG a
+  # few-metre path once fitted to 0.4-1.0 /m on a straight road. Below this
+  # reach past the preview point it is also scaled by (reach / this)^2. Keep
+  # it SHORT: the planner legitimately ends the path ~4 m out in a tight bend
+  # (it stops where the road turns past 45 deg), and 5 m here under-steered
+  # every 5 m-radius S-bend in scripts/sbend_sim.py.
+  min_curvature_span_m: 2.0
+  #
+  # ---- Trail centring (all measured in scripts/sbend_sim.py on a 6 m trail;
+  # together with the gains above: mean off-centre 0.66 -> 0.31 m, p95
+  # 1.38 -> 0.75 m, worst 1.84 -> 0.99 m, at ~25% more time).
+  #
+  # Cross-track adaptive lookahead, as a RECOVERY mode: the rejoin distance
+  # is the normal lookahead until the offset exceeds cross_track_recovery_m
+  # past the deadzone, then shrinks as lookahead / (1 + gain * excess).
+  # Shrinking it continuously (from 0 m) destabilised the loop at 3 FPS.
+  cross_track_lookahead_gain: 1.0
+  cross_track_recovery_m: 0.5
+  cross_track_min_lookahead_m: 1.5
+  # Trail edges come from the planner's traversable mask along the car's
+  # predicted arc. "Clearance" = distance to the nearer edge minus the
+  # vehicle half-width (control.vehicle_half_width_m). Inside edge_margin_m:
+  #  - the steering reference is pulled toward the centre of the traversable
+  #    run, by edge_centering_gain at the edge (the planner's path is already
+  #    the per-row centre; this bites where the fit leaves it near a side),
+  #  - edge risk rises 0 -> 1 and the target speed is cut by up to
+  #    edge_speed_reduction of cruise.
+  edge_margin_m: 0.75
+  edge_centering_gain: 0.7
+  edge_speed_reduction: 0.6
+  # While |cross-track| is growing, target / (1 + gain * rate[m/s]). The
+  # single most effective centring term in the sim (3 FPS worst case
+  # 1.75 -> 0.98 m) - drift is caught while it is still small.
+  drift_speed_gain: 2.0
+  # Measured lateral acceleration budget: speed^2 x the applied steering's
+  # curvature. Above it, v <= sqrt(budget / curvature). (The planning budget
+  # above, max_lateral_accel_mps2, is for the bends the car SEES coming.)
+  max_measured_lateral_accel_mps2: 0.8
+  # Mild extra gain reduction at speed (full below 3 m/s).
+  steer_full_authority_speed_mps: 3.0
+  steer_speed_falloff: 0.08
+  #
+  # Output smoothing: EMA, then a hard cap on change per control frame.
+  # BeamNG itself slews the Hopper's steering at ~0.9/s (measured: 0 -> 0.6
+  # in ~0.7 s), so the cap only needs to stop jumps, not add smoothing:
+  # 0.3 per frame (~1.2/s at 4 FPS). At 0.12 (~0.5/s) OUR limiter was the
+  # slowest element in the loop and the S-bend reversal came too late.
+  steering_ema_alpha: 0.45
+  max_steering_delta: 0.3
+  # Hopper geometry - ESTIMATES, check against the jbeam. They convert wheel
+  # angles to BeamNG's [-1, 1] input and curvature to required steering.
+  wheelbase_m: 2.6
+  # The grid's arcs start at the rear axle; this offset also anchors the S-bend simulation.
+  camera_ahead_of_rear_axle_m: 1.4
+  max_wheel_angle_deg: 32.0
+  # Never arrive at the end of the perceived path moving:
+  # v <= sqrt(2 * decel * (path_end - margin)).
+  path_end_margin_m: 1.5
+  path_end_decel_mps2: 2.0
+  # Was 0.45: the Hopper then launches at ~4 m/s^2 and overshoots the
+  # target before the 4 FPS loop can react.
+  max_throttle: 0.3
+  max_brake: 0.8
+  speed_kp: 0.22
+  clearance_slow_m: 6.0 # start easing off when an obstacle is this close
+  clearance_stop_m: 2.5 # hold at the minimum turn speed by this point
+
+# The stack card's bars. Their floors are not set here: they are
+# planning.gate.confidence_threshold and safety.min_road_fraction, so a tick
+# always sits where the gate or the safe stop actually triggers.
+dashboard:
+  # Segmentation confidence is red below planning.gate.confidence_threshold
+  # (the gate rejects the frame there), amber up to this value, green above.
+  confidence_good: 0.5
+  # Road / valid px is tiny when healthy; the bar saturates here so the
+  # safe stop tick (safety.min_road_fraction) stays visible and not a hair
+  # at the left edge.
+  road_bar_full_scale: 0.2

@@ -1,5 +1,6 @@
 # Opt-in planner profile; default.yaml keeps the baseline planner for A/B runs.
-# Settings live in planning.grid in default.yaml.
+# Grid settings live in planning.grid in the mono_yoloe stack's default.yaml.
 extends: default.yaml
-planning:
-  mode: grid
+stack_config:
+  planning:
+    mode: grid

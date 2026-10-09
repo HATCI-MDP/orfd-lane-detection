@@ -3,12 +3,13 @@
 # attach to it over a socket. This only swaps the model and draws nothing.
 extends: default.yaml
 
-perception:
-  # 26x alone costs ~40 ms per frame on a laptop RTX 3060, so a Jetson needs
-  # a smaller model and a TensorRT engine to meet the loop budget. Engines
-  # are tied to the GPU that built them: run scripts/export_engine.py on the
-  # device.
-  model_weights: "models/yoloe-26s-seg.engine"
+stack_config:
+  perception:
+    # 26x alone costs ~40 ms per frame on a laptop RTX 3060, so a Jetson needs
+    # a smaller model and a TensorRT engine to meet the loop budget. Engines
+    # are tied to the GPU that built them: run scripts/export_engine.py on the
+    # device.
+    model_weights: "models/yoloe-26s-seg.engine"
 
 ui:
   headless: true

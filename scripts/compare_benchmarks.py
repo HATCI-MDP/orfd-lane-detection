@@ -4,43 +4,22 @@
     python scripts/compare_benchmarks.py output/benchmarks/*.json
 
 Each report comes from one ``--benchmark-seconds`` run of
-``offroad-autonomy``. Values the run could not measure print as "-".
+``offroad-autonomy``. Every column is scored by the harness from simulator
+ground truth, so runs of different stacks compare fairly; values a run could
+not measure (no reference route, say) print as "-".
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
-COLUMNS = (
-    ("run", lambda r: r.get("label")),
-    ("FPS", lambda r: r.get("main_fps")),
-    ("lat mean", lambda r: r.get("primary_latency_mean_ms")),
-    ("lat p95", lambda r: r.get("primary_latency_p95_ms")),
-    ("loop p95", lambda r: r.get("full_loop_p95_ms")),
-    ("seg conf", lambda r: r.get("segmentation_confidence_mean")),
-    ("jitter", lambda r: r.get("path_jitter_pct")),
-    ("departures", lambda r: r.get("lane_departures")),
-    (">=20FPS", lambda r: _yes_no(r.get("meets_20fps"))),
-    ("<=50ms", lambda r: _yes_no(r.get("meets_50ms"))),
-)
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
 
-
-def _yes_no(flag) -> str:
-    if flag:
-        return "yes"
-    return "no"
-
-
-def _cell(value) -> str:
-    if value is None:
-        return "-"
-    if isinstance(value, float):
-        if abs(value) < 10:
-            return f"{value:.2f}"
-        return f"{value:.1f}"
-    return str(value)
+from offroad_autonomy.runtime.benchmark import comparison_table
 
 
 def main() -> None:
@@ -49,24 +28,9 @@ def main() -> None:
     parser.add_argument("--markdown", action="store_true", help="Emit a Markdown table.")
     args = parser.parse_args()
 
-    rows = []
-    for path in sorted(args.reports):
-        report = json.loads(path.read_text(encoding="utf-8"))
-        rows.append([_cell(fn(report)) for _, fn in COLUMNS])
-
-    headers = [name for name, _ in COLUMNS]
-    if args.markdown:
-        print("| " + " | ".join(headers) + " |")
-        print("|" + "|".join("---" for _ in headers) + "|")
-        for row in rows:
-            print("| " + " | ".join(row) + " |")
-        return
-
-    widths = [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(headers)]
-    print("  ".join(h.ljust(w) for h, w in zip(headers, widths)))
-    print("  ".join("-" * w for w in widths))
-    for row in rows:
-        print("  ".join(c.ljust(w) for c, w in zip(row, widths)))
+    reports = [json.loads(path.read_text(encoding="utf-8")) for path in sorted(args.reports)]
+    for line in comparison_table(reports, markdown=args.markdown):
+        print(line)
 
 
 if __name__ == "__main__":
