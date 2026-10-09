@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import logging
 import math
-import time
 from dataclasses import dataclass, replace
 from typing import Protocol
 
@@ -16,13 +15,14 @@ from scipy.signal import savgol_filter
 from offroad_autonomy.perception.camera_geometry import CameraModel
 from offroad_autonomy.planning.arc_planner import ArcPlanner
 from offroad_autonomy.planning.baseline_planner import BaselinePlanner
-from offroad_autonomy.planning.bev_grid import TraversabilityGrid, ground_pose
+from offroad_autonomy.planning.bev_grid import TraversabilityGrid
+from offroad_autonomy.planning.odometry import DeadReckoning
 from offroad_autonomy.planning.perception_gate import GateDecision, PerceptionGate
 from offroad_autonomy.types import (
     PathPlan,
     PipelineConfig,
     StabilizedResult,
-    VehicleState,
+    VehicleSignals,
 )
 
 logger = logging.getLogger("offroad_autonomy.planning")
@@ -76,7 +76,6 @@ class _PlannerScene:
     stability_score: float
     lateral_prior_px: float
     heading_prior: float
-    ego_heading_rad: float
 
 
 class _PlannerBackend(Protocol):
@@ -261,8 +260,11 @@ class CenterlinePlanner:
         self._grid_config = config.grid
         # Built on the first frame, once the mask size and ego exclusion are known.
         self._grid: TraversabilityGrid | None = None
-        self._grid_time: float | None = None
-        self._direction_warned = False
+        self._odometry = DeadReckoning(config.grid.max_odometry_gap_s)
+        # Where the camera's ground point sits from the rear axle that the
+        # odometry tracks; BeamNG vehicle space has +X to the left.
+        self._camera_ahead_m = float(config.camera_ahead_of_rear_axle_m)
+        self._camera_left_m = float(self._camera.position[0])
         self._arcs = ArcPlanner(
             config.grid,
             wheelbase_m=config.wheelbase_m,
@@ -275,7 +277,7 @@ class CenterlinePlanner:
     def plan(
         self,
         stabilized: StabilizedResult,
-        vehicle_state: VehicleState | None = None,
+        signals: VehicleSignals | None = None,
     ) -> PathPlan:
         """A frame that fails the gate never produces a new path: driving a
         path no perception supports is how the vehicle used to leave the
@@ -289,7 +291,7 @@ class CenterlinePlanner:
             decision.component[~valid.all(axis=1)] = False
 
         if self._mode == "grid":
-            return self._plan_grid(stabilized, decision, vehicle_state)
+            return self._plan_grid(stabilized, decision, signals)
 
         if not decision.ok:
             return self._hold(decision)
@@ -306,7 +308,7 @@ class CenterlinePlanner:
                 road_width_px=self._estimate_road_width(decision.component, centerline),
             )
         else:
-            plan = self._plan_advanced(replace(stabilized, mask=decision.component), vehicle_state)
+            plan = self._plan_advanced(replace(stabilized, mask=decision.component))
             if plan.kalman_active:
                 # A predicted path is not a perceived one; never drive it at
                 # full speed or remember it as the last good path.
@@ -323,7 +325,7 @@ class CenterlinePlanner:
         self,
         stabilized: StabilizedResult,
         decision: GateDecision,
-        vehicle_state: VehicleState | None,
+        signals: VehicleSignals | None,
     ) -> PathPlan:
         """The grid keeps tracking the vehicle on every frame, but only a
         frame that passed the gate adds evidence: a rejected mask must not
@@ -336,54 +338,46 @@ class CenterlinePlanner:
                 stabilized.valid_roi,
                 self._gate.roi_top(mask.shape[0]),
             )
-        now = time.perf_counter()
-        dt = 0.0
-        if self._grid_time is not None:
-            dt = now - self._grid_time
-        self._grid_time = now
-
-        self._check_direction(vehicle_state)
+        rear_axle = self._odometry.update(signals)
+        pose = None
+        if rear_axle is not None:
+            pose = rear_axle.offset(self._camera_ahead_m, self._camera_left_m)
         observation = None
         if decision.ok:
             observation = mask
-        self._grid.update(observation, ground_pose(vehicle_state, self._camera), dt)
+        self._grid.update(observation, pose, self._odometry.interval_s)
 
         if not decision.ok:
             return self._hold(decision)
 
-        choice = self._arcs.choose(self._grid, ground_pose(vehicle_state, self._camera))
+        choice = self._arcs.choose(self._grid, pose)
         if choice is None:
             decision.reason = "no drivable arc in the grid"
             return self._hold(decision)
 
+        # The controller centres the path on the trail it finds in this mask,
+        # so it gets all the road the grid planned on, not only the gate's
+        # largest component: at a fork that component can be the other branch.
+        # Rows the hood cuts are left out, as they are from the component.
+        road = mask.copy()
+        road[: decision.roi_top] = False
+        valid = stabilized.valid_roi
+        if valid is not None and valid.shape == road.shape:
+            road &= valid
+            road[~valid.all(axis=1)] = False
         # Pixels far -> near, the order Stanley expects from every planner.
         centerline = self._camera.ground_to_image(choice.forward_m, choice.right_m)[::-1].copy()
         plan = PathPlan(
             centerline=centerline,
             heading_rad=self._estimate_heading(centerline),
             curvature=self._estimate_curvature(centerline),
-            road_width_px=self._estimate_road_width(decision.component, centerline),
+            road_width_px=self._estimate_road_width(road, centerline),
         )
-        plan.planner_mask = decision.component
+        plan.planner_mask = road
         plan.roi_top = decision.roi_top
         self._last_good = plan
         self._held = 0
         return plan
-
-    def _check_direction(self, vehicle_state: VehicleState | None) -> None:
-        """Driving forward, velocity and the simulator's direction vector must
-        agree; if they do not, the grid would shift its memory the wrong way."""
-        if self._direction_warned or vehicle_state is None or vehicle_state.direction is None:
-            return
-        if vehicle_state.speed_mps < 2.0:
-            return
-        vx, vy = vehicle_state.velocity[0], vehicle_state.velocity[1]
-        dx, dy = vehicle_state.direction[0], vehicle_state.direction[1]
-        if vx * dx + vy * dy < 0.0:
-            logger.warning(
-                "Vehicle direction points against its velocity; grid memory may be mirrored"
-            )
-            self._direction_warned = True
 
     @property
     def grid(self) -> TraversabilityGrid | None:
@@ -419,11 +413,7 @@ class CenterlinePlanner:
             roi_top=decision.roi_top,
         )
 
-    def _plan_advanced(
-        self,
-        stabilized: StabilizedResult,
-        vehicle_state: VehicleState | None = None,
-    ) -> PathPlan:
+    def _plan_advanced(self, stabilized: StabilizedResult) -> PathPlan:
         mask = stabilized.mask
         h, w = mask.shape[:2]
         road_px = int(mask.sum())
@@ -432,12 +422,7 @@ class CenterlinePlanner:
         if road_px < self._min_road_px:
             return self._fallback(h, w, prior_state)
 
-        scene = self._build_scene(
-            mask,
-            stabilized.stability_score,
-            prior_state,
-            vehicle_state,
-        )
+        scene = self._build_scene(mask, stabilized.stability_score, prior_state)
         waypoints, confidence = self._backend.infer(scene)
         if len(waypoints) < 2 or confidence < self._min_confidence:
             return self._fallback(h, w, prior_state)
@@ -471,7 +456,6 @@ class CenterlinePlanner:
         mask: np.ndarray,
         stability_score: float,
         prior_state: np.ndarray,
-        vehicle_state: VehicleState | None,
     ) -> _PlannerScene:
         mask_u8 = mask.astype(np.uint8)
 
@@ -485,10 +469,6 @@ class CenterlinePlanner:
         if float(clearance.max()) > 0.0:
             clearance /= float(clearance.max())
 
-        ego_heading = 0.0
-        if vehicle_state is not None:
-            ego_heading = float(vehicle_state.heading_rad)
-
         return _PlannerScene(
             mask=mask.astype(bool),
             traversability=traversability,
@@ -496,7 +476,6 @@ class CenterlinePlanner:
             stability_score=float(stability_score),
             lateral_prior_px=float(prior_state[0]),
             heading_prior=float(prior_state[1]),
-            ego_heading_rad=ego_heading,
         )
 
     def _postprocess_trajectory(self, waypoints: np.ndarray, h: int, w: int) -> np.ndarray:
@@ -716,5 +695,5 @@ class CenterlinePlanner:
         self._held = 0
         if self._grid is not None:
             self._grid.reset()
-        self._grid_time = None
+        self._odometry.reset()
         self._arcs.reset()

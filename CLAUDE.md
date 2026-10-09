@@ -28,6 +28,8 @@ Rules that carry weight:
   read them: a stack talks to the harness only through `contract.py`. Adding a stack must not
   change the harness, dashboard or benchmark.
 - The benchmark scores from simulator ground truth, never from what a stack reports.
+- A stack sees only what a production vehicle senses: its declared sensors and
+  `VehicleSignals` (wheel speed and yaw rate). The world pose stays in the harness.
 - Safety stays in the harness. A stack may ask for a safe stop but can never disable one.
 - A stack's `step` must return within the loop budget; slow work belongs on its own worker,
   and a costly debug image is an `ImageLayer` whose image is a function.

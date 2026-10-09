@@ -16,7 +16,7 @@ from offroad_autonomy.contract import (
     camera_spec,
 )
 from offroad_autonomy.stacks.mono_yoloe.config import load_pipeline_config
-from offroad_autonomy.types import PerceptionResult, VehicleState
+from offroad_autonomy.types import PerceptionResult, VehicleSignals, VehicleState
 
 H, W = 465, 720
 
@@ -59,7 +59,7 @@ def _observation(t: float = 0.0, speed: float = 1.0) -> Observation:
     image = np.zeros((620, 960, 3), dtype=np.uint8)
     return Observation(
         sensors={"dashcam": image},
-        vehicle=VehicleState(speed_mps=speed),
+        vehicle=VehicleSignals(speed_mps=speed),
         timestamp=t,
         frame_id=1,
     )

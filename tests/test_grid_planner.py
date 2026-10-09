@@ -9,10 +9,16 @@ import pytest
 from offroad_autonomy.control.stanley_controller import StanleyController, path_to_ground
 from offroad_autonomy.perception.perception_view import PerceptionView
 from offroad_autonomy.planning.arc_planner import ArcPlanner
-from offroad_autonomy.planning.bev_grid import GroundPose, TraversabilityGrid, ground_pose
+from offroad_autonomy.planning.bev_grid import TraversabilityGrid
 from offroad_autonomy.planning.centerline_planner import CenterlinePlanner
 from offroad_autonomy.planning.grid_config import GridPlannerConfig
-from offroad_autonomy.types import PerceptionResult, PipelineConfig, StabilizedResult, VehicleState
+from offroad_autonomy.planning.odometry import DeadReckoning, GroundPose
+from offroad_autonomy.types import (
+    PerceptionResult,
+    PipelineConfig,
+    StabilizedResult,
+    VehicleSignals,
+)
 
 CONFIG = replace(PipelineConfig(), planner_mode="grid")
 VIEW = PerceptionView(CONFIG)
@@ -131,17 +137,6 @@ def test_evidence_fades_with_the_memory_time_constant():
     assert float(_cells(grid, 8.0, 0.0)) == pytest.approx(before / math.e, rel=1e-4)
 
 
-def test_ground_pose_uses_the_simulator_direction_vector():
-    state = VehicleState(position=(10.0, 5.0, 0.0), direction=(0.0, 1.0, 0.0))
-
-    pose = ground_pose(state, CAMERA)
-
-    # The camera sits 0.30 m ahead of the vehicle origin, along +y here.
-    assert pose.x == pytest.approx(10.0)
-    assert pose.y == pytest.approx(5.0 + 0.30)
-    assert ground_pose(VehicleState(), CAMERA) is None
-
-
 def _choose(is_road, arcs=None):
     grid = _grid()
     grid.update(_road_mask(is_road), _pose(), dt_s=0.0)
@@ -182,6 +177,26 @@ def test_the_path_ends_where_the_road_does():
     assert choice.forward_m.max() < 7.0
 
 
+def test_a_wide_road_bending_away_from_the_previous_path_is_followed():
+    """On a 14 m road the straight previous path stays clear for metres after
+    the road bends. Scored in metres, straying from it cost more than centring
+    gained, and the vehicle drove straight on into the outside of the bend."""
+    grid, arcs = _grid(), _arcs()
+    grid.update(_road_mask(_bend(-0.05, half_width_m=7.0)), _pose(), dt_s=0.0)
+    straight = int(np.argmin(np.abs(arcs.curvatures)))
+    ahead = arcs._forward[straight] >= CONFIG.grid.start_m
+    arcs._previous = 0.0
+    arcs._previous_path = np.column_stack(
+        (arcs._forward[straight, ahead], arcs._right[straight, ahead])
+    )
+    arcs._previous_pose = _pose()
+
+    choice = arcs.choose(grid, _pose())
+
+    # Negative curvature turns left, with the road.
+    assert choice.curvature < 0.0
+
+
 def test_no_road_means_no_arc():
     assert _choose(lambda f, r: np.zeros_like(f, dtype=bool)) is None
 
@@ -200,9 +215,9 @@ def _stabilized(mask):
 
 def test_grid_mode_hands_the_controller_a_usable_path():
     planner = CenterlinePlanner(CONFIG, camera=CAMERA)
-    state = VehicleState(direction=(1.0, 0.0, 0.0), speed_mps=3.0, velocity=(3.0, 0.0, 0.0))
+    state = VehicleSignals(speed_mps=3.0)
 
-    plan = planner.plan(_stabilized(_road_mask(_straight(2.0))), vehicle_state=state)
+    plan = planner.plan(_stabilized(_road_mask(_straight(2.0))), signals=state)
 
     assert not plan.fallback_active
     forward, right, keep = path_to_ground(CAMERA, plan.centerline)
@@ -212,14 +227,30 @@ def test_grid_mode_hands_the_controller_a_usable_path():
     assert command.throttle > 0.0
 
 
+def test_grid_mode_hands_the_controller_the_whole_road_it_planned_on():
+    """At a fork the gate's largest component can be the branch the grid did
+    not choose; the controller centres on what it is given, so it gets both."""
+    planner = CenterlinePlanner(CONFIG, camera=CAMERA)
+    main = _road_mask(_straight(2.0))
+    branch = _road_mask(lambda f, r: (r > 4.0) & (r < 6.0) & (f > 6.0))
+
+    plan = planner.plan(_stabilized(main | branch), signals=VehicleSignals())
+
+    assert not plan.fallback_active
+    assert (plan.planner_mask & branch).any()
+    assert not plan.planner_mask[:ROI_TOP].any()
+    hood_rows = ~VALID.all(axis=1)
+    assert not plan.planner_mask[hood_rows].any()
+
+
 def test_grid_mode_stops_when_no_arc_fits_the_vehicle():
     """A 2.0 m trail passes the gate but is narrower than the 2.1 m the
     vehicle needs, so the planner, not the gate, refuses it."""
     planner = CenterlinePlanner(CONFIG, camera=CAMERA)
     narrow = _stabilized(_road_mask(_straight(1.0)))
-    state = VehicleState(direction=(1.0, 0.0, 0.0))
+    state = VehicleSignals()
 
-    plan = planner.plan(narrow, vehicle_state=state)
+    plan = planner.plan(narrow, signals=state)
 
     assert plan.speed_scale == 0.0
     assert "no drivable arc" in plan.fallback_reason
@@ -227,24 +258,24 @@ def test_grid_mode_stops_when_no_arc_fits_the_vehicle():
 
 def test_memory_keeps_the_path_through_one_bad_frame():
     planner = CenterlinePlanner(CONFIG, camera=CAMERA)
-    state = VehicleState(direction=(1.0, 0.0, 0.0))
-    planner.plan(_stabilized(_road_mask(_straight(2.0))), vehicle_state=state)
+    state = VehicleSignals()
+    planner.plan(_stabilized(_road_mask(_straight(2.0))), signals=state)
 
-    plan = planner.plan(_stabilized(_road_mask(_straight(1.0))), vehicle_state=state)
+    plan = planner.plan(_stabilized(_road_mask(_straight(1.0))), signals=state)
 
     assert not plan.fallback_active
 
 
 def test_a_frame_the_gate_rejects_adds_no_evidence():
     planner = CenterlinePlanner(CONFIG, camera=CAMERA)
-    state = VehicleState(direction=(1.0, 0.0, 0.0))
+    state = VehicleSignals()
     rejected = StabilizedResult(
         mask=_road_mask(_straight(2.0)),
         valid_roi=VALID,
         raw_result=PerceptionResult(mask=None, confidences=[0.01]),
     )
 
-    planner.plan(rejected, vehicle_state=state)
+    planner.plan(rejected, signals=state)
 
     assert not planner.grid.logodds.any()
 
@@ -291,3 +322,44 @@ def test_model_false_positive_can_persist_but_corrected_evidence_clears_it():
     for _ in range(10):
         grid.update(correct_mask, _pose(), dt_s=0.0)
     assert _cells(grid, 8.0, 4.0) < CONFIG.grid.blocked_threshold
+
+
+def test_dead_reckoned_memory_matches_exact_registration():
+    """On a constant turn dead reckoning is exact, so memory moved by wheel
+    speed and yaw rate lands where the true pose would put it."""
+    exact, reckoned = _grid(), _grid()
+    odometry = DeadReckoning(max_gap_s=1.0)
+    ahead = CONFIG.camera_ahead_of_rear_axle_m
+    speed, yaw_rate, dt = 3.0, 0.3, 0.25
+    mask = _road_mask(_bend(-0.04))
+    for frame in range(6):
+        heading = yaw_rate * dt * frame
+        radius = speed / yaw_rate
+        rear = GroundPose(
+            x=radius * math.sin(heading),
+            y=radius * (1.0 - math.cos(heading)),
+            forward_x=math.cos(heading),
+            forward_y=math.sin(heading),
+        )
+        observation = None
+        if frame == 0:
+            observation = mask
+        exact.update(observation, rear.offset(ahead, 0.0), dt)
+        signals = VehicleSignals(speed_mps=speed, yaw_rate_rps=yaw_rate, timestamp_s=frame * dt)
+        reckoned.update(observation, odometry.update(signals).offset(ahead, 0.0), dt)
+
+    assert exact.logodds.any()
+    np.testing.assert_allclose(reckoned.logodds, exact.logodds, atol=1e-3)
+
+
+def test_losing_the_vehicle_signals_makes_the_grid_forget():
+    planner = CenterlinePlanner(CONFIG, camera=CAMERA)
+    road = _stabilized(_road_mask(_straight(2.0)))
+    planner.plan(road, signals=VehicleSignals(speed_mps=3.0, timestamp_s=0.0))
+    planner.plan(road, signals=VehicleSignals(speed_mps=3.0, timestamp_s=1.0))
+    # Under the hood now: only memory can know it is road.
+    assert _cells(planner.grid, 1.5, 0.0) > CONFIG.grid.road_threshold
+
+    planner.plan(road, signals=VehicleSignals(valid=False))
+
+    assert _cells(planner.grid, 1.5, 0.0) == 0.0

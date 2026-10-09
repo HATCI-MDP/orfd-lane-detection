@@ -22,52 +22,13 @@ The projection assumes flat ground, so slopes and crests misplace far cells.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 
 import cv2
 import numpy as np
 
 from offroad_autonomy.perception.camera_geometry import CameraModel
 from offroad_autonomy.planning.grid_config import GridPlannerConfig
-from offroad_autonomy.types import VehicleState
-
-
-@dataclass(frozen=True)
-class GroundPose:
-    """Where the camera's ground point is in the world, and which way the
-    vehicle faces, on the horizontal plane."""
-
-    x: float
-    y: float
-    forward_x: float
-    forward_y: float
-
-    @property
-    def left_x(self) -> float:
-        # BeamNG's world is right-handed with +Z up, so left is forward turned 90 deg anticlockwise.
-        return -self.forward_y
-
-    @property
-    def left_y(self) -> float:
-        return self.forward_x
-
-
-def ground_pose(state: VehicleState | None, camera: CameraModel) -> GroundPose | None:
-    """``None`` when the state cannot register frames against each other;
-    the grid then forgets instead of smearing old evidence in the wrong place."""
-    if state is None or not state.valid or state.direction is None:
-        return None
-    fx, fy = float(state.direction[0]), float(state.direction[1])
-    norm = math.hypot(fx, fy)
-    if not math.isfinite(norm) or norm < 1e-6:
-        return None
-    fx, fy = fx / norm, fy / norm
-    # Camera position is in vehicle space: +X left, -Y forward.
-    cam_forward = -float(camera.position[1])
-    cam_left = float(camera.position[0])
-    x = float(state.position[0]) + cam_forward * fx - cam_left * fy
-    y = float(state.position[1]) + cam_forward * fy + cam_left * fx
-    return GroundPose(x=x, y=y, forward_x=fx, forward_y=fy)
+from offroad_autonomy.planning.odometry import GroundPose
 
 
 class TraversabilityGrid:
@@ -83,7 +44,7 @@ class TraversabilityGrid:
         self.rows = int(round((config.ahead_m + config.behind_m) / self.cell_m))
         self.cols = int(round(2.0 * config.half_width_m / self.cell_m))
         self._ahead_m = float(config.ahead_m)
-        self._half_width_m = float(config.half_width_m)
+        self.half_width_m = float(config.half_width_m)
         self._decay_s = float(config.memory_s)
         self.logodds = np.zeros((self.rows, self.cols), dtype=np.float32)
         self._pose: GroundPose | None = None
@@ -111,13 +72,13 @@ class TraversabilityGrid:
         rows = np.arange(self.rows, dtype=np.float64)
         cols = np.arange(self.cols, dtype=np.float64)
         forward = self._ahead_m - (rows + 0.5) * self.cell_m
-        right = (cols + 0.5) * self.cell_m - self._half_width_m
+        right = (cols + 0.5) * self.cell_m - self.half_width_m
         return np.meshgrid(forward, right, indexing="ij")
 
     def to_cell(self, forward_m: np.ndarray, right_m: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Integer ``(row, col)``; out-of-grid points fall outside ``[0, rows)``/``[0, cols)``."""
         row = np.floor((self._ahead_m - np.asarray(forward_m)) / self.cell_m).astype(int)
-        col = np.floor((np.asarray(right_m) + self._half_width_m) / self.cell_m).astype(int)
+        col = np.floor((np.asarray(right_m) + self.half_width_m) / self.cell_m).astype(int)
         return row, col
 
     def reset(self) -> None:
@@ -200,7 +161,7 @@ class TraversabilityGrid:
         cell_to_metric = np.array(
             [
                 [0.0, -self.cell_m, self._ahead_m - 0.5 * self.cell_m],
-                [self.cell_m, 0.0, 0.5 * self.cell_m - self._half_width_m],
+                [self.cell_m, 0.0, 0.5 * self.cell_m - self.half_width_m],
                 [0.0, 0.0, 1.0],
             ]
         )

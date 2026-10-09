@@ -12,7 +12,7 @@ import pytest
 
 from offroad_autonomy.control.stanley_controller import StanleyController, path_to_ground
 from offroad_autonomy.perception.camera_geometry import CameraModel
-from offroad_autonomy.types import PathPlan, PipelineConfig, VehicleState
+from offroad_autonomy.types import PathPlan, PipelineConfig, VehicleSignals
 
 
 def _config(**overrides) -> PipelineConfig:
@@ -41,7 +41,7 @@ def _path(config, right_of_forward, forward=_DEFAULT_FORWARD) -> PathPlan:
 def _settle(controller, plan, speed, frames=40):
     command = None
     for _ in range(frames):
-        command = controller.compute(plan, VehicleState(speed_mps=speed))
+        command = controller.compute(plan, VehicleSignals(speed_mps=speed))
     return command
 
 
@@ -92,7 +92,7 @@ def test_hidden_near_path_does_not_reverse_the_visible_turn(direction, held):
     if held:
         plan.speed_scale = 0.4
     controller = StanleyController(config)
-    state = VehicleState(speed_mps=3.9 * 0.44704)
+    state = VehicleSignals(speed_mps=3.9 * 0.44704)
     for _ in range(10):
         command = controller.compute(plan, state)
         assert direction * command.steering > 0.0
@@ -118,7 +118,7 @@ def test_steering_rate_is_limited_per_frame():
     plan = _path(config, lambda f: 3.0 + 0.5 * f)  # large demand
     previous = 0.0
     for _ in range(5):
-        command = controller.compute(plan, VehicleState(speed_mps=2.0))
+        command = controller.compute(plan, VehicleSignals(speed_mps=2.0))
         assert abs(command.steering - previous) <= 0.05 + 1e-9
         previous = command.steering
     assert command.debug.desired_steering > command.steering
@@ -149,7 +149,8 @@ def test_feedforward_steers_for_the_arc_before_any_error():
     config = _config(steering_ema_alpha=1.0, max_steering_delta=1.0)
     radius = 12.0
     command = StanleyController(config).compute(
-        _path(config, _arc(radius), forward=np.linspace(0.1, 6.0, 20)), VehicleState(speed_mps=1.0)
+        _path(config, _arc(radius), forward=np.linspace(0.1, 6.0, 20)),
+        VehicleSignals(speed_mps=1.0),
     )
     expected = math.atan(config.wheelbase_m / radius) / math.radians(config.max_wheel_angle_deg)
     assert command.debug.curvature == pytest.approx(1.0 / radius, rel=0.15)
@@ -167,7 +168,7 @@ def test_slows_before_a_bend_and_keeps_speed_on_straights():
         return (f - 8.0) ** 2 / (2 * 6.0)
 
     bend_ahead = _path(config, bend_after_8m, forward=np.linspace(1.0, 14.0, 24))
-    state = VehicleState(speed_mps=4.0)
+    state = VehicleSignals(speed_mps=4.0)
     cruise = StanleyController(config).compute(straight, state)
     braking = StanleyController(config).compute(bend_ahead, state)
     # Straight: accelerating toward cruise (ramped), never slowing.
@@ -180,7 +181,7 @@ def test_slows_before_a_bend_and_keeps_speed_on_straights():
 def test_saturation_cuts_speed_and_throttle():
     config = _config()
     tight = _path(config, _arc(5.0), forward=np.linspace(0.5, 6.0, 20))
-    command = StanleyController(config).compute(tight, VehicleState(speed_mps=1.0))
+    command = StanleyController(config).compute(tight, VehicleSignals(speed_mps=1.0))
     assert command.debug.saturation > 0.8
     assert command.debug.target_speed_mps < 0.6 * StanleyController(config)._target_speed
 
@@ -191,7 +192,7 @@ def test_overspeed_gets_full_brake_not_comfort_brake():
     straight = _path(config, lambda f: 0.0, forward=np.linspace(1.0, 14.0, 24))
     controller = StanleyController(config)
     controller._prev_target = 1.0  # e.g. just slowed for a bend
-    command = controller.compute(straight, VehicleState(speed_mps=5.0))
+    command = controller.compute(straight, VehicleSignals(speed_mps=5.0))
     assert command.brake > config.comfort_brake
 
 
@@ -199,9 +200,9 @@ def test_no_full_lock_at_speed():
     config = _config(steering_ema_alpha=1.0, max_steering_delta=1.0)
     controller = StanleyController(config)
     tight = _path(config, _arc(4.0), forward=np.linspace(0.5, 5.0, 20))
-    fast = controller.compute(tight, VehicleState(speed_mps=6.0))
+    fast = controller.compute(tight, VehicleSignals(speed_mps=6.0))
     assert abs(fast.steering) <= config.steer_cap_at_high_speed + 1e-6
-    slow = StanleyController(config).compute(tight, VehicleState(speed_mps=1.0))
+    slow = StanleyController(config).compute(tight, VehicleSignals(speed_mps=1.0))
     assert abs(slow.steering) > abs(fast.steering)
 
 
@@ -210,8 +211,8 @@ def test_target_speed_ramps_up_after_a_bend():
     controller = StanleyController(config)
     bend = _path(config, _arc(6.0), forward=np.linspace(0.5, 8.0, 20))
     straight = _path(config, lambda f: 0.0, forward=np.linspace(1.0, 14.0, 24))
-    slow_target = controller.compute(bend, VehicleState(speed_mps=2.0)).debug.target_speed_mps
-    after = controller.compute(straight, VehicleState(speed_mps=2.0)).debug
+    slow_target = controller.compute(bend, VehicleSignals(speed_mps=2.0)).debug.target_speed_mps
+    after = controller.compute(straight, VehicleSignals(speed_mps=2.0)).debug
     assert after.target_speed_mps == pytest.approx(slow_target + 0.1, abs=1e-6)
     assert after.speed_reason == "ramp up"
 
@@ -251,7 +252,7 @@ def test_short_path_brakes_before_its_end():
     config = _config()
     long_path = _path(config, lambda f: 0.0, forward=np.linspace(1.0, 14.0, 20))
     short_path = _path(config, lambda f: 0.0, forward=np.linspace(1.0, 3.0, 20))
-    state = VehicleState(speed_mps=4.0)
+    state = VehicleSignals(speed_mps=4.0)
     assert StanleyController(config).compute(long_path, state).throttle > 0.0
     command = StanleyController(config).compute(short_path, state)
     assert command.throttle == 0.0 and command.brake > 0.0
@@ -261,7 +262,7 @@ def test_short_path_brakes_before_its_end():
 def test_lookahead_point_is_reported_on_the_image():
     config = _config()
     command = StanleyController(config).compute(
-        _path(config, lambda f: 0.0), VehicleState(speed_mps=0.0)
+        _path(config, lambda f: 0.0), VehicleSignals(speed_mps=0.0)
     )
     x, y = command.debug.lookahead_px
     assert x == pytest.approx(config.preprocess_width / 2.0, abs=1.0)
@@ -316,7 +317,7 @@ def _cruising(config):
 def test_edge_risk_slows_the_car():
     config = _config(min_turn_speed_mph=3.0)  # the shipped crawl floor
     straight = _path(config, lambda f: 0.0, forward=np.linspace(1.0, 14.0, 24))
-    state = VehicleState(speed_mps=3.0)
+    state = VehicleSignals(speed_mps=3.0)
     centred = replace_mask(straight, _trail(config, width=6.0))
     near_edge = replace_mask(straight, _trail(config, width=6.0, offset=2.0))  # left edge 1 m away
     a = _cruising(config).compute(centred, state).debug
@@ -338,7 +339,7 @@ def test_path_near_an_edge_is_pulled_toward_the_centre():
     hugging = replace_mask(
         _path(config, lambda f: -1.5, forward=np.linspace(1.0, 10.0, 24)), _trail(config, width=5.0)
     )
-    debug = StanleyController(config).compute(hugging, VehicleState(speed_mps=2.0)).debug
+    debug = StanleyController(config).compute(hugging, VehicleSignals(speed_mps=2.0)).debug
     assert debug.centering_shift_m > 0.2  # moved right, toward the centre
 
 
@@ -347,7 +348,7 @@ def test_growing_cross_track_error_slows_the_car():
 
     config = _config(min_turn_speed_mph=3.0)  # the shipped crawl floor
     controller = StanleyController(config)
-    state = VehicleState(speed_mps=3.0)
+    state = VehicleSignals(speed_mps=3.0)
     reasons = []
     for offset in (0.0, 0.4, 0.8, 1.2):
         plan = _path(config, lambda f, o=offset: o, forward=np.linspace(1.0, 14.0, 24))
@@ -365,7 +366,7 @@ def test_high_lateral_acceleration_limits_speed():
     controller._prev_steering = 0.6  # already turning hard
     controller._prev_target = 5.0
     straight = _path(config, lambda f: 0.0, forward=np.linspace(1.0, 14.0, 24))
-    debug = controller.compute(straight, VehicleState(speed_mps=4.5)).debug
+    debug = controller.compute(straight, VehicleSignals(speed_mps=4.5)).debug
     assert debug.lateral_accel_mps2 > config.max_measured_lateral_accel_mps2
     assert debug.target_speed_mps < 4.5
 
@@ -376,7 +377,7 @@ def test_rejoin_distance_shortens_only_in_recovery():
         StanleyController(config)
         .compute(
             _path(config, lambda f: 0.4, forward=np.linspace(1.0, 14.0, 24)),
-            VehicleState(speed_mps=3.0),
+            VehicleSignals(speed_mps=3.0),
         )
         .debug
     )
@@ -384,7 +385,7 @@ def test_rejoin_distance_shortens_only_in_recovery():
         StanleyController(config)
         .compute(
             _path(config, lambda f: 2.0, forward=np.linspace(1.0, 14.0, 24)),
-            VehicleState(speed_mps=3.0),
+            VehicleSignals(speed_mps=3.0),
         )
         .debug
     )

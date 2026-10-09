@@ -69,7 +69,7 @@ from offroad_autonomy.types import (
     PathPlan,
     PipelineConfig,
     SteeringDebug,
-    VehicleState,
+    VehicleSignals,
 )
 
 logger = logging.getLogger("offroad_autonomy.control")
@@ -297,7 +297,7 @@ class StanleyController:
                 config.speed_limit_mph,
             )
 
-    def compute(self, plan: PathPlan, state: VehicleState) -> ControlCommand:
+    def compute(self, plan: PathPlan, state: VehicleSignals) -> ControlCommand:
         debug, path = self._lateral_control(plan, state)
         steering = self._smooth_steering(debug.desired_steering)
         debug.final_steering = steering
@@ -333,7 +333,7 @@ class StanleyController:
         return wheel_angle / self._max_wheel_angle
 
     def _lateral_control(
-        self, plan: PathPlan, state: VehicleState
+        self, plan: PathPlan, state: VehicleSignals
     ) -> tuple[SteeringDebug, _GroundPath | None]:
         speed = max(state.speed_mps, 0.0)
         debug = SteeringDebug(
@@ -534,7 +534,7 @@ class StanleyController:
     def _longitudinal_control(
         self,
         plan: PathPlan,
-        state: VehicleState,
+        state: VehicleSignals,
         path: _GroundPath | None,
         debug: SteeringDebug,
     ) -> tuple[float, float]:

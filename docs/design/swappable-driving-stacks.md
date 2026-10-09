@@ -41,7 +41,7 @@ sensors in, command out, something to show the operator.
 │  the stack declares   manual override      visual primitives    sim truth    │
 └───────────────┬──────────────────────────────────────▲───────────────────────┘
                 │ Observation                          │ StackOutput
-                │ sensors + vehicle state              │ command, visuals, metrics,
+                │ sensors + vehicle signals            │ command, visuals, metrics,
                 ▼                                      │ safe-stop request
 ┌──────────────── Driving stacks: swappable, chosen by config ─────────────────┐
 │  stack A              stack B              stack C              next stack   │
@@ -81,7 +81,7 @@ class SensorSpec:
 @dataclass
 class Observation:
     sensors: dict[str, np.ndarray]
-    vehicle: VehicleState
+    vehicle: VehicleSignals   # wheel speed and yaw rate, never the world pose
     timestamp: float
     frame_id: int = 0
 
@@ -97,6 +97,10 @@ class StackOutput:
 - **Inside a stack, anything goes:** its own types, threads, workers and models.
 - **A stack never imports `beamngpy`.** It sees only `Observation`, so it is testable
   offline.
+- **A stack sees only what a production vehicle senses.** `Observation.vehicle` is a
+  `VehicleSignals`: speed and yaw rate as the wheel-speed sensors and the stability-control
+  gyro report them. The simulator's world pose stays in the harness's `VehicleState`, for
+  safety and scoring, so no stack can steer by it.
 - **The observation is all or nothing.** If any declared sensor has no frame, the harness
   skips the iteration rather than handing over a partial observation.
 - **Safety stays in the harness.** The stuck detector, `E` safe stop and manual override

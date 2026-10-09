@@ -18,7 +18,7 @@ from offroad_autonomy.types import (
     PerceptionResult,
     PipelineConfig,
     StabilizedResult,
-    VehicleState,
+    VehicleSignals,
 )
 
 H, W = 465, 720
@@ -182,7 +182,7 @@ def test_widening_road_above_hood_keeps_a_continuous_drivable_path(mirror):
     assert valid[
         np.round(plan.centerline[:, 1]).astype(int), np.round(plan.centerline[:, 0]).astype(int)
     ].all()
-    command = StanleyController(config).compute(plan, VehicleState())
+    command = StanleyController(config).compute(plan, VehicleSignals())
     assert command.throttle > 0 and command.brake == 0
 
 
@@ -242,7 +242,7 @@ def test_advanced_mode_is_gated_too():
 def test_controller_brakes_when_there_is_no_path():
     controller = StanleyController(_config())
     stop = PathPlan(centerline=np.empty((0, 2), np.float32), fallback_active=True, speed_scale=0.0)
-    command = controller.compute(stop, VehicleState(speed_mps=5.0))
+    command = controller.compute(stop, VehicleSignals(speed_mps=5.0))
     assert command.throttle == 0.0
     assert command.brake > 0.5
 
@@ -250,10 +250,12 @@ def test_controller_brakes_when_there_is_no_path():
 def test_controller_slows_while_holding():
     config = _config()
     line = np.stack([np.full(20, W / 2.0), np.linspace(240, 440, 20)], axis=1).astype(np.float32)
-    full = StanleyController(config).compute(PathPlan(centerline=line), VehicleState(speed_mps=3.0))
+    full = StanleyController(config).compute(
+        PathPlan(centerline=line), VehicleSignals(speed_mps=3.0)
+    )
     held = StanleyController(config).compute(
         PathPlan(centerline=line, fallback_active=True, speed_scale=0.4),
-        VehicleState(speed_mps=3.0),
+        VehicleSignals(speed_mps=3.0),
     )
     assert full.throttle > 0.0
     assert held.throttle == 0.0 and held.brake > 0.0

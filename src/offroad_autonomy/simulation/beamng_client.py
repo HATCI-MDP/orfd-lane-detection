@@ -20,6 +20,7 @@ from offroad_autonomy.types import (
     CameraSpec,
     ControlCommand,
     HarnessConfig,
+    VehicleSignals,
     VehicleState,
 )
 from offroad_autonomy.utils.environment import LOCAL_HOSTS
@@ -57,6 +58,7 @@ class BeamNGClient:
         self._frame_id = 0
         self._last_signatures: dict[str, int | None] = {}
         self._shared_memory = config.beamng_camera_transport == "shared_memory"
+        self._odometry = OdometryEmulator()
 
     def connect(self) -> None:
         if not self._config.beamng_host:
@@ -240,33 +242,35 @@ class BeamNGClient:
 
     def get_vehicle_state(self) -> VehicleState:
         if self._vehicle is None:
-            return VehicleState(valid=False)
+            return _invalid_state()
 
         try:
             self._vehicle.sensors.poll()
             st = self._vehicle.state
-            if not all(key in st for key in ("pos", "vel", "rotation")):
-                return VehicleState(valid=False)
+            if not all(key in st for key in ("pos", "vel", "rotation", "dir")):
+                return _invalid_state()
             pos = tuple(st.get("pos", (0, 0, 0)))
             rot = tuple(st.get("rotation", (0, 0, 0, 1)))
             vel = tuple(st.get("vel", (0, 0, 0)))
             speed = math.sqrt(sum(v**2 for v in vel))
             _, _, yaw = self._quat_to_euler(rot)
-            direction = None
-            if "dir" in st:
-                direction = tuple(st["dir"])
+            # Simulation time, because BeamNG slows below real time under load
+            # and rates measured against the wall clock would then overstate motion.
+            timestamp = time.perf_counter()
+            if "time" in st:
+                timestamp = float(st["time"])
             return VehicleState(
                 position=pos,
                 rotation=rot,
                 velocity=vel,
                 speed_mps=speed,
                 heading_rad=yaw,
-                direction=direction,
+                signals=self._odometry.read(pos, vel, tuple(st["dir"]), timestamp),
             )
         except Exception as exc:
             # Do not let a failed poll masquerade as a stationary vehicle.
             logger.debug("State poll failed: %s", exc)
-            return VehicleState(valid=False)
+            return _invalid_state()
 
     def send_controls(self, cmd: ControlCommand) -> None:
         if self._vehicle is None:
@@ -381,6 +385,75 @@ class BeamNGClient:
         yaw = math.atan2(siny_cosp, cosy_cosp)
 
         return roll, pitch, yaw
+
+
+def _invalid_state() -> VehicleState:
+    return VehicleState(valid=False, signals=VehicleSignals(valid=False))
+
+
+class OdometryEmulator:
+    """Wheel speed and yaw rate as a production vehicle's odometry reports
+    them, derived from the simulator's state.
+
+    Both are means over the interval since the previous reading: what an
+    odometry module integrating the wheel-speed sensors and the gyro at their
+    own rate reports once per frame. The distance is the displacement along
+    the vehicle's mean heading over the interval, which ideal wheel-speed
+    sensors measure when the wheels do not slip, and BeamNG's state has no
+    angular velocity, so the gyro's integral is the heading change. Only the
+    rates leave this module, never the pose they were computed from.
+    """
+
+    def __init__(self) -> None:
+        self._forward: np.ndarray | None = None
+        self._position = np.zeros(3)
+        self._time = 0.0
+        self._speed = 0.0
+        self._yaw_rate = 0.0
+
+    def read(
+        self,
+        position: tuple[float, float, float],
+        velocity: tuple[float, float, float],
+        direction: tuple[float, float, float],
+        timestamp: float,
+    ) -> VehicleSignals:
+        forward = np.asarray(direction, dtype=np.float64)
+        norm = float(np.linalg.norm(forward))
+        if not math.isfinite(norm) or norm < 1e-6:
+            self._forward = None
+            return VehicleSignals(valid=False)
+        forward = forward / norm
+        position_now = np.asarray(position, dtype=np.float64)
+
+        if self._forward is None or timestamp < self._time:
+            # The first reading, or the simulation restarted: there is no
+            # interval yet, and nothing integrates this reading's rates.
+            self._speed = float(np.dot(np.asarray(velocity, dtype=np.float64), forward))
+            self._yaw_rate = 0.0
+        elif timestamp > self._time:
+            dt = timestamp - self._time
+            turn = math.remainder(_heading(forward) - _heading(self._forward), 2.0 * math.pi)
+            mean_forward = self._forward + forward
+            mean_forward /= np.linalg.norm(mean_forward)
+            # Any point on the vehicle's axis moves this far along the mean
+            # heading: the chord of the rear axle's arc, which is shorter than
+            # the arc by sinc(turn / 2).
+            chord = float(np.dot(position_now - self._position, mean_forward))
+            self._speed = chord / (float(np.sinc(turn / (2.0 * math.pi))) * dt)
+            self._yaw_rate = turn / dt
+        # An unchanged timestamp is the same physics state polled twice: the
+        # rates hold, as a bus repeats its last message.
+        self._forward = forward
+        self._position = position_now
+        self._time = timestamp
+        return VehicleSignals(
+            speed_mps=self._speed, yaw_rate_rps=self._yaw_rate, timestamp_s=timestamp
+        )
+
+
+def _heading(forward: np.ndarray) -> float:
+    return math.atan2(float(forward[1]), float(forward[0]))
 
 
 def frame_signature(buffer) -> int | None:

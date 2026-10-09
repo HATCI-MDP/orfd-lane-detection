@@ -11,6 +11,7 @@ class GridPlannerConfig:
     behind_m: float = 4.0
     half_width_m: float = 10.0
     memory_s: float = 2.0
+    max_odometry_gap_s: float = 1.0
     road_logodds: float = 0.85
     offroad_logodds: float = -0.85
     logodds_limit: float = 4.0
@@ -18,16 +19,17 @@ class GridPlannerConfig:
     blocked_threshold: float = -0.5
     arc_count: int = 41
     lookahead_m: float = 14.0
+    reach_m: float = 6.0
     step_m: float = 0.25
     start_m: float = 1.0
     min_path_m: float = 4.0
     clearance_margin_m: float = 0.1
-    clearance_cap_m: float = 4.0
     weight_length: float = 1.0
     weight_clearance: float = 1.0
     weight_consistency: float = 0.2
     weight_curvature: float = 0.1
-    weight_trajectory_distance: float = 0.35  # Score penalty per metre of path separation.
+    #: Score penalty per corridor (the best arc's clearance) of path separation.
+    weight_trajectory_distance: float = 0.20
 
     def __post_init__(self):
         for f in fields(self):
@@ -42,12 +44,13 @@ class GridPlannerConfig:
             "behind_m",
             "half_width_m",
             "memory_s",
+            "max_odometry_gap_s",
             "road_logodds",
             "logodds_limit",
             "lookahead_m",
+            "reach_m",
             "step_m",
             "min_path_m",
-            "clearance_cap_m",
         ):
             if getattr(self, name) <= 0:
                 raise ValueError(f"planning.grid.{name} must be > 0")

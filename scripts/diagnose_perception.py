@@ -129,7 +129,7 @@ def analyze(args: argparse.Namespace) -> None:
     from offroad_autonomy.planning.centerline_planner import CenterlinePlanner
     from offroad_autonomy.postprocessing.temporal_stabilizer import TemporalStabilizer
     from offroad_autonomy.preprocessing.image_preprocessor import ImagePreprocessor
-    from offroad_autonomy.types import VehicleState
+    from offroad_autonomy.types import VehicleSignals
 
     config = load_pipeline_config_file(args.config)
     if args.conf is not None:
@@ -164,7 +164,7 @@ def analyze(args: argparse.Namespace) -> None:
         masks, confs, names = _raw_instances(segmenter, frame, conf=0.01)
         perception = segmenter.predict(frame, view.valid_roi)
         stabilized = stabilizer.stabilize(perception)
-        plan = planner.plan(stabilized, vehicle_state=VehicleState())
+        plan = planner.plan(stabilized, signals=VehicleSignals())
 
         img = frame.preprocessed
         h, w = img.shape[:2]
@@ -267,7 +267,7 @@ def _bottom_x(plan) -> float | None:
 def full(args: argparse.Namespace) -> None:
     """Run the RGB pipeline on saved dashcam frames."""
     from offroad_autonomy.stacks.mono_yoloe.pipeline import AutonomyPipeline
-    from offroad_autonomy.types import CameraFrame, VehicleState
+    from offroad_autonomy.types import CameraFrame, VehicleSignals
 
     config = load_pipeline_config_file(args.config)
     pipeline = AutonomyPipeline(config)
@@ -286,7 +286,7 @@ def full(args: argparse.Namespace) -> None:
                 frame_id=i + 1,
                 is_new=True,
             )
-            result = pipeline.step_result(frame, VehicleState(speed_mps=4.0))
+            result = pipeline.step_result(frame, VehicleSignals(speed_mps=4.0))
         row = {
             "frame": path.stem,
             "road_fraction": round(result.perception.road_fraction, 3),

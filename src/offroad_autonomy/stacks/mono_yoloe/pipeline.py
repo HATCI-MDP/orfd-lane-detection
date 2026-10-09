@@ -11,7 +11,7 @@ from offroad_autonomy.perception.road_segmenter import RoadSegmenter
 from offroad_autonomy.planning.centerline_planner import CenterlinePlanner
 from offroad_autonomy.postprocessing.temporal_stabilizer import TemporalStabilizer
 from offroad_autonomy.preprocessing.image_preprocessor import ImagePreprocessor
-from offroad_autonomy.types import CameraFrame, PipelineConfig, PipelineStepResult, VehicleState
+from offroad_autonomy.types import CameraFrame, PipelineConfig, PipelineStepResult, VehicleSignals
 
 logger = logging.getLogger("offroad_autonomy.stacks.mono_yoloe")
 
@@ -31,7 +31,7 @@ class AutonomyPipeline:
     def ego_coverage(self) -> float:
         return self.view.ego_coverage
 
-    def step_result(self, capture: CameraFrame, vehicle_state: VehicleState) -> PipelineStepResult:
+    def step_result(self, capture: CameraFrame, signals: VehicleSignals) -> PipelineStepResult:
         if capture.image is None:
             raise ValueError("No frame available to segment")
         timings: dict[str, float] = {}
@@ -49,11 +49,11 @@ class AutonomyPipeline:
         t4 = time.perf_counter()
         timings["postprocess"] = (t4 - t3) * 1000.0
 
-        plan = self.planner.plan(stabilized, vehicle_state=vehicle_state)
+        plan = self.planner.plan(stabilized, signals=signals)
         t5 = time.perf_counter()
         timings["planning"] = (t5 - t4) * 1000.0
 
-        command = self.controller.compute(plan, vehicle_state)
+        command = self.controller.compute(plan, signals)
         timings["control"] = (time.perf_counter() - t5) * 1000.0
 
         if logger.isEnabledFor(logging.DEBUG):

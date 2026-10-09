@@ -66,14 +66,22 @@ default until the grid planner has been compared on several maps.
 
 - Ground the camera cannot see is unknown, never "not road", so a trail running off the image
   side does not pull the path toward the visible part.
-- Memory carries the road the hood now hides, using the simulator's direction vector. Without
-  a valid pose the grid forgets rather than smearing.
+- Memory carries the road the hood now hides. It moves with dead reckoning from the wheel
+  speed and yaw rate in `VehicleSignals` (`planning/odometry.py`), integrated at the rear
+  axle in a local frame. The simulator's world pose never reaches the stack (see
+  [bev-grid-production-inputs.md](bev-grid-production-inputs.md)). A missing reading, or a
+  gap over `max_odometry_gap_s`, makes the grid forget rather than smear.
 - Frames the gate rejects move the grid with the vehicle but add no evidence.
 - Arcs end where the body would leave the road, and the path extends only as far as the grid
   has seen road, so the path-end speed law still applies.
+- Each arc scores its length on road up to `reach_m` (6 m), its mean clearance over that
+  first `reach_m`, and penalties for bending, for changing curvature and for straying from
+  the motion-compensated previous path. Clearance and straying are measured against the best
+  arc's clearance that frame, so they weigh the same on a 3 m trail as on a 14 m road.
 - At a split it locks onto the branch closest to the current trajectory until only one
-  remains or that branch is no longer safe. `weight_trajectory_distance` (0.35 per metre)
-  penalises arcs that stray from the motion-compensated previous path.
+  remains or that branch is no longer safe.
+- The controller gets the whole road mask the grid planned on (ROI rows not cut by the
+  hood), not just the gate's largest component, which at a fork can be the other branch.
 
 Limits:
 
@@ -83,8 +91,11 @@ Limits:
   clearance so unseen ground under the hood does not block all motion, which means clearance
   does not guarantee safe terrain.
 - Road evidence comes only from the learned mask; BeamNG annotation, instance and depth
-  buffers are disabled. Memory is registered with BeamNG's true pose, which a production
-  vehicle does not have (see [bev-grid-production-inputs.md](bev-grid-production-inputs.md)).
+  buffers are disabled.
+- Clearance is checked along the rear axle's arc with half the vehicle width plus
+  `clearance_margin_m`; the swept corners of the body are not modelled. On the offline bench's
+  tightest trail (3.5 m wide, 7 m radius) with noisy masks, the body still clipped the inside
+  edge by up to 0.2 m.
 
 ## Dashboard
 
@@ -119,17 +130,25 @@ measured over valid pixels only, so bodywork in frame cannot trip it.
 - After moving the camera or changing its lens, re-run `scripts/derive_ego_mask.py` and
   re-check `planning.roi_height`.
 - After any change to the controller or its config, re-run `scripts/sbend_sim.py`.
+- After any change to the grid planner or `planning.grid`, re-run `scripts/grid_sim.py`, clean
+  and with `--odometry noisy --mask-noise --pitch-deg 0.5 --seeds 3`.
 
 ## Checks And Tools
 
 | Command | What It Does | Needs BeamNG |
 | --- | --- | --- |
 | `python scripts/sbend_sim.py [--config a.yaml b.yaml]` | Closed-loop controller check on a synthetic S-bend; several configs print one comparison table. CI runs it | No |
+| `python scripts/grid_sim.py [--odometry noisy --mask-noise --pitch-deg 0.5 --seeds 3]` | Closed-loop grid planner check on 12 synthetic trails, six held out from tuning, with production signals only | No |
 | `python scripts/derive_ego_mask.py` | Regenerate the hood polygon after moving the camera | No |
 | `python scripts/diagnose_perception.py capture` / `analyze` / `full` | Save simulator frames, then dump every perception stage | `capture` only |
 | `python scripts/closed_loop_log.py --seconds 120 --summary` | Headless run that logs every control frame to CSV | Yes |
 | `python scripts/export_engine.py` | Export the segmentation model to TensorRT | No |
 
 With the shipped configs, the S-bend check gives mean off-centre 0.14 m, p95 0.46 m and max
-0.56 m, the same as before the harness split. The synthetic S-bend and planner tests use
-idealised masks: they test mechanics, not real perception accuracy.
+0.56 m, the same as before the harness split.
+
+The grid check, with clean signals, finishes all 12 trails with no departure frame, a minimum
+body margin of 0.17 m and a mean offset of 0.14 m. With noise added it finishes all 36 runs;
+the only departures are on `held_out_tight_r7_w3.5`, by up to 0.16 m. The synthetic S-bend,
+grid check and planner tests use idealised masks: they test mechanics, not real perception
+accuracy.

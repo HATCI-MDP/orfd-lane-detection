@@ -16,7 +16,7 @@ from offroad_autonomy.types import (
     PipelineConfig,
     PipelineStepResult,
     StabilizedResult,
-    VehicleState,
+    VehicleSignals,
 )
 
 H, W = 465, 720
@@ -105,14 +105,14 @@ def test_each_stage_receives_the_previous_stage_output():
         pipeline, mocks, outputs = _pipeline(stack, _make_config())
         packet, perception, stabilized, plan, command = outputs
         capture = _capture()
-        state = VehicleState(speed_mps=4.0)
+        state = VehicleSignals(speed_mps=4.0)
 
         result = pipeline.step_result(capture, state)
 
         mocks[0].return_value.process.assert_called_once_with(capture.image)
         mocks[1].return_value.predict.assert_called_once_with(packet, pipeline.valid_roi)
         mocks[2].return_value.stabilize.assert_called_once_with(perception)
-        mocks[3].return_value.plan.assert_called_once_with(stabilized, vehicle_state=state)
+        mocks[3].return_value.plan.assert_called_once_with(stabilized, signals=state)
         mocks[4].return_value.compute.assert_called_once_with(plan, state)
         assert isinstance(result, PipelineStepResult)
         assert (result.frame, result.stabilized, result.plan) == (packet, stabilized, plan)
@@ -139,7 +139,7 @@ def test_missing_dashcam_is_not_accepted():
         pipeline, _, _ = _pipeline(stack, _make_config())
         capture = _capture(image=None)
         with pytest.raises(ValueError, match="No frame available"):
-            pipeline.step_result(capture, VehicleState())
+            pipeline.step_result(capture, VehicleSignals())
 
 
 @pytest.mark.parametrize("planner_mode", ["baseline", "advanced"])
@@ -165,7 +165,7 @@ def test_rgb_pipeline_plans_and_controls_in_every_mode(planner_mode, road_half_w
     with patch("offroad_autonomy.stacks.mono_yoloe.pipeline.RoadSegmenter") as segmenter:
         segmenter.return_value.predict.side_effect = segment
         pipeline = AutonomyPipeline(config)
-        result = pipeline.step_result(_capture(), VehicleState(speed_mps=1.0))
+        result = pipeline.step_result(_capture(), VehicleSignals(speed_mps=1.0))
 
     assert not result.plan.fallback_active, result.plan.fallback_reason
     assert len(result.plan.centerline) >= 2
@@ -184,7 +184,7 @@ def test_dashcam_geometry_and_capture_reach_all_stages():
         cfg = _make_config()
         pipeline, mocks, _ = _pipeline(stack, cfg)
         capture = _capture()
-        result = pipeline.step_result(capture, VehicleState())
+        result = pipeline.step_result(capture, VehicleSignals())
         assert result.capture is capture
         assert pipeline.view.camera.spec is cfg.camera
         assert mocks[3].call_args.kwargs["camera"] is pipeline.view.camera

@@ -33,6 +33,8 @@ class ArcChoice:
     min_clearance_m: float
     score: float
     continuity_distance_m: float = 0.0
+    #: Mean distance from the arc to ground seen as not road, before scoring.
+    centring_m: float = 0.0
 
 
 class ArcPlanner:
@@ -81,6 +83,9 @@ class ArcPlanner:
         c = np.clip(cols, 0, grid.cols - 1)
         arc_clearance = np.where(inside, clearance[r, c], 0.0)
         arc_road = inside & road[r, c]
+        # Farther than the grid's half width, an obstacle is out of the grid,
+        # so clearance beyond it says nothing about centring.
+        arc_centring = np.minimum(arc_clearance, grid.half_width_m)
         ahead = self._forward >= cfg.start_m
 
         candidates = []
@@ -95,15 +100,32 @@ class ArcPlanner:
                 self.branch_locked = False
         for i, curvature in enumerate(self.curvatures):
             candidate = self._score(
-                i, float(curvature), arc_clearance[i], arc_road[i], ahead[i], inside[i]
+                i,
+                float(curvature),
+                arc_clearance[i],
+                arc_road[i],
+                arc_centring[i],
+                ahead[i],
+                inside[i],
             )
             if candidate is not None and reference is not None:
                 candidate.continuity_distance_m = trajectory_distance(
                     np.column_stack((candidate.forward_m, candidate.right_m)), reference
                 )
-                candidate.score -= cfg.weight_trajectory_distance * candidate.continuity_distance_m
             if candidate is not None:
                 candidates.append(candidate)
+        # Centring and separation from the previous path are both measured in
+        # units of the corridor, the best arc's clearance this frame, so they
+        # weigh the same on a 3 m trail as on a 14 m road. In metres, a 4 m
+        # clearance cap stopped centring on the wide road, and the separation
+        # penalty held a straight arc into the outside of its bend.
+        corridor = max((candidate.centring_m for candidate in candidates), default=0.0)
+        if corridor > 0.0:
+            for candidate in candidates:
+                candidate.score += cfg.weight_clearance * candidate.centring_m / corridor
+                candidate.score -= (
+                    cfg.weight_trajectory_distance * candidate.continuity_distance_m / corridor
+                )
         candidates = self._keep_branch(candidates, grid, road, clearance, reference)
         best = max(candidates, key=lambda candidate: candidate.score, default=None)
         if best is not None:
@@ -122,34 +144,44 @@ class ArcPlanner:
         """
         if len(candidates) < 2:
             return None
+        cfg = self.config
+        distances = np.arange(cfg.start_m, cfg.lookahead_m, cfg.step_m)
+        rows, _ = grid.to_cell(distances, np.zeros_like(distances))
+        in_grid = (rows >= 0) & (rows < grid.rows)
+        distances = distances[in_grid]
+        rows = rows[in_grid]
+        # Unseen ground (especially the hood exclusion) is not a divider.
+        # Only a known obstacle/boundary can separate two road branches.
+        safe = clearance[rows] >= self._required_clearance
+        starts = safe.copy()
+        starts[:, 1:] &= ~safe[:, :-1]
+        split = np.flatnonzero(np.count_nonzero(starts, axis=1) >= 2)
+        if len(split) == 0:
+            return None
+
+        # Where each arc is sideways at every distance with two corridors;
+        # NaN where the arc does not reach that far.
+        lateral = np.full((len(candidates), len(split)), np.nan)
+        for j, candidate in enumerate(candidates):
+            forward, indices = np.unique(candidate.forward_m, return_index=True)
+            within = (distances[split] >= forward[0]) & (distances[split] <= forward[-1])
+            lateral[j, within] = np.interp(
+                distances[split][within], forward, candidate.right_m[indices]
+            )
+
         best = None
         most = 1
-        paths = []
-        for candidate in candidates:
-            forward, indices = np.unique(candidate.forward_m, return_index=True)
-            paths.append((candidate, forward, candidate.right_m[indices]))
-        for distance in np.arange(self.config.start_m, self.config.lookahead_m, self.config.step_m):
-            row, _ = grid.to_cell(np.asarray(distance), np.asarray(0.0))
-            if not 0 <= row < grid.rows:
-                continue
-            # Unseen ground (especially the hood exclusion) is not a divider.
-            # Only a known obstacle/boundary can separate two road branches.
-            safe = clearance[row] >= self._required_clearance
-            starts = safe & ~np.r_[False, safe[:-1]]
-            if np.count_nonzero(starts) < 2:
-                continue
-            labels = np.where(safe, np.cumsum(starts), 0)
+        for n, i in enumerate(split):
+            labels = np.where(safe[i], np.cumsum(starts[i]), 0)
+            reached = np.flatnonzero(np.isfinite(lateral[:, n]))
+            _, cols = grid.to_cell(distances[i], lateral[reached, n])
             groups = {}
-            for candidate, forward, right in paths:
-                if not forward[0] <= distance <= forward[-1]:
-                    continue
-                lateral = np.interp(distance, forward, right)
-                _, col = grid.to_cell(np.asarray(distance), np.asarray(lateral))
-                if 0 <= col < grid.cols and labels[col] != 0 and road[row, col]:
-                    groups.setdefault(int(labels[col]), []).append(candidate)
+            for j, col in zip(reached, cols):
+                if 0 <= col < grid.cols and labels[col] != 0 and road[rows[i], col]:
+                    groups.setdefault(int(labels[col]), []).append(candidates[j])
             if len(groups) > most:
                 most = len(groups)
-                best = distance, labels, groups
+                best = float(distances[i]), labels, groups
         return best
 
     def _keep_branch(self, candidates, grid, road, clearance, reference):
@@ -198,6 +230,7 @@ class ArcPlanner:
         curvature: float,
         clearance: np.ndarray,
         road: np.ndarray,
+        centring: np.ndarray,
         ahead: np.ndarray,
         inside: np.ndarray,
     ) -> ArcChoice | None:
@@ -222,15 +255,19 @@ class ArcPlanner:
             return None
 
         span = slice(first, last + 1)
-        reach = min(length / cfg.lookahead_m, 1.0)
-        capped = np.minimum(clearance[span], cfg.clearance_cap_m) / cfg.clearance_cap_m
+        reach = min(length / cfg.reach_m, 1.0)
+        # Centring is averaged over the same reach_m for every arc, with
+        # ground an arc does not reach counting as no clearance; averaged over
+        # its own length, an arc ending before a narrow stretch would look
+        # more central than one that drives through it.
+        horizon = int(round(cfg.reach_m / cfg.step_m)) + 1
+        near = centring[first : min(first + horizon, last + 1)]
         bend = abs(curvature) / self._max_curvature
         change = 0.0
         if self._previous is not None:
             change = abs(curvature - self._previous) / (2.0 * self._max_curvature)
         score = (
             cfg.weight_length * reach
-            + cfg.weight_clearance * float(capped.mean())
             - cfg.weight_consistency * change
             - cfg.weight_curvature * bend
         )
@@ -241,4 +278,5 @@ class ArcPlanner:
             length_m=length,
             min_clearance_m=float(clearance[span].min()),
             score=score,
+            centring_m=float(near.sum()) / horizon,
         )

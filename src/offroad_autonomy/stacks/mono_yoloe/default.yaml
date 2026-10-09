@@ -150,6 +150,10 @@ planning:
     # Evidence fades with this time constant. At 4 m/s the 3 m hidden by the
     # hood was in view 0.75 s earlier, well inside the memory.
     memory_s: 2.0
+    # Memory moves with dead reckoning from wheel speed and yaw rate, each held
+    # over the interval since the previous reading. Over a longer gap that no
+    # longer describes the motion, so the grid forgets instead (4 frames at 4 FPS).
+    max_odometry_gap_s: 1.0
     # Log-odds added per frame for road / not road. One frame is enough to
     # mark a cell; the stabilizer's EMA has already smoothed the mask.
     road_logodds: 0.85
@@ -164,6 +168,13 @@ planning:
     # between near-equal arcs more often on the recorded run.
     arc_count: 41
     lookahead_m: 14.0
+    # An arc this long scores full length, and centring is averaged over this
+    # first stretch of every arc; the controller still gets the whole arc.
+    # Preferring longer arcs cuts the inside of bends, where an arc stays clear
+    # longest. On scripts/grid_sim.py's tuning trails 6 m centred best (mean
+    # offset 0.12 m); 8 m gave 0.20 m, 4 m wandered (p95 1.6 m) and the full
+    # 14 m cut the hairpin's inside edge.
+    reach_m: 6.0
     # Under a third of the vehicle width, so an arc cannot step over an edge.
     step_m: 0.25
     # The path starts 1 m ahead of the camera; nearer points are under the car.
@@ -172,16 +183,21 @@ planning:
     min_path_m: 4.0
     # Required clearance = control.vehicle_half_width_m + this margin.
     clearance_margin_m: 0.1
-    # Clearance counts up to half a wide trail. A 2 m cap saturated on wide
-    # roads and the planner stopped centring.
-    clearance_cap_m: 4.0
-    # Score = length seen as road + clearance - change from last arc - bend.
+    # Score = length seen as road + clearance - change from last arc - bend
+    # - distance from the previous path. Clearance is the arc's mean distance
+    # to ground seen as not road over its first reach_m, over the best arc's
+    # this frame, so centring weighs the same on a 3 m trail as on a 14 m road;
+    # a 4 m cap saturated on the wider one and the planner stopped centring.
     weight_length: 1.0
     weight_clearance: 1.0
     # Only breaks near-ties; at 0.4 it locked onto the first arc it picked.
     weight_consistency: 0.2
     weight_curvature: 0.1
-    weight_trajectory_distance: 0.35 # penalty per metre from the motion-compensated prior path
+    # Penalty for straying from the motion-compensated previous path, per
+    # corridor of separation. On scripts/grid_sim.py's tuning trails 0 to 0.2
+    # kept every trail with the same centring; 0.5 held a straight arc into the
+    # outside of the 14 m road's bend. It stays nonzero to damp flip-flopping.
+    weight_trajectory_distance: 0.20
 
 control:
   # Half the vehicle width keeps the road-edge margin outside the bodywork.

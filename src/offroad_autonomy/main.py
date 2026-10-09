@@ -476,7 +476,7 @@ def _observation(frames: dict, state: VehicleState) -> Observation:
     first = next(iter(frames.values()))
     return Observation(
         sensors={name: frame.image for name, frame in frames.items()},
-        vehicle=state,
+        vehicle=state.signals,
         timestamp=min(frame.timestamp for frame in frames.values()),
         frame_id=first.frame_id,
     )

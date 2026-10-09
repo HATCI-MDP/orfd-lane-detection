@@ -16,6 +16,7 @@ from offroad_autonomy.types import (
     CameraFrame,
     ControlCommand,
     HarnessConfig,
+    VehicleSignals,
     VehicleState,
 )
 
@@ -112,6 +113,29 @@ def test_stuck_detector_fires_after_its_time_without_motion():
 
     assert triggered
     assert reason == "vehicle stuck"
+
+
+def test_a_stack_sees_the_vehicle_signals_never_the_world_pose(run_harness):
+    """With the simulator's exact pose a stack could drive by a map no
+    production vehicle has; only what the vehicle's own sensors report passes."""
+    seen = []
+
+    class Recorder(FakeStack):
+        def step(self, obs) -> StackOutput:
+            seen.append(obs.vehicle)
+            return super().step(obs)
+
+    signals = VehicleSignals(speed_mps=2.5, yaw_rate_rps=0.1, timestamp_s=7.0)
+    client = _client(steps_before_shutdown=1)
+    client.get_vehicle_state.return_value = VehicleState(
+        position=(100.0, -50.0, 2.0), heading_rad=1.2, speed_mps=2.5, signals=signals
+    )
+
+    run_harness(Recorder([StackOutput(ControlCommand())]), client)
+
+    assert seen == [signals]
+    assert not hasattr(seen[0], "position")
+    assert not hasattr(seen[0], "heading_rad")
 
 
 def test_stack_keeps_stepping_under_safe_stop_and_its_commands_are_ignored(

@@ -31,8 +31,9 @@ def test_motion_compensation_translates_and_rotates_the_previous_path():
 def test_closest_valid_candidate_wins_over_small_quality_fluctuations():
     arcs, grid = _arcs(), _grid()
     f = np.linspace(1, 10, 24)
-    same = ArcChoice(0.02, f, f * 0 + 0.2, 9, 2, 1.0)
-    switch = ArcChoice(-0.02, f, f * 0 - 1.0, 9, 2, 1.1)
+    # Both 1.5 m from the edges: separation is scored in corridors of that size.
+    same = ArcChoice(0.02, f, f * 0 + 0.2, 9, 2, 1.0, centring_m=1.5)
+    switch = ArcChoice(-0.02, f, f * 0 - 1.0, 9, 2, 1.1, centring_m=1.5)
     arcs._previous_path = np.column_stack((f, f * 0 + 0.2))
     arcs._previous_pose = _pose()
     with patch.object(

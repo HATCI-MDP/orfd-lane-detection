@@ -72,9 +72,9 @@ The app uses port **64256**; BeamNG's `-tcom` default is **25252**, so include
 A stack is any object with three methods, defined in `src/offroad_autonomy/contract.py`:
 
 - `sensors()` returns the `SensorSpec`s to attach (cameras today), read once before connecting.
-- `step(observation)` takes every declared sensor's reading and the vehicle state, and returns a
-  `StackOutput`: the control command, visuals for the dashboard, optional metrics, and an
-  optional safe-stop request.
+- `step(observation)` takes every declared sensor's reading and the vehicle's own speed and yaw
+  rate (never the simulator's world pose), and returns a `StackOutput`: the control command,
+  visuals for the dashboard, optional metrics, and an optional safe-stop request.
 - `reset()` is called when the operator resumes after a safe stop.
 
 A run config names its stack by import path and hands it a section only the stack reads:

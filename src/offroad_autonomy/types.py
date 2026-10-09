@@ -289,16 +289,40 @@ class PathPlan:
 
 
 @dataclass
+class VehicleSignals:
+    """What the vehicle's own sensors report, as on a production CAN bus.
+
+    This is all a stack learns about the vehicle. Wheel-speed sensors give the
+    speed and the stability-control gyro gives the yaw rate on any modern
+    vehicle, so a stack that drives in simulation has the same inputs on a
+    real one. The simulator's world pose stays with the harness.
+    """
+
+    #: Along the vehicle's forward axis; negative when reversing. Like the yaw
+    #: rate, the mean over the interval since the previous reading, as an
+    #: odometry module integrating the sensors at their own rate reports it.
+    speed_mps: float = 0.0
+    #: About the vertical axis; positive turning left (ISO 8855).
+    yaw_rate_rps: float = 0.0
+    #: When the reading was taken, on the clock the rates are measured against.
+    timestamp_s: float = 0.0
+    valid: bool = True
+
+
+@dataclass
 class VehicleState:
+    """The simulator's ground truth, for the harness's safety checks and scoring.
+
+    A stack never sees it: it gets only ``signals``.
+    """
+
     position: tuple[float, float, float] = (0.0, 0.0, 0.0)
     rotation: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)
     velocity: tuple[float, float, float] = (0.0, 0.0, 0.0)
     speed_mps: float = 0.0
     heading_rad: float = 0.0
     valid: bool = True
-    #: World-frame forward vector from the simulator. Kept separate from the
-    #: quaternion so frame-to-frame motion never depends on its convention.
-    direction: tuple[float, float, float] | None = None
+    signals: VehicleSignals = field(default_factory=VehicleSignals)
 
 
 @dataclass

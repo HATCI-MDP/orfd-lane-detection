@@ -16,7 +16,7 @@ from typing import Protocol, runtime_checkable
 
 import numpy as np
 
-from offroad_autonomy.types import CameraSensor, CameraSpec, ControlCommand, VehicleState
+from offroad_autonomy.types import CameraSensor, CameraSpec, ControlCommand, VehicleSignals
 
 #: What the simulator adapter can attach today; a new kind needs one adapter there.
 SENSOR_KINDS = ("camera",)
@@ -125,10 +125,14 @@ def validate_sensors(sensors: list[SensorSpec]) -> None:
 
 @dataclass
 class Observation:
-    """One frame of input: every declared sensor, read in the same loop iteration."""
+    """One frame of input: every declared sensor, read in the same loop iteration.
+
+    ``vehicle`` holds only what a production vehicle's own sensors report, so
+    no stack can steer by the simulator's exact world pose.
+    """
 
     sensors: dict[str, np.ndarray]
-    vehicle: VehicleState
+    vehicle: VehicleSignals
     timestamp: float
     frame_id: int = 0
 

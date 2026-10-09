@@ -39,7 +39,7 @@ from offroad_autonomy.control.stanley_controller import StanleyController
 from offroad_autonomy.perception.camera_geometry import CameraModel
 from offroad_autonomy.runtime.benchmark import comparison_table
 from offroad_autonomy.stacks.mono_yoloe.config import load_pipeline_config_file
-from offroad_autonomy.types import PathPlan, PipelineConfig, VehicleState
+from offroad_autonomy.types import PathPlan, PipelineConfig, VehicleSignals
 
 
 def s_bend(radius: float, straight: float = 30.0, step: float = 0.1) -> np.ndarray:
@@ -221,7 +221,7 @@ def simulate(
                 plan.roi_top = roi_top
 
         control_started = time.perf_counter()
-        cmd = controller.compute(plan, VehicleState(speed_mps=v))
+        cmd = controller.compute(plan, VehicleSignals(speed_mps=v))
         control_ms = (time.perf_counter() - control_started) * 1000
         # Bicycle model with the PREVIOUS command (latency), + = right.
         step = steer_rate_per_s * dt

@@ -246,3 +246,34 @@ def test_unknown_gearbox_is_not_released():
     assert not any(
         c.kwargs.get("parkingbrake") == 0 for c in client._vehicle.control.call_args_list
     )
+
+
+def test_vehicle_state_reports_emulated_odometry_alongside_the_truth():
+    client = BeamNGClient(HarnessConfig(), [DASHCAM])
+    client._vehicle = MagicMock()
+    readings = [
+        {"pos": (0.0, 0.0, 0.0), "vel": (2.0, 0.0, 0.0), "dir": (1.0, 0.0, 0.0), "time": 10.0},
+        {"pos": (0.5, 0.0, 0.0), "vel": (2.0, 0.0, 0.0), "dir": (0.0, 1.0, 0.0), "time": 10.25},
+    ]
+    states = []
+    for reading in readings:
+        client._vehicle.state = {**reading, "rotation": (0.0, 0.0, 0.0, 1.0)}
+        states.append(client.get_vehicle_state())
+
+    # The truth stays for the harness; the stack's signals are rates only.
+    assert states[1].position == (0.5, 0.0, 0.0)
+    signals = states[1].signals
+    assert signals.valid
+    assert signals.timestamp_s == 10.25
+    assert signals.yaw_rate_rps == pytest.approx((np.pi / 2) / 0.25)
+
+
+def test_a_state_without_a_direction_gives_invalid_signals():
+    client = BeamNGClient(HarnessConfig(), [DASHCAM])
+    client._vehicle = MagicMock()
+    client._vehicle.state = {"pos": (0, 0, 0), "vel": (0, 0, 0), "rotation": (0, 0, 0, 1)}
+
+    state = client.get_vehicle_state()
+
+    assert not state.valid
+    assert not state.signals.valid
