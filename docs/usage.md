@@ -98,31 +98,27 @@ under `control` in `configs/default.yaml`. Remove the former `control.controller
 and `--controller` flag from custom configurations and launch commands.
 
 For the bird's-eye grid planner, run `offroad-autonomy --config configs/grid.yaml`.
-At a split, the grid planner measures how far each branch's drivable road continues through
-the grid (out to `planning.grid.max_range_m`) and drops branches more than
-`planning.grid.branch_depth_margin_m` shorter than the deepest, so a spur or dead end is not
-taken; of the rest it chooses the one closest to the current trajectory and locks onto it
-while multiple branches remain. A change in branch scores
-does not switch branches; the lock releases when only one option remains or the chosen
-branch is no longer safe. Arcs within a branch still use the existing quality scores and
-motion-compensated RMS trajectory-distance penalty. `planning.grid.weight_trajectory_distance`
-sets that penalty per metre (default `0.10`, `0` disables the soft penalty, not branch locking;
-at `0.35` it held the path straight while the road bent).
 
 ### Grid Planner
 
 `planning.mode: grid` projects the road mask onto flat ground, fuses it over time using the
 vehicle's own motion, and picks the best of a fan of steerable arcs on that grid
 (`planning/bev_grid.py`, `planning/arc_planner.py`). It was built for the roof-mounted dashcam,
-whose hood hides the first ~3 m of ground and whose image edges cut wide trails:
+whose hood hides the first ~3 m of ground and whose image edges cut wide trails. This is the
+planner's first implementation, unchanged except that its motion now comes from wheel/gyro
+odometry instead of the simulator's world pose:
 
 - Ground the camera cannot see is unknown, never "not road", so a trail running off the side of
   the image does not pull the path toward the visible part.
 - Memory carries the road the hood now hides, using wheel-speed/yaw-rate dead reckoning
   to follow the vehicle's motion. Without a valid estimate the grid forgets rather than smearing.
 - Frames the perception gate rejects move the grid with the vehicle but add no evidence.
+- Every frame the whole stabilized road mask inside the gate ROI is fused into the grid.
+- Each of 41 constant-curvature arcs is scored on length seen as road, clearance, change from
+  the last arc and bend; the best one becomes the path, handed to Stanley as image pixels.
 - Arcs end where the vehicle's body would leave the road, and the path only extends as far as
   the grid has seen road, so the path-end speed law still applies.
+- There is no centring term, fork or branch handling, or trajectory-continuity penalty.
 - The projection assumes flat ground: on crests and in dips far cells are misplaced, and the
   grid has no height information, so obstacles the segmenter labels as road are not seen.
 
@@ -179,13 +175,14 @@ offroad-autonomy --config configs/grid_mppi.yaml  # smooth MPPI
 offroad-autonomy --config configs/grid_mpc.yaml   # delay-aware tracking MPC
 ```
 
-Both predictive modes follow the grid planner's metric path with a kinematic model that first
+Both predictive modes follow a planner's metric path with a kinematic model that first
 replays the commands already in flight (`control.control_latency_s`) and limits steering slew
 as BeamNG does (`control/predictive.py`; settings under `control.predictive`). `mppi` samples
 changes in the command rather than commands, which keeps plain MPPI from chattering on slow,
 delayed steering, and also scores the BEV grid's clearance, so it can leave a path that runs
 into non-road. `mpc` solves the tracking problem by Gauss-Newton and does not read the grid.
-Without a metric path (other planner modes, or a stop) Stanley steers.
+Without a metric path Stanley steers. No planner currently supplies one (the grid planner
+hands over image pixels), so `grid_mppi.yaml` and `grid_mpc.yaml` steer with Stanley.
 
 ### Live Presentation View
 

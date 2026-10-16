@@ -375,12 +375,13 @@ class CenterlinePlanner:
         frame that passed the gate adds evidence: a rejected mask must not
         teach the grid road that perception itself did not trust."""
         self._grid_path = None
+        mask = stabilized.mask.astype(bool)
         if self._grid is None:
             self._grid = TraversabilityGrid(
                 self._grid_config,
                 self._camera,
                 stabilized.valid_roi,
-                self._grid_top_row(),
+                self._gate.roi_top(mask.shape[0]),
             )
         now = time.perf_counter()
         dt = 0.0
@@ -391,9 +392,7 @@ class CenterlinePlanner:
         self._check_direction(vehicle_state)
         observation = None
         if decision.ok:
-            # Only the trusted road connected to the gate's chosen corridor
-            # may teach the grid. Keep its continuation beyond the gate ROI.
-            observation = self._gate.connected_evidence(stabilized, decision.component)
+            observation = mask
         pose = ground_pose(vehicle_state, self._camera)
         self._track_heading(pose)
         self._grid.update(observation, pose, dt)
@@ -401,16 +400,14 @@ class CenterlinePlanner:
         if not decision.ok:
             return self._hold(decision)
 
-        choice = self._arcs.choose(self._grid, pose)
+        choice = self._arcs.choose(self._grid)
         if choice is None:
             decision.reason = "no drivable arc in the grid"
             return self._hold(decision)
 
+        # Kept for the BEV view only; the controller follows the pixel path.
         self._grid_path = np.column_stack((choice.forward_m, choice.right_m)).copy()
-        curvature = choice.curvature_profile
-        if curvature is None:
-            curvature = np.full(len(choice.forward_m), choice.curvature)
-        # Pixels far -> near, the order Stanley expects from every planner.
+        # Pixels far -> near, the order every planner hands the controllers.
         centerline = self._camera.ground_to_image(choice.forward_m, choice.right_m)[::-1].copy()
         plan = PathPlan(
             centerline=centerline,
@@ -420,21 +417,9 @@ class CenterlinePlanner:
         )
         plan.planner_mask = decision.component
         plan.roi_top = decision.roi_top
-        plan.ground_path = self._grid_path.copy()
-        plan.ground_curvature = np.asarray(curvature, dtype=np.float64).copy()
-        plan.status = "grid_estimate"
         self._last_good = plan
         self._held = 0
         return plan
-
-    def _grid_top_row(self) -> int:
-        """Highest image row the grid reads: where flat ground ``max_range_m``
-        ahead appears. The gate's ROI stops nearer (~15 m); past ~25 m one
-        row spans metres of ground and a small pitch moves it by metres more."""
-        far = self._camera.ground_to_image(
-            np.array([self._grid_config.max_range_m]), np.array([0.0])
-        )[0][1]
-        return max(0, int(math.ceil(float(far))))
 
     def _track_heading(self, pose) -> None:
         if pose is None:
@@ -450,7 +435,6 @@ class CenterlinePlanner:
         grid = self._grid
         if grid is None:
             return None
-        arcs = self._arcs
         path = None
         if self._grid_path is not None:
             path = self._grid_path.copy()
@@ -462,9 +446,6 @@ class CenterlinePlanner:
             ahead_m=self._grid_config.ahead_m,
             half_width_m=self._grid_config.half_width_m,
             path=path,
-            candidates=arcs.preview_arcs(),
-            branch_count=arcs.branch_count,
-            branch_locked=arcs.branch_locked,
             heading_rad=self._heading,
             confidence=np.clip(
                 np.abs(grid.logodds) / self._grid_config.logodds_limit, 0.0, 1.0
