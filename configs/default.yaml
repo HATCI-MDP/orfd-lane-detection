@@ -141,6 +141,14 @@ postprocessing:
   ema_alpha: 0.7
   min_mask_area_fraction: 0.001
   morphology_kernel_size: 5
+  # MIN_ISLAND_AREA_M2: a road island covering less flat ground than this is
+  # dropped as a false positive before any planner sees it. Measured on the
+  # ground, not in pixels: one pixel covers ~0.03 m2 at 13 m but ~0.00005 m2
+  # at 1.4 m, so a pixel threshold would delete far road first. 1 m2 is far
+  # below the ~8.5 m2 the vehicle itself covers, so no island it could drive
+  # on alone is removed. Pixels past planning.projection_max_range_m count as
+  # the farthest footprint. 0 disables. Not yet tuned on recorded runs.
+  min_island_area_m2: 1.0
 
 planning:
   # baseline: largest road component touching the vehicle -> centre of each

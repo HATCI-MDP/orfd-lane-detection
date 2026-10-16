@@ -11,6 +11,7 @@ import logging
 import cv2
 import numpy as np
 
+from offroad_autonomy.perception.camera_geometry import CameraModel
 from offroad_autonomy.perception.ego_mask import road_fraction
 from offroad_autonomy.types import PerceptionResult, PipelineConfig, StabilizedResult
 
@@ -29,6 +30,10 @@ class TemporalStabilizer:
         # the raw mask.
         self._use_morphology = bool(config.enable_morphology)
         self._use_ema = bool(config.enable_ema)
+        self._min_island_m2 = float(config.min_island_area_m2)
+        self._camera_spec = config.camera
+        self._max_range_m = float(config.projection_max_range_m)
+        self._pixel_area: np.ndarray | None = None
         self._accum: np.ndarray | None = None
         self._prev_mask: np.ndarray | None = None
 
@@ -49,6 +54,9 @@ class TemporalStabilizer:
         if self._use_morphology:
             smoothed = cv2.morphologyEx(smoothed, cv2.MORPH_CLOSE, self._kernel)
             smoothed = cv2.morphologyEx(smoothed, cv2.MORPH_OPEN, self._kernel)
+
+        if self._min_island_m2 > 0.0:
+            smoothed = self._remove_islands(smoothed)
 
         h, w = smoothed.shape
         min_area = int(h * w * self._min_area_frac)
@@ -74,6 +82,29 @@ class TemporalStabilizer:
             valid_roi=roi,
             road_fraction=road_fraction(stable_mask, roi),
         )
+
+    def _remove_islands(self, mask: np.ndarray) -> np.ndarray:
+        """A speck of false road would otherwise reach every planner as a
+        destination, and the grid would remember it for seconds. Islands are
+        judged by ground area, not pixel count, because a far pixel covers
+        hundreds of times more ground than a near one: a pixel threshold would
+        delete distant real road first."""
+        count, labels = cv2.connectedComponents(mask, connectivity=8)
+        if count <= 1:
+            return mask
+        area = self._pixel_area_for(mask.shape)
+        # Summing over road pixels only halves the cost on a mostly empty frame.
+        road = mask.astype(bool)
+        island_m2 = np.bincount(labels[road], weights=area[road], minlength=count)
+        keep = (island_m2 >= self._min_island_m2).astype(np.uint8)
+        keep[0] = 0
+        return np.take(keep, labels)
+
+    def _pixel_area_for(self, shape: tuple[int, int]) -> np.ndarray:
+        if self._pixel_area is None or self._pixel_area.shape != shape:
+            camera = CameraModel(self._camera_spec, shape[1], shape[0])
+            self._pixel_area = camera.ground_area_px(self._max_range_m)
+        return self._pixel_area
 
     def _temporal_iou(self, mask: np.ndarray) -> float:
         if self._prev_mask is None:

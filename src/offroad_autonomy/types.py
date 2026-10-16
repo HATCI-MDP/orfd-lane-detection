@@ -462,6 +462,8 @@ class PipelineConfig:
     ema_alpha: float = 0.7
     min_mask_area_fraction: float = 0.001
     morphology_kernel_size: int = 5
+    #: Zero keeps every road island, so configs that predate the setting are unchanged.
+    min_island_area_m2: float = 0.0
     enable_morphology: bool = True
     enable_ema: bool = True
 

@@ -207,6 +207,39 @@ class CameraModel:
         keep &= (low > 0) & (high < math.pi / 2) & (error <= max_relative_error * forward)
         return forward, right, keep
 
+    def ground_area_px(self, max_range_m: float) -> np.ndarray:
+        """Flat-ground area in square metres that each pixel covers, ``(h, w)``.
+
+        A pixel whose footprint does not land on the ground within
+        ``max_range_m`` (sky, the far distance) takes the largest projected
+        footprint instead, so anything measured in ground area there reads as
+        far away rather than as nothing.
+        """
+        u, v = np.meshgrid(
+            np.arange(self.width + 1, dtype=np.float64),
+            np.arange(self.height + 1, dtype=np.float64),
+        )
+        corners = np.stack([u.ravel(), v.ravel()], axis=1)
+        forward, right, keep = self.image_to_ground(corners, max_range_m)
+        shape = (self.height + 1, self.width + 1)
+        forward = forward.reshape(shape)
+        right = right.reshape(shape)
+        keep = keep.reshape(shape)
+
+        # Half the cross product of the diagonals is the area of the
+        # quadrilateral the four pixel corners trace on the ground.
+        diag_f = forward[1:, 1:] - forward[:-1, :-1]
+        diag_r = right[1:, 1:] - right[:-1, :-1]
+        anti_f = forward[1:, :-1] - forward[:-1, 1:]
+        anti_r = right[1:, :-1] - right[:-1, 1:]
+        area = 0.5 * np.abs(diag_f * anti_r - diag_r * anti_f)
+
+        on_ground = keep[1:, 1:] & keep[:-1, :-1] & keep[1:, :-1] & keep[:-1, 1:]
+        largest = np.inf
+        if on_ground.any():
+            largest = float(area[on_ground].max())
+        return np.where(on_ground, area, largest)
+
     def ground_to_image(self, forward_m: np.ndarray, right_m: np.ndarray) -> np.ndarray:
         forward_m = np.asarray(forward_m, dtype=np.float64)
         right_m = np.asarray(right_m, dtype=np.float64)

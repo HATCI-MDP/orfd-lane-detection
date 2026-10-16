@@ -113,7 +113,11 @@ odometry instead of the simulator's world pose:
 - Memory carries the road the hood now hides, using wheel-speed/yaw-rate dead reckoning
   to follow the vehicle's motion. Without a valid estimate the grid forgets rather than smearing.
 - Frames the perception gate rejects move the grid with the vehicle but add no evidence.
-- Every frame the whole stabilized road mask inside the gate ROI is fused into the grid.
+- Every frame the whole stabilized road mask inside the gate ROI is fused into the grid. Before
+  that, the stabilizer drops road islands covering less flat ground than
+  `postprocessing.min_island_area_m2`, so a false-positive speck is not remembered as road.
+  The threshold is in square metres rather than pixels because a far pixel covers far more
+  ground than a near one.
 - Each of 41 constant-curvature arcs is scored on length seen as road, clearance, change from
   the last arc and bend; the best one becomes the path, handed to Stanley as image pixels.
 - Arcs end where the vehicle's body would leave the road, and the path only extends as far as

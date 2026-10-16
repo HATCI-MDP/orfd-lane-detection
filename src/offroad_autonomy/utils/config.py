@@ -407,6 +407,7 @@ def load_config(path: str | Path) -> PipelineConfig:
         ema_alpha=post.get("ema_alpha", 0.7),
         min_mask_area_fraction=post.get("min_mask_area_fraction", 0.001),
         morphology_kernel_size=post.get("morphology_kernel_size", 5),
+        min_island_area_m2=_nonnegative(post, "min_island_area_m2", 0.0),
         enable_morphology=bool(post.get("enable_morphology", True)),
         enable_ema=bool(post.get("enable_ema", True)),
         planner_mode=_planner_mode(plan.get("mode", "baseline")),

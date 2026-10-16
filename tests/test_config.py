@@ -207,6 +207,29 @@ def test_invalid_recording_settings_are_refused(tmp_path, block):
         load_config(config_path)
 
 
+def test_island_removal_is_configured_with_postprocessing(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("postprocessing:\n  min_island_area_m2: 2.5\n", encoding="utf-8")
+
+    assert load_config(config_path).min_island_area_m2 == 2.5
+    assert load_config(DEFAULT_YAML).min_island_area_m2 > 0.0
+
+
+def test_island_removal_is_off_when_not_configured(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("postprocessing: {}\n", encoding="utf-8")
+
+    assert load_config(config_path).min_island_area_m2 == 0.0
+
+
+def test_negative_island_area_is_refused(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("postprocessing:\n  min_island_area_m2: -1\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="min_island_area_m2"):
+        load_config(config_path)
+
+
 def test_grid_profile_selects_the_grid_planner():
     config = load_config(REPO / "configs" / "grid.yaml")
 

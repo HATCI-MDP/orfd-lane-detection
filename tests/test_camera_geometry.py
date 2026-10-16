@@ -24,6 +24,27 @@ def test_camera_axes_follow_vehicle_convention():
     assert np.allclose(forward, [0.0, -1.0, 0.0], atol=1e-6)
 
 
+def test_ground_footprint_grows_with_distance():
+    model = CameraModel(DEFAULT_CAMERA, width=720, height=465)
+
+    area = model.ground_area_px(max_range_m=30.0)
+
+    assert area.shape == (465, 720)
+    assert np.isfinite(area).all()
+    assert (area > 0).all()
+    # Row 440 is a few metres ahead, row 240 is near the planner's far edge.
+    assert area[240, 360] > 10.0 * area[440, 360]
+
+
+def test_pixels_beyond_range_take_the_largest_footprint():
+    """Sky and far ground are never smaller than the farthest projected pixel."""
+    model = CameraModel(DEFAULT_CAMERA, width=720, height=465)
+
+    area = model.ground_area_px(max_range_m=30.0)
+
+    assert area[0, 360] == pytest.approx(area.max())
+
+
 def test_focal_length_is_derived_from_horizontal_fov():
     """f = (w/2) / tan(hfov/2) - never a hard-coded constant."""
     sensor = replace(GMSL2_SENSOR, width=640, height=360, fov_x_deg=90.0)
