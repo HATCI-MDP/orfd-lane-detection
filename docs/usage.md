@@ -117,7 +117,13 @@ odometry instead of the simulator's world pose:
   that, the stabilizer drops road islands covering less flat ground than
   `postprocessing.min_island_area_m2`, so a false-positive speck is not remembered as road.
   The threshold is in square metres rather than pixels because a far pixel covers far more
-  ground than a near one.
+  ground than a near one. With `postprocessing.hysteresis_high` above zero (0.8 by default) it
+  also drops any road region with no pixel at least that confident; it never adds road.
+- With `planning.grid.evidence: binary` each observed cell gets a fixed log-odds step. With
+  `probabilistic`, the default, the step is the logit of the model's confidence,
+  capped at that fixed step and scaled down with range by the projection pitch-sensitivity
+  bound, so uncertain or distant pixels need more frames to mark a cell. Both hysteresis and
+  probabilistic evidence need a binary semantic head and fall back to the mask otherwise.
 - Each of 41 constant-curvature arcs is scored on length seen as road, clearance, change from
   the last arc and bend; the best one becomes the path, handed to Stanley as image pixels.
 - Arcs end where the vehicle's body would leave the road, and the path only extends as far as

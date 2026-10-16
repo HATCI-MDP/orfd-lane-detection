@@ -41,6 +41,13 @@ def _nonnegative(raw: dict, key: str, default: float) -> float:
     return value
 
 
+def _probability(raw: dict, key: str, default: float) -> float:
+    value = _nonnegative(raw, key, default)
+    if value > 1:
+        raise ValueError(f"{key} must be between 0 and 1")
+    return value
+
+
 def _positive(raw: dict, key: str, default: float) -> float:
     value = _nonnegative(raw, key, default)
     if value == 0:
@@ -408,6 +415,7 @@ def load_config(path: str | Path) -> PipelineConfig:
         min_mask_area_fraction=post.get("min_mask_area_fraction", 0.001),
         morphology_kernel_size=post.get("morphology_kernel_size", 5),
         min_island_area_m2=_nonnegative(post, "min_island_area_m2", 0.0),
+        hysteresis_high=_probability(post, "hysteresis_high", 0.0),
         enable_morphology=bool(post.get("enable_morphology", True)),
         enable_ema=bool(post.get("enable_ema", True)),
         planner_mode=_planner_mode(plan.get("mode", "baseline")),

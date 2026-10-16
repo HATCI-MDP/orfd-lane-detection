@@ -80,6 +80,8 @@ class TraversabilityGrid:
         camera: CameraModel,
         valid_roi: np.ndarray | None,
         roi_top: int,
+        pitch_uncertainty_deg: float = 0.0,
+        max_relative_error: float = 1.0,
     ) -> None:
         self.config = config
         self.cell_m = float(config.cell_m)
@@ -109,6 +111,15 @@ class TraversabilityGrid:
         self._map_x = np.where(in_image, u, -1.0).astype(np.float32)
         self._map_y = np.where(in_image, v, -1.0).astype(np.float32)
 
+        # A small pitch error moves far ground by metres and near ground by
+        # centimetres, so far observations count for less. Zero at the
+        # distance where the error reaches max_relative_error of the range.
+        self.range_weight = np.ones((self.rows, self.cols), dtype=np.float32)
+        if pitch_uncertainty_deg > 0:
+            relative = camera.pitch_relative_error(forward, pitch_uncertainty_deg)
+            weight = 1.0 - relative / max_relative_error
+            self.range_weight = np.clip(weight, 0.0, 1.0).astype(np.float32)
+
     def cell_centres(self) -> tuple[np.ndarray, np.ndarray]:
         """``(forward_m, right_m)`` of every cell, each ``(rows, cols)``."""
         rows = np.arange(self.rows, dtype=np.float64)
@@ -132,10 +143,12 @@ class TraversabilityGrid:
         road_mask: np.ndarray | None,
         pose: GroundPose | None,
         dt_s: float,
+        road_probability: np.ndarray | None = None,
     ) -> None:
         """Move the grid with the vehicle, let old evidence fade, then add
         this frame's mask. ``road_mask`` is ``None`` when the frame is not
-        trusted, so the grid still tracks the vehicle but learns nothing."""
+        trusted, so the grid still tracks the vehicle but learns nothing.
+        ``road_probability`` is used only in probabilistic evidence mode."""
         if pose is None or self._pose is None:
             self.logodds.fill(0.0)
         else:
@@ -156,9 +169,34 @@ class TraversabilityGrid:
             borderValue=0,
         ).astype(bool)
         cfg = self.config
-        evidence = np.where(observed, cfg.road_logodds, cfg.offroad_logodds).astype(np.float32)
+        if cfg.evidence == "probabilistic" and road_probability is not None:
+            evidence = self._weighted_evidence(observed, road_probability)
+        else:
+            evidence = np.where(observed, cfg.road_logodds, cfg.offroad_logodds)
+            evidence = evidence.astype(np.float32)
         self.logodds[self.in_view] += evidence[self.in_view]
         np.clip(self.logodds, -cfg.logodds_limit, cfg.logodds_limit, out=self.logodds)
+
+    def _weighted_evidence(self, observed: np.ndarray, road_probability: np.ndarray) -> np.ndarray:
+        """Inverse sensor model: the mask decides whether a cell is road, the
+        model's confidence and the range decide how much one frame says so.
+        The binary steps cap it, so no single frame outweighs binary mode."""
+        # Bilinear, so a near cell spread over many pixels averages them.
+        probability = cv2.remap(
+            road_probability.astype(np.float32),
+            self._map_x,
+            self._map_y,
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0.5,
+        )
+        confidence = np.clip(np.maximum(probability, 1.0 - probability), 0.5, 1.0 - 1e-6)
+        strength = np.log(confidence / (1.0 - confidence))
+        cfg = self.config
+        road = np.minimum(strength, cfg.road_logodds)
+        offroad = np.maximum(-strength, cfg.offroad_logodds)
+        evidence = np.where(observed, road, offroad) * self.range_weight
+        return evidence.astype(np.float32)
 
     def road(self) -> np.ndarray:
         return self.logodds > self.config.road_threshold

@@ -230,6 +230,22 @@ def test_negative_island_area_is_refused(tmp_path):
         load_config(config_path)
 
 
+@pytest.mark.parametrize("value", ["-0.1", "1.5"])
+def test_hysteresis_threshold_outside_probability_range_is_refused(tmp_path, value):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(f"postprocessing:\n  hysteresis_high: {value}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="hysteresis_high"):
+        load_config(config_path)
+
+
+def test_grid_evidence_mode_is_configured(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("planning:\n  grid:\n    evidence: probabilistic\n", encoding="utf-8")
+
+    assert load_config(config_path).grid.evidence == "probabilistic"
+
+
 def test_grid_profile_selects_the_grid_planner():
     config = load_config(REPO / "configs" / "grid.yaml")
 

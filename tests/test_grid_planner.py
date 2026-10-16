@@ -290,3 +290,103 @@ def test_unknown_clearance_is_not_positive_road_evidence():
     assert grid.clearance_m().max() > CONFIG.grid.lookahead_m
     assert not grid.road().any()
     assert _arcs().choose(grid) is None
+
+
+PROBABILISTIC = replace(CONFIG.grid, evidence="probabilistic")
+
+
+def _probability(mask: np.ndarray, road: float, background: float = 0.05) -> np.ndarray:
+    return np.where(mask, road, background).astype(np.float32)
+
+
+def _probabilistic_grid(pitch_uncertainty_deg: float = 0.0) -> TraversabilityGrid:
+    return TraversabilityGrid(
+        PROBABILISTIC,
+        CAMERA,
+        VALID,
+        ROI_TOP,
+        pitch_uncertainty_deg=pitch_uncertainty_deg,
+        max_relative_error=CONFIG.projection_max_relative_error,
+    )
+
+
+def test_confident_road_adds_more_evidence_than_uncertain_road():
+    mask = _road_mask(_straight(2.0))
+    sure, unsure = _probabilistic_grid(), _probabilistic_grid()
+
+    sure.update(mask, _pose(), 0.0, road_probability=_probability(mask, 0.95))
+    unsure.update(mask, _pose(), 0.0, road_probability=_probability(mask, 0.6))
+
+    assert float(_cells(sure, 5.0, 0.0)) > float(_cells(unsure, 5.0, 0.0)) > 0.0
+
+
+def test_one_frame_never_adds_more_than_the_binary_step():
+    mask = _road_mask(_straight(2.0))
+    grid = _probabilistic_grid()
+
+    grid.update(mask, _pose(), 0.0, road_probability=_probability(mask, 1.0, 0.0))
+
+    assert grid.logodds.max() == pytest.approx(PROBABILISTIC.road_logodds)
+    assert grid.logodds.min() == pytest.approx(PROBABILISTIC.offroad_logodds)
+
+
+def test_a_coin_flip_pixel_adds_no_evidence():
+    mask = _road_mask(_straight(2.0))
+    grid = _probabilistic_grid()
+
+    grid.update(mask, _pose(), 0.0, road_probability=np.full(mask.shape, 0.5, np.float32))
+
+    assert float(_cells(grid, 5.0, 0.0)) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_far_ground_counts_for_less_than_near_ground():
+    """A small pitch error moves far ground points by metres, near ones by centimetres."""
+    mask = _road_mask(_straight(2.0))
+    grid = _probabilistic_grid(pitch_uncertainty_deg=CONFIG.projection_pitch_uncertainty_deg)
+
+    grid.update(mask, _pose(), 0.0, road_probability=_probability(mask, 0.95))
+
+    assert 0.0 < float(_cells(grid, 12.0, 0.0)) < float(_cells(grid, 4.0, 0.0))
+
+
+def test_binary_evidence_ignores_the_probability():
+    mask = _road_mask(_straight(2.0))
+    plain, given = _grid(), _grid()
+
+    plain.update(mask, _pose(), 0.0)
+    given.update(mask, _pose(), 0.0, road_probability=_probability(mask, 0.6))
+
+    np.testing.assert_array_equal(plain.logodds, given.logodds)
+
+
+def test_probabilistic_grid_falls_back_to_binary_without_probabilities():
+    mask = _road_mask(_straight(2.0))
+    plain, probabilistic = _grid(), _probabilistic_grid()
+
+    plain.update(mask, _pose(), 0.0)
+    probabilistic.update(mask, _pose(), 0.0)
+
+    np.testing.assert_array_equal(plain.logodds, probabilistic.logodds)
+
+
+def test_planner_feeds_the_segmenter_probability_to_the_grid():
+    config = replace(CONFIG, grid=PROBABILISTIC)
+    planner = CenterlinePlanner(config, camera=CAMERA)
+    mask = _road_mask(_straight(2.0))
+    raw = PerceptionResult(
+        mask=mask,
+        confidences=[0.6],
+        confidence_map=np.where(mask, 0.6, 0.0).astype(np.float32),
+        road_probability=_probability(mask, 0.6),
+    )
+    stabilized = StabilizedResult(mask=mask, valid_roi=VALID, raw_result=raw)
+
+    planner.plan(stabilized, vehicle_state=VehicleState(direction=(1.0, 0.0, 0.0)))
+
+    near = float(_cells(planner.grid, 4.0, 0.0))
+    assert 0.0 < near < PROBABILISTIC.road_logodds
+
+
+def test_unknown_grid_evidence_mode_is_refused():
+    with pytest.raises(ValueError, match="evidence"):
+        replace(CONFIG.grid, evidence="fuzzy")

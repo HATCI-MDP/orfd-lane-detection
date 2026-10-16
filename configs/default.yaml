@@ -149,6 +149,13 @@ postprocessing:
   # on alone is removed. Pixels past planning.projection_max_range_m count as
   # the farthest footprint. 0 disables. Not yet tuned on recorded runs.
   min_island_area_m2: 1.0
+  # HYSTERESIS_HIGH: a road region survives only if some pixel in it reaches
+  # this P(road). The model's own mask is the low threshold, so this can only
+  # remove road the model was never confident about anywhere, never add any.
+  # Needs a binary semantic head; other heads skip it. 0 disables. 0.8 sits
+  # between the near-certain peak of a real trail region and the hedged peak
+  # of a false positive; not yet checked on a recorded run.
+  hysteresis_high: 0.8
 
 planning:
   # baseline: largest road component touching the vehicle -> centre of each
@@ -227,7 +234,9 @@ planning:
     # hood was in view 0.75 s earlier, well inside the memory.
     memory_s: 2.0
     # Log-odds added per frame for road / not road. One frame is enough to
-    # mark a cell; the stabilizer's EMA has already smoothed the mask.
+    # mark a cell. The mask arrives unsmoothed (postprocessing EMA is off);
+    # this grid is the temporal filter, and it follows the vehicle's motion.
+    # In probabilistic mode these are the most one frame can add.
     road_logodds: 0.85
     offroad_logodds: -0.85
     logodds_limit: 4.0
@@ -257,6 +266,14 @@ planning:
     # Only breaks near-ties; at 0.4 it locked onto the first arc it picked.
     weight_consistency: 0.2
     weight_curvature: 0.1
+    # binary: every observed cell gets road_logodds or offroad_logodds.
+    # probabilistic: the mask still decides road or not, but the step is
+    # logit(model confidence), capped at those values, times a range weight
+    # from planning.projection_pitch_uncertainty_deg and
+    # projection_max_relative_error (0.88 at 2 m, 0.51 at 13.4 m), so
+    # uncertain and far pixels need more frames to mark a cell. Falls back to
+    # binary without a binary semantic head. Not yet compared on recorded runs.
+    evidence: probabilistic
 
 control:
   # Half the vehicle width keeps the road-edge margin outside the bodywork.

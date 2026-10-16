@@ -283,6 +283,9 @@ class PerceptionResult:
     road_fraction: float = 0.0
     #: Probability of the selected road class (instance scores for YOLOE).
     confidence_map: np.ndarray | None = None
+    #: P(road) for every pixel, road or not. Only binary semantic heads have
+    #: it; ``None`` everywhere else, and consumers fall back to the mask.
+    road_probability: np.ndarray | None = None
 
 
 @dataclass
@@ -464,6 +467,8 @@ class PipelineConfig:
     morphology_kernel_size: int = 5
     #: Zero keeps every road island, so configs that predate the setting are unchanged.
     min_island_area_m2: float = 0.0
+    #: Zero keeps every road region regardless of its peak probability.
+    hysteresis_high: float = 0.0
     enable_morphology: bool = True
     enable_ema: bool = True
 

@@ -86,3 +86,64 @@ def test_island_removal_follows_the_mask_size():
     cleaned = _stabilize(_stabilizer(), mask)
 
     assert not cleaned.any()
+
+
+def _with_probability(mask: np.ndarray, probability: np.ndarray) -> PerceptionResult:
+    return PerceptionResult(mask=mask, road_probability=probability)
+
+
+def _hysteresis(**overrides) -> TemporalStabilizer:
+    settings = {"min_island_area_m2": 0.0, "hysteresis_high": 0.8}
+    settings.update(overrides)
+    return _stabilizer(**settings)
+
+
+def test_road_region_without_a_confident_pixel_is_dropped():
+    mask = np.zeros(SHAPE, dtype=bool)
+    mask[300:, 100:200] = True
+    probability = np.where(mask, 0.6, 0.1).astype(np.float32)
+
+    cleaned = _hysteresis().stabilize(_with_probability(mask, probability)).mask
+
+    assert not cleaned.any()
+
+
+def test_one_confident_pixel_keeps_its_whole_region():
+    mask = np.zeros(SHAPE, dtype=bool)
+    mask[300:, 100:200] = True
+    probability = np.where(mask, 0.6, 0.1).astype(np.float32)
+    probability[400, 150] = 0.95
+
+    cleaned = _hysteresis().stabilize(_with_probability(mask, probability)).mask
+
+    assert cleaned[300:, 100:200].all()
+
+
+def test_hysteresis_never_adds_road_the_model_rejected():
+    mask = np.zeros(SHAPE, dtype=bool)
+    mask[300:, 100:200] = True
+    probability = np.full(SHAPE, 0.95, dtype=np.float32)
+
+    cleaned = _hysteresis().stabilize(_with_probability(mask, probability)).mask
+
+    np.testing.assert_array_equal(cleaned, mask)
+
+
+def test_hysteresis_is_off_at_zero():
+    mask = np.zeros(SHAPE, dtype=bool)
+    mask[300:, 100:200] = True
+    probability = np.where(mask, 0.6, 0.1).astype(np.float32)
+
+    cleaned = _hysteresis(hysteresis_high=0.0).stabilize(_with_probability(mask, probability))
+
+    np.testing.assert_array_equal(cleaned.mask, mask)
+
+
+def test_hysteresis_leaves_the_mask_alone_without_probabilities():
+    """YOLOE instance heads have no per-pixel road probability."""
+    mask = np.zeros(SHAPE, dtype=bool)
+    mask[300:, 100:200] = True
+
+    cleaned = _hysteresis().stabilize(PerceptionResult(mask=mask)).mask
+
+    np.testing.assert_array_equal(cleaned, mask)

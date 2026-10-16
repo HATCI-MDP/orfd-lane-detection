@@ -3,6 +3,8 @@
 import math
 from dataclasses import dataclass, fields
 
+EVIDENCE_MODES = ("binary", "probabilistic")
+
 
 @dataclass
 class GridPlannerConfig:
@@ -27,9 +29,16 @@ class GridPlannerConfig:
     weight_clearance: float = 1.0
     weight_consistency: float = 0.2
     weight_curvature: float = 0.1
+    evidence: str = "binary"
 
     def __post_init__(self):
+        if self.evidence not in EVIDENCE_MODES:
+            raise ValueError(
+                f"planning.grid.evidence must be one of {EVIDENCE_MODES}, got {self.evidence!r}"
+            )
         for f in fields(self):
+            if f.name == "evidence":
+                continue
             value = getattr(self, f.name)
             if isinstance(value, bool) or not math.isfinite(value):
                 raise ValueError(f"planning.grid.{f.name} must be finite and numeric")

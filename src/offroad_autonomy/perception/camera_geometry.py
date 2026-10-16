@@ -197,6 +197,16 @@ class CameraModel:
         forward, right, keep = self.image_to_ground(uv, max_range_m)
         if pitch_uncertainty_deg <= 0:
             return forward, right, keep
+        keep &= self.pitch_relative_error(forward, pitch_uncertainty_deg) <= max_relative_error
+        return forward, right, keep
+
+    def pitch_relative_error(
+        self, forward_m: np.ndarray, pitch_uncertainty_deg: float
+    ) -> np.ndarray:
+        """How far a flat-ground point at ``forward_m`` could move, as a share
+        of its range, if the true pitch differs by ``pitch_uncertainty_deg``.
+        Infinite where the error reaches the horizon or straight down."""
+        forward = np.asarray(forward_m, dtype=np.float64)
         angle = np.arctan2(self.position[2], forward)
         delta = math.radians(pitch_uncertainty_deg)
         low, high = angle - delta, angle + delta
@@ -204,8 +214,9 @@ class CameraModel:
         far = self.position[2] / np.tan(safe_low)
         near = self.position[2] / np.tan(high)
         error = np.maximum(np.abs(far - forward), np.abs(near - forward))
-        keep &= (low > 0) & (high < math.pi / 2) & (error <= max_relative_error * forward)
-        return forward, right, keep
+        bounded = (low > 0) & (high < math.pi / 2) & (forward > 0)
+        safe_forward = np.where(bounded, forward, 1.0)
+        return np.where(bounded, error / safe_forward, np.inf)
 
     def ground_area_px(self, max_range_m: float) -> np.ndarray:
         """Flat-ground area in square metres that each pixel covers, ``(h, w)``.

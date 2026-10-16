@@ -382,6 +382,8 @@ class CenterlinePlanner:
                 self._camera,
                 stabilized.valid_roi,
                 self._gate.roi_top(mask.shape[0]),
+                pitch_uncertainty_deg=self._projection_options["pitch_uncertainty_deg"],
+                max_relative_error=self._projection_options["max_relative_error"],
             )
         now = time.perf_counter()
         dt = 0.0
@@ -391,11 +393,14 @@ class CenterlinePlanner:
 
         self._check_direction(vehicle_state)
         observation = None
+        road_probability = None
         if decision.ok:
             observation = mask
+            if stabilized.raw_result is not None:
+                road_probability = stabilized.raw_result.road_probability
         pose = ground_pose(vehicle_state, self._camera)
         self._track_heading(pose)
-        self._grid.update(observation, pose, dt)
+        self._grid.update(observation, pose, dt, road_probability=road_probability)
 
         if not decision.ok:
             return self._hold(decision)

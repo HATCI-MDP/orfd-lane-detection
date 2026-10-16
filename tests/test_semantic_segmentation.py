@@ -41,6 +41,48 @@ def test_semantic_road_selection_threshold_and_ego_exclusion():
     assert model.predict.call_args.kwargs["predictor"] is RoadSemanticPredictor
 
 
+def _semantic_frame(labels, confidence):
+    return [
+        SimpleNamespace(
+            semantic_mask=SimpleNamespace(data=torch.tensor(labels)),
+            semantic_confidence=torch.tensor(confidence),
+        )
+    ]
+
+
+def _predict(seg, shape=(2, 3)):
+    image = np.zeros((*shape, 3), dtype=np.uint8)
+    packet = FramePacket(
+        raw=image, preprocessed=image, timestamp=0, height=shape[0], width=shape[1]
+    )
+    return seg.predict(packet, None)
+
+
+def test_binary_head_reports_road_probability_for_every_pixel():
+    """Background pixels carry 1 - confidence, so a confident background
+    pixel is a confident "not road", not merely a missing value."""
+    seg, model = _segmenter()
+    model.predict.return_value = _semantic_frame(
+        [[0, 1, 1], [1, 1, 0]], [[0.99, 0.8, 0.6], [0.95, 0.9, 0.7]]
+    )
+
+    result = _predict(seg)
+
+    np.testing.assert_allclose(
+        result.road_probability, [[0.01, 0.8, 0.6], [0.95, 0.9, 0.3]], atol=1e-6
+    )
+
+
+def test_multi_class_head_has_no_road_probability():
+    """With three classes 1 - confidence overstates the chance of road."""
+    seg, model = _segmenter({0: "background", 1: "grass", 2: "traversable road"})
+    model.predict.return_value = _semantic_frame([[0, 1, 2]], [[0.9, 0.9, 0.9]])
+
+    result = _predict(seg, shape=(1, 3))
+
+    assert result.road_probability is None
+
+
 def test_unknown_semantic_class_fails_instead_of_treating_everything_as_road():
     with pytest.raises(ValueError, match="No semantic road class"):
         _segmenter({0: "background", 1: "vehicle"})

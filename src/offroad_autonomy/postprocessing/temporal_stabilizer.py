@@ -31,6 +31,7 @@ class TemporalStabilizer:
         self._use_morphology = bool(config.enable_morphology)
         self._use_ema = bool(config.enable_ema)
         self._min_island_m2 = float(config.min_island_area_m2)
+        self._hysteresis_high = float(config.hysteresis_high)
         self._camera_spec = config.camera
         self._max_range_m = float(config.projection_max_range_m)
         self._pixel_area: np.ndarray | None = None
@@ -54,6 +55,9 @@ class TemporalStabilizer:
         if self._use_morphology:
             smoothed = cv2.morphologyEx(smoothed, cv2.MORPH_CLOSE, self._kernel)
             smoothed = cv2.morphologyEx(smoothed, cv2.MORPH_OPEN, self._kernel)
+
+        if self._hysteresis_high > 0.0 and result.road_probability is not None:
+            smoothed = self._hysteresis(smoothed, result.road_probability)
 
         if self._min_island_m2 > 0.0:
             smoothed = self._remove_islands(smoothed)
@@ -82,6 +86,21 @@ class TemporalStabilizer:
             valid_roi=roi,
             road_fraction=road_fraction(stable_mask, roi),
         )
+
+    def _hysteresis(self, mask: np.ndarray, road_probability: np.ndarray) -> np.ndarray:
+        """The model's own mask is the weak set, so this can only take road
+        away: a region survives when part of it is confidently road, and a
+        region the model was never sure of anywhere is dropped whole."""
+        if road_probability.shape != mask.shape:
+            raise ValueError("Road probability is not aligned with the mask")
+        count, labels = cv2.connectedComponents(mask, connectivity=8)
+        if count <= 1:
+            return mask
+        strong = (road_probability >= self._hysteresis_high) & mask.astype(bool)
+        keep = np.zeros(count, dtype=np.uint8)
+        keep[labels[strong]] = 1
+        keep[0] = 0
+        return np.take(keep, labels)
 
     def _remove_islands(self, mask: np.ndarray) -> np.ndarray:
         """A speck of false road would otherwise reach every planner as a

@@ -67,6 +67,9 @@ class RoadSegmenter:
             # their names dictionary lists the sole foreground class as 0.
             if len(names) == 1:
                 self._road_ids = [1]
+            # Only with one road class against background is 1 - confidence
+            # the chance of road; with more classes it overstates it.
+            self._binary_head = len(names) <= 2 and len(self._road_ids) == 1
             logger.info("Semantic road classes: %s (mask IDs %s)", names, self._road_ids)
         elif prompts and Path(weights).suffix == ".pt":
             try:
@@ -154,12 +157,17 @@ class RoadSegmenter:
         mask = np.zeros((h, w), dtype=bool)
         confs = []
         confidence_map = np.zeros((h, w), dtype=np.float32)
+        road_probability = None
         if result is not None and result.semantic_mask is not None:
             labels = result.semantic_mask.data.cpu().numpy()
             confidence = result.semantic_confidence.cpu().numpy()
             if labels.shape != (h, w) or confidence.shape != (h, w):
                 raise ValueError("Semantic prediction is not aligned with the camera frame")
-            mask = np.isin(labels, self._road_ids) & (confidence >= self._conf)
+            labelled_road = np.isin(labels, self._road_ids)
+            if self._binary_head:
+                road_probability = np.where(labelled_road, confidence, 1.0 - confidence)
+                road_probability = road_probability.astype(np.float32)
+            mask = labelled_road & (confidence >= self._conf)
             mask = apply_roi(mask, valid_roi)
             confidence_map[mask] = confidence[mask]
             if mask.any():
@@ -172,6 +180,7 @@ class RoadSegmenter:
             valid_roi=valid_roi,
             road_fraction=road_fraction(mask, valid_roi),
             confidence_map=confidence_map,
+            road_probability=road_probability,
         )
 
     @staticmethod
