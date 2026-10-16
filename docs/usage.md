@@ -27,7 +27,7 @@ Put the model weights in `models/`: `weights.pt` for the current semantic defaul
 ### Custom Semantic Weights
 
 Custom semantic segmentation checkpoints such as `models/weights.pt` require
-Ultralytics 8.4.55 or newer (`pip install -e ".[dev]"`). Set `perception.model_weights`
+Ultralytics 8.4.80 or newer (`pip install -e ".[dev]"`). Set `perception.model_weights`
 to the checkpoint and include its road class name in `perception.prompts`.
 For semantic models these names select fixed classes; other classes are excluded.
 Class matching ignores case and treats spaces and underscores as equivalent, so

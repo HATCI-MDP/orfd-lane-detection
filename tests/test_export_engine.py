@@ -21,4 +21,4 @@ def test_export_preserves_fixed_semantic_classes_and_prompts_yoloe(task):
         model.set_classes.assert_not_called()
     else:
         model.set_classes.assert_called_once_with(config.perception_prompts)
-    model.export.assert_called_once_with(format="engine", imgsz=1024, half=True, device=0)
+    model.export.assert_called_once_with(format="engine", imgsz=1024, quantize=16, device=0)

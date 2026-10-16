@@ -40,10 +40,13 @@ def main() -> None:
         except (TypeError, AssertionError, AttributeError):
             # Fixed-class checkpoints already contain their road vocabulary.
             pass
+    quantize = 16
+    if args.fp32:
+        quantize = None
     engine = model.export(
         format="engine",
         imgsz=config.perception_input_size,
-        half=not args.fp32,
+        quantize=quantize,
         device=0,
     )
     print(f"Engine written to {Path(engine)}")

@@ -36,7 +36,11 @@ class RoadSegmenter:
         weights = config.model_weights
         self._conf = config.confidence_threshold
         self._imgsz = int(config.perception_input_size)
-        self._half = bool(config.perception_half and torch.cuda.is_available())
+        # Ultralytics reads quantize=16 as FP16 and None as FP32; its older half
+        # flag still works but warns on every model setup.
+        self._quantize = None
+        if config.perception_half and torch.cuda.is_available():
+            self._quantize = 16
 
         logger.info("Loading model weights: %s", weights)
         self._model = YOLO(weights, task="segment")
@@ -71,6 +75,29 @@ class RoadSegmenter:
             except (TypeError, AssertionError, AttributeError):
                 logger.info("Model has fixed classes - skipping open-vocab prompts")
 
+        # The first inference sets up the predictor and GPU kernels and takes
+        # about a second. Inside the control loop that opens a gap between
+        # wheel/gyro samples longer than odometry accepts, which safe-stops
+        # autonomy on its second frame, so pay it here instead.
+        blank = np.zeros((config.preprocess_height, config.preprocess_width, 3), dtype=np.uint8)
+        self._infer(blank)
+
+    def _infer(self, img: np.ndarray) -> list:
+        # Without retina_masks the masks come back at the padded network
+        # resolution, and a plain resize shifts them against the frame.
+        kwargs = {}
+        if self._semantic:
+            kwargs["predictor"] = self._predictor
+        return self._model.predict(
+            img,
+            conf=self._conf,
+            imgsz=self._imgsz,
+            quantize=self._quantize,
+            verbose=False,
+            retina_masks=True,
+            **kwargs,
+        )
+
     def predict(
         self,
         frame: FramePacket,
@@ -85,20 +112,7 @@ class RoadSegmenter:
         h, w = frame.height, frame.width
 
         t0 = time.perf_counter()
-        # Without retina_masks the masks come back at the padded network
-        # resolution, and a plain resize shifts them against the frame.
-        kwargs = {}
-        if self._semantic:
-            kwargs["predictor"] = self._predictor
-        results = self._model.predict(
-            img,
-            conf=self._conf,
-            imgsz=self._imgsz,
-            half=self._half,
-            verbose=False,
-            retina_masks=True,
-            **kwargs,
-        )
+        results = self._infer(img)
         t_ms = (time.perf_counter() - t0) * 1000.0
 
         result = None

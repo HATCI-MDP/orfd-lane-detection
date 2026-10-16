@@ -107,7 +107,7 @@ def test_instance_model_retains_prompting_and_mask_path():
 
 
 @pytest.mark.parametrize(
-    "requested,cuda,expected", [(False, True, False), (True, False, False), (True, True, True)]
+    "requested,cuda,expected", [(False, True, None), (True, False, None), (True, True, 16)]
 )
 def test_half_precision_is_opt_in_and_falls_back_on_cpu(requested, cuda, expected):
     cfg = PipelineConfig(perception_half=requested)
@@ -122,4 +122,18 @@ def test_half_precision_is_opt_in_and_falls_back_on_cpu(requested, cuda, expecte
         seg = RoadSegmenter(cfg)
     image = np.zeros((2, 3, 3), dtype=np.uint8)
     seg.predict(FramePacket(raw=image, preprocessed=image, timestamp=0, height=2, width=3))
-    assert model.predict.call_args.kwargs["half"] is expected
+    assert model.predict.call_args.kwargs["quantize"] == expected
+    assert "half" not in model.predict.call_args.kwargs
+
+
+def test_model_is_warmed_up_before_the_first_frame():
+    """The first inference is slow; done in the loop it starves wheel/gyro
+    odometry for over a second and safe-stops the vehicle."""
+    cfg = PipelineConfig()
+    model = Mock(task="semantic", names={0: "background", 1: "traversable road"})
+    model.predict.return_value = []
+    with patch("offroad_autonomy.perception.road_segmenter.YOLO", return_value=model):
+        RoadSegmenter(cfg)
+    model.predict.assert_called_once()
+    warmup = model.predict.call_args.args[0]
+    assert warmup.shape == (cfg.preprocess_height, cfg.preprocess_width, 3)
