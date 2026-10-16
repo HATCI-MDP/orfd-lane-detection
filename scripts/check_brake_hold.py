@@ -20,12 +20,16 @@ from offroad_autonomy.types import ControlCommand
 from offroad_autonomy.utils.config import load_config
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=str(ROOT / "configs/default.yaml"))
     parser.add_argument("--reproduce-arcade", action="store_true")
     parser.add_argument("--out", default="output/diagnostics/brake_hold.json")
-    args = parser.parse_args()
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
     client = BeamNGClient(load_config(args.config))
     rows = []
 

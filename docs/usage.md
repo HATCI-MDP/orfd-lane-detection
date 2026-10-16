@@ -24,6 +24,31 @@ pip install -e ".[dev]"
 
 Put the model weights in `models/`: `weights.pt` for the current semantic default, or the optional `yoloe-26x-seg.pt` / `yoloe-26s-seg.pt` instance checkpoints and `mobileclip2_b.ts` YOLOE text encoder.
 
+### Tab Completion
+
+`offroad-autonomy` and every `scripts/*.py` complete their options, option
+choices and subcommands on TAB. Load the completion once per shell, or add the
+line to `~/.bashrc` or `$PROFILE` to keep it:
+
+```bash
+source completions/offroad-autonomy.bash
+```
+
+```powershell
+. .\completions\offroad-autonomy.ps1
+```
+
+Scripts complete after `python`, `python3` or (PowerShell only) `py`, such as
+`python scripts/diagnose_perception.py analyze --<TAB>`. Path options offer
+file names; numeric options offer nothing. In Bash, sourcing the file replaces
+bash-completion's completion of the interpreter's own flags with file names.
+Windows PowerShell 5.1 does not call completers for a bare `-` or `--`, so
+type the option's first letter there; PowerShell 7 completes both.
+
+The files are generated from the argparse parsers. After adding or changing an
+option, run `python scripts/generate_completions.py`; `tests/test_completions.py`
+fails until the committed files match.
+
 ### Custom Semantic Weights
 
 Custom semantic segmentation checkpoints such as `models/weights.pt` require
@@ -318,6 +343,7 @@ BEAMNG_HOST=192.168.1.50 docker compose up
 | `python scripts/diagnose_perception.py capture` / `analyze`     | Save simulator frames, then dump every perception stage |
 | `python scripts/closed_loop_log.py --seconds 120 --summary`     | Headless run that logs every control frame to CSV       |
 | `python scripts/export_engine.py`                               | Export the segmentation model to TensorRT               |
+| `python scripts/generate_completions.py`                        | Regenerate Bash and PowerShell tab completion           |
 
 ## Development Notes
 
@@ -327,6 +353,7 @@ BEAMNG_HOST=192.168.1.50 docker compose up
 - `beamng.host`, `beamng.launch` and `beamng.camera_transport` default to `auto`; `ui.display_async` defaults to `true` and is constrained by GUI platform support; `BEAMNG_HOST`, `BEAMNG_PORT`, `BEAMNG_HOME` and `BEAMNG_LAUNCH` override the `beamng:` block
 - The dashboard runs on its own thread, and the control loop never waits for it
 - After changing the mount or lens in `beamng.camera`, re-run `scripts/derive_ego_mask.py` and re-check `planning.roi_height`
+- Every script exposes `build_parser()`, which `scripts/generate_completions.py` reads to write the tab completion in `completions/`
 - Manual driving (W/A/S/D under safe stop) reads the OS key state and works only on Windows
 - CI (`.github/workflows/ci.yml`) runs lint, format, the S-bend check, tests with coverage and the build on Python 3.10; CodeQL scans weekly and on every pull request; Dependabot watches pip, the Docker base image and the Actions
 

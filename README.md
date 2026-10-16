@@ -65,6 +65,7 @@ Creates the wheel and source archive in `dist/`.
 | `offroad-autonomy --record-video` | Record the dashboard; requires ffmpeg with libx264 |
 | `offroad-autonomy --presentation-view` | Show the presentation layout |
 | `python scripts/derive_ego_mask.py` | Regenerate hood exclusion after camera changes |
+| `source completions/offroad-autonomy.bash` | Enable tab completion; PowerShell: `. .\completions\offroad-autonomy.ps1` |
 
 ## Development Notes
 

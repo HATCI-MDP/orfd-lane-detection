@@ -48,11 +48,15 @@ def _polyline_score(points, reference):
     return coverage, clearance
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--half-width-m", type=float, default=0.0)
-    args = parser.parse_args()
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
     config = PipelineConfig(enable_ema=False, enable_morphology=False, baseline_temporal_blend=0.4)
     config.path_half_width_m = args.half_width_m
     camera = CameraModel(config.camera, 720, 465)

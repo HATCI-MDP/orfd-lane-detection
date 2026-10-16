@@ -34,7 +34,7 @@ def _summary(values: list[float]) -> dict:
     return {"mean": float(np.mean(values)), "p95": float(np.percentile(values, 95))}
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/default.yaml")
     parser.add_argument("--images", type=Path, required=True)
@@ -70,6 +70,11 @@ def main() -> None:
         action="store_true",
         help="Only with calibration for this RGB camera in --config",
     )
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
     config = load_config(args.config)
     if args.weights:

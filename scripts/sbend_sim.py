@@ -249,7 +249,7 @@ def simulate(
     return _finish(log, max_err, lock_frames, False, trail_width)
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -257,7 +257,11 @@ def main() -> None:
     parser.add_argument("--radius", type=float, default=9.0)
     parser.add_argument("--fps", type=float, default=4.0)
     parser.add_argument("--verbose", action="store_true")
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
     config = load_config(args.config)
     res = simulate(config, radius=args.radius, fps=args.fps)
     print(

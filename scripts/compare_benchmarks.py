@@ -43,11 +43,15 @@ def _cell(value) -> str:
     return str(value)
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("reports", nargs="+", type=Path)
     parser.add_argument("--markdown", action="store_true", help="Emit a Markdown table.")
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
 
     rows = []
     for path in sorted(args.reports):

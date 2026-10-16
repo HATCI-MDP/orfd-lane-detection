@@ -104,7 +104,7 @@ def summarize(rows: list[dict]) -> None:
         )
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -113,7 +113,11 @@ def main() -> None:
     parser.add_argument("--out", default=str(ROOT / "output/diagnostics/closed_loop.csv"))
     parser.add_argument("--snap-from", type=float, default=None)
     parser.add_argument("--summary", action="store_true")
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
 
     cfg = load_config(args.config)
     out = Path(args.out)

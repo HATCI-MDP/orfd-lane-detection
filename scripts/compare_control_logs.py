@@ -40,11 +40,15 @@ def summarize(path):
     }
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("logs", nargs="+")
     parser.add_argument("--out", default="output/diagnostics/beamng_comparison.json")
-    args = parser.parse_args()
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
     report = {"kind": __doc__, "results": [summarize(path) for path in args.logs]}
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

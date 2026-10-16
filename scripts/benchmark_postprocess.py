@@ -17,12 +17,16 @@ from offroad_autonomy.postprocessing.temporal_stabilizer import TemporalStabiliz
 from offroad_autonomy.types import PerceptionResult, PipelineConfig
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline-root", type=Path, required=True)
     parser.add_argument("--labels", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
-    args = parser.parse_args()
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
     path = args.baseline_root / "src/offroad_autonomy/postprocessing/temporal_stabilizer.py"
     spec = importlib.util.spec_from_file_location("baseline_stabilizer", path)
     module = importlib.util.module_from_spec(spec)

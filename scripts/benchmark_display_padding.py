@@ -25,10 +25,15 @@ def _reference(frame, width, height, background):
     return canvas
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--iterations", type=int, default=200)
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
     if args.iterations < 20:
         parser.error("--iterations must be at least 20")

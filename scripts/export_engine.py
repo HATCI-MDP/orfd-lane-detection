@@ -17,7 +17,7 @@ from ultralytics import YOLO
 from offroad_autonomy.utils.config import load_config
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--config",
@@ -28,7 +28,11 @@ def main() -> None:
     parser.add_argument(
         "--fp32", action="store_true", help="Build a full-precision engine instead of FP16."
     )
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
 
     config = load_config(args.config)
     model = YOLO(args.weights)

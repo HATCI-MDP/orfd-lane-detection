@@ -309,8 +309,7 @@ def full(args: argparse.Namespace) -> None:
     print(json.dumps(rows, indent=1))
 
 
-def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -333,8 +332,12 @@ def main() -> None:
     fl = sub.add_parser("full", help="RGB Pipeline On Saved Pairs")
     fl.add_argument("--src", default=str(ROOT / "output/diagnostics/frames"))
     fl.add_argument("--out", default=str(ROOT / "output/diagnostics"))
+    return parser
 
-    args = parser.parse_args()
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    args = build_parser().parse_args()
     {"capture": capture, "analyze": analyze, "full": full}[args.cmd](args)
 
 

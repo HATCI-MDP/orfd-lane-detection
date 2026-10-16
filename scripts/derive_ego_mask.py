@@ -148,13 +148,17 @@ def derive(spec, width: int, height: int, args, key: str) -> None:
     print()
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/default.yaml")
     parser.add_argument("--margin-px", type=int, default=1)
     parser.add_argument("--epsilon", type=float, default=2.0)
     parser.add_argument("--close-px", type=int, default=5)
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
 
     config = load_config(args.config)
     derive(config.camera, config.preprocess_width, config.preprocess_height, args, "ego_mask")
