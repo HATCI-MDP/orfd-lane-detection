@@ -160,6 +160,14 @@ planning:
   # Keeps the road's curvature, removes frame-to-frame jumps.
   baseline_temporal_blend: 0.4
   baseline_max_shift_m: 0.5
+  # A run cut by the viewport has an unknown midpoint. This opt-in development
+  # mode fits only rows whose two road edges are observed, or holds/stops.
+  baseline_require_visible_edges: false
+  # Segmentation can stop just short of the border while the road continues.
+  baseline_edge_margin_px: 3.0
+  # Keep 1.0 for the original fit. Development overlays can reduce a cropped
+  # row's influence without removing its evidence of a drivable continuation.
+  baseline_censored_row_weight: 1.0
   # Check between waypoints after smoothing: a fit can cross mask holes.
   validate_path_corridor: true
   path_min_clearance_px: 1.0
@@ -341,6 +349,10 @@ control:
   lookahead_min_m: 2.0
   lookahead_max_m: 8.0
   lookahead_curvature_gain: 2.0
+  # Opt-in visibility-aware preview: retain curvature adaptation, but measure
+  # preview from the first observed point when the near road is hidden. The
+  # original rule can spend its entire preview reaching that first point.
+  lookahead_from_visible_path: false
   #
   # ---- Speed: min of cruise, curve profile, path end, saturation.
   # Demo maximum is 6 mph. Cruise below it to leave room for tracking error.

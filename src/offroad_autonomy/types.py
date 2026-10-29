@@ -469,6 +469,9 @@ class PipelineConfig:
     planner_roi_height: float = 0.50
     baseline_temporal_blend: float = 0.0
     baseline_max_shift_m: float = 0.5
+    baseline_require_visible_edges: bool = False
+    baseline_edge_margin_px: float = 3.0
+    baseline_censored_row_weight: float = 1.0
     validate_path_corridor: bool = True
     path_min_clearance_px: float = 1.0
     path_half_width_m: float = 0.0
@@ -526,6 +529,7 @@ class PipelineConfig:
     curve_decel_mps2: float = 0.8
     control_latency_s: float = 0.35
     lookahead_curvature_gain: float = 2.0
+    lookahead_from_visible_path: bool = False
     curvature_feedforward_gain: float = 1.0
     saturation_start: float = 0.5
     saturation_min_speed_scale: float = 0.35
