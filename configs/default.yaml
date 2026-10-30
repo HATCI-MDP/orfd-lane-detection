@@ -138,6 +138,10 @@ evaluation:
   # Authored roads kept in the run log: those reaching within route length
   # plus this margin of the spawn. Any further away cannot be on the route.
   road_margin_m: 50.0
+  # True position comes from its own connection and thread, so this rate costs
+  # the control loop nothing; 30 Hz matches the R5 logging spec and was
+  # measured to hold (30.8 Hz median) against a live simulator.
+  position_rate_hz: 30.0
 
 preprocessing:
   # Exactly 3/4 of the 960x620 capture (1/4 of the 2880x1860 imager), so the

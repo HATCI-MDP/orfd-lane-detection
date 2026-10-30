@@ -30,6 +30,7 @@ from offroad_autonomy.runtime.timing import DISPLAY_STAGES, MAIN_STAGES
 from offroad_autonomy.runtime.video_recorder import VideoRecorder, default_video_path
 from offroad_autonomy.simulation.beamng_client import BeamNGClient, BeamNGConnectionError
 from offroad_autonomy.simulation.daylight import validate_daylight
+from offroad_autonomy.simulation.position_sampler import PositionSampler
 from offroad_autonomy.types import (
     DEBUG_VIEW_KEYS,
     ControlCommand,
@@ -429,7 +430,11 @@ def _start_evaluation(
         "route_length_m": config.eval_route_length_m,
         "max_duration_s": config.eval_max_duration_s,
         "trim_start_s": config.eval_trim_start_s,
-        "position_source": "BeamNG vehicle state pos (reference node), sampled once per control frame",
+        "position_source": (
+            "BeamNG game-engine object position (equals the reference node), "
+            "sampled on a separate connection and thread"
+        ),
+        "position_rate_hz": config.eval_position_rate_hz,
         "frame_resolution": [config.camera.sensor.width, config.camera.sensor.height],
         "mask_resolution": [config.preprocess_width, config.preprocess_height],
     }
@@ -565,11 +570,14 @@ def main() -> None:
         logger.info("Recording the presentation video to %s", presentation_video.path)
 
     evaluation: EvalRun | None = None
+    sampler: PositionSampler | None = None
     eval_end: tuple[str, str] | None = None
     try:
         client.connect()
         if args.eval_log:
             evaluation = _start_evaluation(args, config, config_path, client)
+            sampler = client.position_sampler(config.eval_position_rate_hz)
+            sampler.start()
 
         record_dashboard = video is not None
         record = None
@@ -765,7 +773,8 @@ def main() -> None:
             primary_ms = (time.perf_counter() - t_iter) * 1000.0
             stats.record("primary_loop", primary_ms)
 
-            # After actuation, so reading simulator truth adds no command latency.
+            # After actuation; the true position arrives from the sampler thread, so
+            # logging adds no simulator request to this loop.
             if evaluation is not None:
                 evaluation.log.frame(
                     index=frame_count,
@@ -777,7 +786,7 @@ def main() -> None:
                     confidence=_mean_confidence(result.perception.confidences),
                     plan=result.plan,
                 )
-                ended = evaluation.step(time.perf_counter(), client.true_position())
+                ended = evaluation.step(time.perf_counter(), sampler.drain())
                 if ended is not None and eval_end is None:
                     eval_end = (ended, "")
                 if eval_end is not None:
@@ -876,7 +885,12 @@ def main() -> None:
             # A run that ended any other way (quit, Ctrl+C, an error) is still
             # logged, so a failure is reported rather than silently rerun.
             outcome, detail = eval_end or ("interrupted", "")
-            evaluation.finish(outcome, detail)
+            extra = {}
+            if sampler is not None:
+                sampler.stop()
+                evaluation.step(time.perf_counter(), sampler.drain())
+                extra["position_sample_failures"] = sampler.failures
+            evaluation.finish(outcome, detail, extra)
         client.disconnect()
         elapsed = time.perf_counter() - t_start
         logger.info("Session ended - %d frames in %.1f s", frame_count, elapsed)

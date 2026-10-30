@@ -1,10 +1,10 @@
 """Evaluation run log for scored drives (``--eval-log``).
 
 Records, per control frame: the dashcam image, the model's road mask, the
-perception gate's own decision and the road-area fraction; per frame also the
-vehicle's true world position from the simulator, which nothing that steers
-ever reads. ``run_metadata.json`` pins down exactly what ran and how the run
-ended, so a result can be reproduced or rejected later.
+perception gate's own decision and the road-area fraction. Separately, the
+vehicle's true world position, sampled at a fixed rate on its own connection,
+which nothing that steers ever reads. ``run_metadata.json`` pins down exactly
+what ran and how the run ended, so a result can be reproduced or rejected.
 
 PNG encoding takes tens of milliseconds per image, so it runs on a writer
 thread. The control loop never waits on disk: if the writer falls behind, an
@@ -185,17 +185,15 @@ class EvalRun:
         self._last: tuple[float, float] | None = None
         self._start: float | None = None
 
-    def step(self, now: float, position: tuple[float, float, float] | None) -> str | None:
-        """Log one position sample; return why the run ends, or None."""
+    def step(self, now: float, samples: list[tuple[float, float, float, float]]) -> str | None:
+        """Log position samples, each (time, x, y, z); return why the run ends, or None."""
         if self._start is None:
             self._start = now
-        if position is not None:
+        for sample_time, x, y, z in samples:
             if self._last is not None:
-                self.travelled_m += float(
-                    np.hypot(position[0] - self._last[0], position[1] - self._last[1])
-                )
-            self._last = (position[0], position[1])
-            self.log.pose(now, position, self.travelled_m)
+                self.travelled_m += float(np.hypot(x - self._last[0], y - self._last[1]))
+            self._last = (x, y)
+            self.log.pose(sample_time, (x, y, z), self.travelled_m)
         if self.travelled_m >= self.route_length_m:
             return COMPLETED
         if now - self._start >= self.max_duration_s:
@@ -206,16 +204,16 @@ class EvalRun:
         self.interventions += 1
         self.log.event(now, kind, detail)
 
-    def finish(self, outcome: str, detail: str = "") -> None:
-        self.log.close(
-            {
-                "outcome": outcome,
-                "outcome_detail": detail,
-                "run_completed": outcome == COMPLETED and self.interventions == 0,
-                "travelled_m": round(self.travelled_m, 2),
-                "interventions": self.interventions,
-            }
-        )
+    def finish(self, outcome: str, detail: str = "", extra: dict | None = None) -> None:
+        summary = {
+            "outcome": outcome,
+            "outcome_detail": detail,
+            "run_completed": outcome == COMPLETED and self.interventions == 0,
+            "travelled_m": round(self.travelled_m, 2),
+            "interventions": self.interventions,
+        }
+        summary.update(extra or {})
+        self.log.close(summary)
 
 
 def sha256_file(path: str | Path) -> str:

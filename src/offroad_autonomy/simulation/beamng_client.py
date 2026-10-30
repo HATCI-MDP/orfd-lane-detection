@@ -17,6 +17,7 @@ import numpy as np
 
 from offroad_autonomy.simulation.daylight import daylight_to_tod, tod_distance, tod_to_clock
 from offroad_autonomy.simulation.odometry import WheelGyroOdometry
+from offroad_autonomy.simulation.position_sampler import PositionSampler
 from offroad_autonomy.types import (
     CameraFrame,
     CameraSpec,
@@ -29,6 +30,8 @@ from offroad_autonomy.utils.environment import LOCAL_HOSTS
 logger = logging.getLogger("offroad_autonomy.simulation")
 
 _PHYSICS_SETTLE_S = 3.0
+# The position sampler finds the vehicle by this scene name.
+_VEHICLE_NAME = "ego"
 _SENSOR_WARMUP_S = 1.0
 # BeamNG round-trips the time of day through Lua as a float; closer than
 # about 1.5 s of game clock is the value that was set.
@@ -127,7 +130,7 @@ class BeamNGClient:
 
         logger.info("Loading map '%s'", cfg.beamng_map)
         scenario = Scenario(cfg.beamng_map, "offroad_autonomy")
-        vehicle = Vehicle("ego", model=cfg.beamng_vehicle, licence="OFFROAD")
+        vehicle = Vehicle(_VEHICLE_NAME, model=cfg.beamng_vehicle, licence="OFFROAD")
         scenario.add_vehicle(vehicle, pos=spawn_pos, rot_quat=spawn_rot, cling=True)
 
         scenario.make(self._bng)
@@ -358,17 +361,10 @@ class BeamNGClient:
     # scoring; nothing that steers may call them, or the stack would no
     # longer be testable as camera plus wheel/gyro only.
 
-    def true_position(self) -> tuple[float, float, float] | None:
-        """World position of the vehicle's reference node, in metres."""
-        if self._vehicle is None:
-            return None
-        try:
-            self._vehicle.sensors.poll("state")
-            return tuple(float(value) for value in self._vehicle.state["pos"])
-        except Exception as exc:
-            # A missed sample leaves a gap in the log; it must not end the run.
-            logger.debug("True position unavailable: %s", exc)
-            return None
+    def position_sampler(self, rate_hz: float) -> PositionSampler:
+        """True position on its own connection, so logging never slows control."""
+        cfg = self._config
+        return PositionSampler(cfg.beamng_host, cfg.beamng_port, _VEHICLE_NAME, rate_hz)
 
     def road_network(self) -> dict:
         """Authored drivable roads with their left, middle and right edges."""

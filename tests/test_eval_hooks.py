@@ -23,20 +23,11 @@ def test_planner_keeps_the_gate_decision_of_its_last_frame():
     assert not planner.last_gate.ok
 
 
-def test_true_position_reads_the_vehicle_state():
-    client = BeamNGClient(PipelineConfig())
-    client._vehicle = SimpleNamespace(sensors=Mock(), state={"pos": (1.0, 2.0, 3.0)})
-    assert client.true_position() == (1.0, 2.0, 3.0)
-    client._vehicle.sensors.poll.assert_called_once_with("state")
-
-
-def test_a_failed_true_position_read_does_not_end_the_run():
-    client = BeamNGClient(PipelineConfig())
-    sensors = Mock()
-    sensors.poll.side_effect = OSError("socket closed")
-    client._vehicle = SimpleNamespace(sensors=sensors, state={})
-    assert client.true_position() is None
-    assert BeamNGClient(PipelineConfig()).true_position() is None
+def test_true_position_comes_from_a_sampler_on_its_own_connection():
+    config = PipelineConfig(beamng_host="10.0.0.5", beamng_port=1234)
+    sampler = BeamNGClient(config).position_sampler(30.0)
+    assert (sampler._host, sampler._port) == ("10.0.0.5", 1234)
+    assert "scenetree.findObject('ego')" in sampler._query
 
 
 def test_simulator_version_is_asked_of_the_game_engine():
@@ -54,6 +45,7 @@ def test_shipped_evaluation_settings():
     assert config.eval_route_length_m == 335.0
     assert config.eval_max_duration_s == 400.0
     assert config.eval_trim_start_s == 3.0
+    assert config.eval_position_rate_hz == 30.0
 
 
 def test_invalid_route_length_is_refused(tmp_path):

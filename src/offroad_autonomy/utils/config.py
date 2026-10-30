@@ -442,6 +442,7 @@ def load_config(path: str | Path) -> PipelineConfig:
         eval_max_duration_s=_positive(evaluation, "max_duration_s", 400.0),
         eval_trim_start_s=_nonnegative(evaluation, "trim_start_s", 3.0),
         eval_road_margin_m=_nonnegative(evaluation, "road_margin_m", 50.0),
+        eval_position_rate_hz=_positive(evaluation, "position_rate_hz", 30.0),
         gate_min_confidence=float(gate.get("confidence_threshold", 0.18)),
         gate_min_mask_area=float(gate.get("min_mask_area", 0.05)),
         gate_hold_frames=int(gate.get("hold_frames", 10)),

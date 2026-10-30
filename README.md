@@ -55,7 +55,8 @@ offroad-autonomy --config configs/grid.yaml --daylight 74
 
 `--eval-log <new folder>` records a run for scoring: every dashcam frame and road mask as
 PNG, the perception gate's decision and road fraction per frame, the vehicle's true BeamNG
-position once per control frame, the nearby authored roads, and `run_metadata.json` (git
+position at `evaluation.position_rate_hz` from a separate connection (so logging never slows
+the control loop), the nearby authored roads, and `run_metadata.json` (git
 commit, model file and SHA-256, planner, daylight and time of day, spawn, speed limits,
 BeamNG version, outcome). The simulator position is read for the log only; nothing that
 steers uses it. A run ends after `evaluation.route_length_m` of true travel, after

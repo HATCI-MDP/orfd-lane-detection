@@ -486,6 +486,7 @@ class PipelineConfig:
     eval_max_duration_s: float = 400.0
     eval_trim_start_s: float = 3.0
     eval_road_margin_m: float = 50.0
+    eval_position_rate_hz: float = 30.0
 
     gate_min_confidence: float = 0.18
     gate_min_mask_area: float = 0.05

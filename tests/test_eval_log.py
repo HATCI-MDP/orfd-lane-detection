@@ -44,8 +44,7 @@ def test_frames_masks_gate_and_metadata_are_written(tmp_path):
     log.frame(1, 0.0, image, mask, _gate(False), 0.01, 0.2, _plan("held"))
     log.frame(2, 0.0, image, None, _gate(False), 0.0, 0.0, _plan("stale"))
     run = EvalRun(log, route_length_m=100.0, max_duration_s=60.0)
-    run.step(10.0, (0.0, 0.0, 0.0))
-    run.step(10.1, (3.0, 4.0, 0.0))
+    run.step(10.1, [(10.0, 0.0, 0.0, 0.0), (10.1, 3.0, 4.0, 0.0)])
     run.finish("timeout")
 
     rows = _read(tmp_path / "run" / "frames.csv")
@@ -67,8 +66,8 @@ def test_frames_masks_gate_and_metadata_are_written(tmp_path):
 
 def test_run_ends_at_route_length_and_counts_as_completed(tmp_path):
     run = EvalRun(EvalLogger(tmp_path / "run", {}), route_length_m=5.0, max_duration_s=60.0)
-    assert run.step(0.0, (0.0, 0.0, 0.0)) is None
-    assert run.step(0.1, (3.0, 4.0, 0.0)) == COMPLETED
+    assert run.step(0.0, [(0.0, 0.0, 0.0, 0.0)]) is None
+    assert run.step(0.1, [(0.05, 1.5, 2.0, 0.0), (0.1, 3.0, 4.0, 0.0)]) == COMPLETED
     run.finish(COMPLETED)
     meta = json.loads((tmp_path / "run" / "run_metadata.json").read_text())
     assert meta["run_completed"] is True
@@ -85,8 +84,8 @@ def test_an_intervention_means_the_run_was_not_completed(tmp_path):
 
 def test_run_times_out_without_progress(tmp_path):
     run = EvalRun(EvalLogger(tmp_path / "run", {}), route_length_m=5.0, max_duration_s=2.0)
-    run.step(0.0, None)
-    assert run.step(2.5, None) == "timeout"
+    run.step(0.0, [])
+    assert run.step(2.5, []) == "timeout"
     run.finish("timeout")
 
 
@@ -116,7 +115,7 @@ def _logged_run(root, condition, name, offset_m, rejected):
         log.frame(
             i, 0.0, np.zeros((2, 2, 3), np.uint8), None, _gate(i not in rejected), 0.3, 0.6, _plan()
         )
-        run.step(float(i) * 0.5, (2.0 * i, offset_m, 0.0))
+        run.step(float(i) * 0.5, [(float(i) * 0.5, 2.0 * i, offset_m, 0.0)])
     run.finish(COMPLETED)
     return root / condition / name
 

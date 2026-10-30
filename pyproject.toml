@@ -58,6 +58,7 @@ ignore = ["RUF046"]
 # beamngpy and the GUI backends raise a wide, undocumented range of exceptions;
 # a failed poll or window call must degrade, never end the session.
 "src/offroad_autonomy/simulation/beamng_client.py" = ["BLE001"]
+"src/offroad_autonomy/simulation/position_sampler.py" = ["BLE001"]
 "src/offroad_autonomy/visualization/window.py" = ["BLE001"]
 # Multi-line YAML fixtures read better as a list of lines than as one f-string.
 "tests/**" = ["FLY002"]
