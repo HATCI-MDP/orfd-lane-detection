@@ -482,6 +482,10 @@ class PipelineConfig:
     projection_pitch_uncertainty_deg: float = 1.0
     projection_max_relative_error: float = 0.3
     max_frame_age_ms: float = 200.0
+    eval_route_length_m: float = 335.0
+    eval_max_duration_s: float = 400.0
+    eval_trim_start_s: float = 3.0
+    eval_road_margin_m: float = 50.0
 
     gate_min_confidence: float = 0.18
     gate_min_mask_area: float = 0.05

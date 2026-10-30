@@ -17,6 +17,15 @@ import numpy as np
 from offroad_autonomy.pipeline import AutonomyPipeline
 from offroad_autonomy.runtime.benchmark import BenchmarkRecorder
 from offroad_autonomy.runtime.display_worker import DisplayState, DisplayWorker
+from offroad_autonomy.runtime.eval_log import (
+    EvalLogger,
+    EvalRun,
+    git_commit,
+    now_iso,
+    package_version,
+    sha256_file,
+)
+from offroad_autonomy.runtime.route_metrics import roads_near
 from offroad_autonomy.runtime.timing import DISPLAY_STAGES, MAIN_STAGES
 from offroad_autonomy.runtime.video_recorder import VideoRecorder, default_video_path
 from offroad_autonomy.simulation.beamng_client import BeamNGClient, BeamNGConnectionError
@@ -99,6 +108,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Map daylight for this run, 0-100: 100 is noon, 0 is midnight, and the clock "
             "stays frozen (overrides beamng.daylight_pct)."
+        ),
+    )
+    parser.add_argument(
+        "--eval-log",
+        metavar="DIR",
+        default="",
+        help=(
+            "Record a scored run to this new folder: dashcam frames, road masks, gate "
+            "decisions, true vehicle position and run_metadata.json. The run ends at "
+            "evaluation.route_length_m of true travel; score it with scripts/r5_metrics.py."
         ),
     )
     parser.add_argument(
@@ -377,6 +396,50 @@ def _open_window(width: int, height: int) -> DashboardWindow | None:
         return None
 
 
+def _start_evaluation(
+    args: argparse.Namespace, config: PipelineConfig, config_path: Path, client: BeamNGClient
+) -> EvalRun:
+    """Open the evaluation log once the scenario is running and its truth is readable."""
+    spawn_pos, spawn_rot = client.spawn_pose
+    weights = Path(config.model_weights).resolve()
+    metadata = {
+        "started": now_iso(),
+        "git_commit": git_commit(),
+        "command": sys.argv,
+        "config": str(config_path),
+        "label": args.label or config_path.stem,
+        "model_weights": str(config.model_weights),
+        "model_file": weights.name,
+        "model_sha256": sha256_file(weights),
+        "perception_prompts": list(config.perception_prompts),
+        "planner": config.planner_mode,
+        "daylight_pct": config.beamng_daylight_pct,
+        "time_of_day": client.time_of_day(),
+        "map": config.beamng_map,
+        "vehicle": config.beamng_vehicle,
+        "spawn_index": config.beamng_spawn_index,
+        "spawn_pos": list(spawn_pos),
+        "spawn_rot": list(spawn_rot),
+        "speed_limit_mph": config.speed_limit_mph,
+        "target_speed_mph": config.target_speed_mph,
+        "beamng_version": client.simulator_version(),
+        "beamngpy_version": package_version("beamngpy"),
+        "ultralytics_version": package_version("ultralytics"),
+        "headless": config.ui_headless,
+        "route_length_m": config.eval_route_length_m,
+        "max_duration_s": config.eval_max_duration_s,
+        "trim_start_s": config.eval_trim_start_s,
+        "position_source": "BeamNG vehicle state pos (reference node), sampled once per control frame",
+        "frame_resolution": [config.camera.sensor.width, config.camera.sensor.height],
+        "mask_resolution": [config.preprocess_width, config.preprocess_height],
+    }
+    log = EvalLogger(args.eval_log, metadata)
+    radius = config.eval_route_length_m + config.eval_road_margin_m
+    log.write_json("road_network.json", roads_near(client.road_network(), spawn_pos[:2], radius))
+    logger.info("Evaluation log: %s (route %.0f m)", log.directory, config.eval_route_length_m)
+    return EvalRun(log, config.eval_route_length_m, config.eval_max_duration_s)
+
+
 def _handle_key(
     key: int,
     autopilot_active: bool,
@@ -444,6 +507,10 @@ def main() -> None:
         config.ui_headless = True
     if args.daylight is not None:
         config.beamng_daylight_pct = args.daylight
+    eval_dir = Path(args.eval_log)
+    # Checked before the map loads, so a reused folder costs nothing to fix.
+    if args.eval_log and eval_dir.exists() and any(eval_dir.iterdir()):
+        sys.exit(f"Evaluation log folder is not empty, choose a new one: {eval_dir}")
     logger.info("Configuration loaded from %s", config_path)
 
     # SIGTERM is what `docker stop` sends; without a handler the process dies
@@ -497,8 +564,12 @@ def main() -> None:
         )
         logger.info("Recording the presentation video to %s", presentation_video.path)
 
+    evaluation: EvalRun | None = None
+    eval_end: tuple[str, str] | None = None
     try:
         client.connect()
+        if args.eval_log:
+            evaluation = _start_evaluation(args, config, config_path, client)
 
         record_dashboard = video is not None
         record = None
@@ -675,6 +746,11 @@ def main() -> None:
                     command = _SAFE_STOP_COMMAND
                     plan = None
                     logger.warning("Safe stop triggered automatically: %s", reason)
+                    if evaluation is not None:
+                        evaluation.intervention(t_iter, "auto_safe_stop", reason)
+                        if config.ui_headless:
+                            # Nobody can take over a headless run, so it is over.
+                            eval_end = ("safe_stop", reason)
             else:
                 held: set[str] = set()
                 if dashboard_window is not None:
@@ -688,6 +764,25 @@ def main() -> None:
                 client.send_controls(command)
             primary_ms = (time.perf_counter() - t_iter) * 1000.0
             stats.record("primary_loop", primary_ms)
+
+            # After actuation, so reading simulator truth adds no command latency.
+            if evaluation is not None:
+                evaluation.log.frame(
+                    index=frame_count,
+                    capture_time=capture.timestamp,
+                    image=capture.image,
+                    mask=result.perception.mask,
+                    gate=pipeline.planner.last_gate,
+                    road_fraction=result.stabilized.road_fraction,
+                    confidence=_mean_confidence(result.perception.confidences),
+                    plan=result.plan,
+                )
+                ended = evaluation.step(time.perf_counter(), client.true_position())
+                if ended is not None and eval_end is None:
+                    eval_end = (ended, "")
+                if eval_end is not None:
+                    client.park()
+                    break
 
             # The command has already gone out and primary_loop is recorded,
             # so nothing below counts as autonomy latency.
@@ -729,9 +824,14 @@ def main() -> None:
                         debug_view = DEBUG_VIEW_KEYS[key - ord("0")]
                         logger.info("Debug view: %s", debug_view)
                     else:
+                        was_active = autopilot_active
                         autopilot_active = _handle_key(
                             key, autopilot_active, client, stuck_detector
                         )
+                        if evaluation is not None and was_active and not autopilot_active:
+                            evaluation.intervention(time.perf_counter(), "operator_safe_stop")
+                        if evaluation is not None and autopilot_active and not was_active:
+                            evaluation.log.event(time.perf_counter(), "operator_resume")
 
             full_ms = (time.perf_counter() - t_iter) * 1000.0
             stats.record("full_loop", full_ms)
@@ -772,6 +872,11 @@ def main() -> None:
             if recording is not None:
                 recording.close()
                 _log_video(recording)
+        if evaluation is not None:
+            # A run that ended any other way (quit, Ctrl+C, an error) is still
+            # logged, so a failure is reported rather than silently rerun.
+            outcome, detail = eval_end or ("interrupted", "")
+            evaluation.finish(outcome, detail)
         client.disconnect()
         elapsed = time.perf_counter() - t_start
         logger.info("Session ended - %d frames in %.1f s", frame_count, elapsed)

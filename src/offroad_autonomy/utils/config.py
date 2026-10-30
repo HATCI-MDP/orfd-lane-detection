@@ -383,6 +383,7 @@ def load_config(path: str | Path) -> PipelineConfig:
     if "controller" in ctrl:
         raise ValueError("Remove control.controller: Stanley is the only controller")
     dashboard = _section(_section(raw, "visualization"), "dashboard")
+    evaluation = _section(raw, "evaluation")
 
     if "segmentation_mode" in perc or "stitching" in raw:
         raise ValueError("Remove segmentation_mode and stitching: the dashcam is the only input")
@@ -437,6 +438,10 @@ def load_config(path: str | Path) -> PipelineConfig:
         ),
         projection_max_relative_error=_positive(plan, "projection_max_relative_error", 0.3),
         max_frame_age_ms=_nonnegative(_section(raw, "runtime"), "max_frame_age_ms", 200.0),
+        eval_route_length_m=_positive(evaluation, "route_length_m", 335.0),
+        eval_max_duration_s=_positive(evaluation, "max_duration_s", 400.0),
+        eval_trim_start_s=_nonnegative(evaluation, "trim_start_s", 3.0),
+        eval_road_margin_m=_nonnegative(evaluation, "road_margin_m", 50.0),
         gate_min_confidence=float(gate.get("confidence_threshold", 0.18)),
         gate_min_mask_area=float(gate.get("min_mask_area", 0.05)),
         gate_hold_frames=int(gate.get("hold_frames", 10)),

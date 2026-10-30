@@ -253,6 +253,7 @@ class CenterlinePlanner:
 
         self._mode = config.planner_mode
         self._gate = PerceptionGate(config)
+        self.last_gate: GateDecision | None = None
         self._baseline = BaselinePlanner(config, camera=camera)
         self._hold_frames = max(0, int(config.gate_hold_frames))
         self._hold_speed_scale = float(np.clip(config.gate_hold_speed_scale, 0.0, 1.0))
@@ -298,6 +299,9 @@ class CenterlinePlanner:
         trail. The last good path is held briefly at reduced speed instead.
         """
         decision = self._gate.evaluate(stabilized)
+        # Kept for evaluation logs: fallback_reason also covers planner and
+        # staleness stops, so it cannot tell a gate rejection apart.
+        self.last_gate = decision
         valid = stabilized.valid_roi
         if valid is not None and valid.shape == decision.component.shape:
             # A hood-cut row exposes only fragments of the road width. Using

@@ -62,6 +62,7 @@ class BeamNGClient:
         self._orbit = orbit
         self._bng = None
         self._vehicle = None
+        self.spawn_pose: tuple[tuple, tuple] | None = None
         self._cameras: dict[str, object] = {}
         self._odometry = WheelGyroOdometry()
         self._last_odometry_warning = float("-inf")
@@ -122,6 +123,7 @@ class BeamNGClient:
             ) from exc
 
         spawn_pos, spawn_rot = self._resolve_spawn(cfg)
+        self.spawn_pose = (spawn_pos, spawn_rot)
 
         logger.info("Loading map '%s'", cfg.beamng_map)
         scenario = Scenario(cfg.beamng_map, "offroad_autonomy")
@@ -351,6 +353,41 @@ class BeamNGClient:
 
         self._vehicle = None
         logger.info("BeamNG session closed")
+
+    # ---- Evaluation only. These read simulator ground truth for run logs and
+    # scoring; nothing that steers may call them, or the stack would no
+    # longer be testable as camera plus wheel/gyro only.
+
+    def true_position(self) -> tuple[float, float, float] | None:
+        """World position of the vehicle's reference node, in metres."""
+        if self._vehicle is None:
+            return None
+        try:
+            self._vehicle.sensors.poll("state")
+            return tuple(float(value) for value in self._vehicle.state["pos"])
+        except Exception as exc:
+            # A missed sample leaves a gap in the log; it must not end the run.
+            logger.debug("True position unavailable: %s", exc)
+            return None
+
+    def road_network(self) -> dict:
+        """Authored drivable roads with their left, middle and right edges."""
+        return self._bng.scenario.get_road_network(include_edges=True, drivable_only=True)
+
+    def time_of_day(self) -> dict:
+        return self._bng.env.get_tod()
+
+    def simulator_version(self) -> str | None:
+        # The protocol handshake carries no game version, and the user folder
+        # is often just "current", so ask the game engine itself.
+        try:
+            version = self._bng.control.queue_lua_command(
+                "return tostring(beamng_versiond)", response=True
+            )
+        except Exception as exc:
+            logger.debug("BeamNG version unavailable: %s", exc)
+            return None
+        return str(version)
 
     def _apply_daylight(self) -> None:
         percent = self._config.beamng_daylight_pct

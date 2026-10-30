@@ -51,6 +51,28 @@ the flag the map keeps its own time of day (`beamng.daylight_pct` in the config)
 offroad-autonomy --config configs/grid.yaml --daylight 74
 ```
 
+### Scored Runs
+
+`--eval-log <new folder>` records a run for scoring: every dashcam frame and road mask as
+PNG, the perception gate's decision and road fraction per frame, the vehicle's true BeamNG
+position once per control frame, the nearby authored roads, and `run_metadata.json` (git
+commit, model file and SHA-256, planner, daylight and time of day, spawn, speed limits,
+BeamNG version, outcome). The simulator position is read for the log only; nothing that
+steers uses it. A run ends after `evaluation.route_length_m` of true travel, after
+`evaluation.max_duration_s`, or at a safe stop when headless. A folder that already holds
+results is refused.
+
+```bash
+offroad-autonomy --config configs/grid.yaml --headless --daylight 100 --eval-log output/r5/noon/run1
+python scripts/r5_metrics.py output/r5/*/run* --baseline noon --out output/r5/summary
+```
+
+`scripts/r5_metrics.py` writes `results.csv` and `verdicts.json`: gate rejection rate and
+longest rejected streak, mean absolute lateral offset from the nearest authored road
+centreline (after `evaluation.trim_start_s`), road departures and interventions, each
+against the proposed R5 criteria. Road IoU is not measured: BeamNG's annotation camera
+labels the dirt trail the same as the trees, and there are no hand labels.
+
 ## Build
 
 ```bash

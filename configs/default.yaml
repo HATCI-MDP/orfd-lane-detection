@@ -125,6 +125,20 @@ runtime:
   # rejection for deliberate offline replay; unknown age is reported as null.
   max_frame_age_ms: 200.0
 
+# Only used with --eval-log, which records a scored run (R5 robustness).
+evaluation:
+  # The demo route from spawn 0 is 332-342 m; ending every run at the same
+  # true travelled distance makes per-run offsets cover the same road.
+  route_length_m: 335.0
+  # A run that stops making progress without a safe stop would never end.
+  # About 2.5x the 136 s the route takes at the 5.5 mph cruise.
+  max_duration_s: 400.0
+  # The first seconds are the car accelerating from rest, not tracking.
+  trim_start_s: 3.0
+  # Authored roads kept in the run log: those reaching within route length
+  # plus this margin of the spawn. Any further away cannot be on the route.
+  road_margin_m: 50.0
+
 preprocessing:
   # Exactly 3/4 of the 960x620 capture (1/4 of the 2880x1860 imager), so the
   # segmentation mask, planner and dashboard overlays share one grid.
