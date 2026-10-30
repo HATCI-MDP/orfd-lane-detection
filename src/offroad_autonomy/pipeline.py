@@ -40,6 +40,9 @@ class RGBPlanningPipeline:
         self.valid_roi = self.view.valid_roi
         self.preprocessor = ImagePreprocessor(config, target_size=self.view.size)
         self.segmenter = RoadSegmenter(config)
+        # Before the simulator connects, so the first live frame is not the
+        # slow one that would stall the control loop.
+        self.segmenter.warmup(self.view.size)
         self.stabilizer = TemporalStabilizer(config)
         self.planner = CenterlinePlanner(config, camera=self.view.camera)
         self._max_frame_age_ms = config.max_frame_age_ms

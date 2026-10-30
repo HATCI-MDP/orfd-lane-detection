@@ -14,7 +14,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
-from ultralytics import YOLO
+from ultralytics import YOLO, YOLOE
+from ultralytics.nn.tasks import YOLOEModel
 
 from offroad_autonomy.perception.ego_mask import (
     apply_roi,
@@ -39,8 +40,21 @@ class RoadSegmenter:
         self._half = bool(config.perception_half and torch.cuda.is_available())
 
         logger.info("Loading model weights: %s", weights)
+        resolved = Path(weights).resolve()
+        if resolved != Path(weights).absolute():
+            # A linked default path would otherwise hide which checkpoint ran.
+            logger.info("Model weights resolve to %s", resolved)
         self._model = YOLO(weights, task="segment")
         self._semantic = self._model.task == "semantic"
+        # Ultralytics picks the YOLOE wrapper from the file name alone, so a
+        # renamed YOLOE checkpoint such as models/weights.pt cannot take
+        # prompts and would segment the stock vocabulary instead of road.
+        if (
+            not self._semantic
+            and isinstance(self._model.model, YOLOEModel)
+            and not isinstance(self._model, YOLOE)
+        ):
+            self._model = YOLOE(weights, task="segment")
 
         # Exported engines have their classes compiled in; re-prompting them
         # is impossible, and fine-tuned checkpoints have fixed classes too.
@@ -71,6 +85,34 @@ class RoadSegmenter:
             except (TypeError, AssertionError, AttributeError):
                 logger.info("Model has fixed classes - skipping open-vocab prompts")
 
+    def warmup(self, size: tuple[int, int]) -> None:
+        """Pay the model's cold-start cost before the control loop starts.
+
+        The first inference builds CUDA kernels and caches. It took 1.6 s on a
+        laptop RTX GPU, long enough to break the wheel/gyro sample gap limit
+        and safe-stop the car on its first frames.
+        """
+        width, height = size
+        t0 = time.perf_counter()
+        self._infer(np.zeros((height, width, 3), dtype=np.uint8))
+        logger.info("Model warm-up: %.0f ms", (time.perf_counter() - t0) * 1000.0)
+
+    def _infer(self, img: np.ndarray):
+        # Without retina_masks the masks come back at the padded network
+        # resolution, and a plain resize shifts them against the frame.
+        kwargs = {}
+        if self._semantic:
+            kwargs["predictor"] = self._predictor
+        return self._model.predict(
+            img,
+            conf=self._conf,
+            imgsz=self._imgsz,
+            half=self._half,
+            verbose=False,
+            retina_masks=True,
+            **kwargs,
+        )
+
     def predict(
         self,
         frame: FramePacket,
@@ -85,20 +127,7 @@ class RoadSegmenter:
         h, w = frame.height, frame.width
 
         t0 = time.perf_counter()
-        # Without retina_masks the masks come back at the padded network
-        # resolution, and a plain resize shifts them against the frame.
-        kwargs = {}
-        if self._semantic:
-            kwargs["predictor"] = self._predictor
-        results = self._model.predict(
-            img,
-            conf=self._conf,
-            imgsz=self._imgsz,
-            half=self._half,
-            verbose=False,
-            retina_masks=True,
-            **kwargs,
-        )
+        results = self._infer(img)
         t_ms = (time.perf_counter() - t0) * 1000.0
 
         result = None
