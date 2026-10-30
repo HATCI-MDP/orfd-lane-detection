@@ -20,6 +20,7 @@ from offroad_autonomy.runtime.display_worker import DisplayState, DisplayWorker
 from offroad_autonomy.runtime.timing import DISPLAY_STAGES, MAIN_STAGES
 from offroad_autonomy.runtime.video_recorder import VideoRecorder, default_video_path
 from offroad_autonomy.simulation.beamng_client import BeamNGClient, BeamNGConnectionError
+from offroad_autonomy.simulation.daylight import validate_daylight
 from offroad_autonomy.types import (
     DEBUG_VIEW_KEYS,
     ControlCommand,
@@ -69,6 +70,14 @@ def _signal_handler(signum, frame) -> None:
     _shutdown = True
 
 
+def _daylight_percent(value: str) -> float:
+    # Rejecting here reports a bad value before the simulator spends a minute loading the map.
+    try:
+        return validate_daylight(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="offroad_autonomy - autonomous off-road driving in BeamNG",
@@ -82,6 +91,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--road-class",
         action="append",
         help="Road class name or prompt for this run; repeat to select multiple classes.",
+    )
+    parser.add_argument(
+        "--daylight",
+        type=_daylight_percent,
+        metavar="PERCENT",
+        help=(
+            "Map daylight for this run, 0-100: 100 is noon, 0 is midnight, and the clock "
+            "stays frozen (overrides beamng.daylight_pct)."
+        ),
     )
     parser.add_argument(
         "--log-level",
@@ -424,6 +442,8 @@ def main() -> None:
         config.perception_prompts = args.road_class
     if args.headless:
         config.ui_headless = True
+    if args.daylight is not None:
+        config.beamng_daylight_pct = args.daylight
     logger.info("Configuration loaded from %s", config_path)
 
     # SIGTERM is what `docker stop` sends; without a handler the process dies

@@ -440,6 +440,8 @@ class PipelineConfig:
     beamng_map: str = "automation_test_track"
     beamng_vehicle: str = "pickup"
     beamng_spawn_index: int = 0
+    #: None keeps the map's own time of day.
+    beamng_daylight_pct: float | None = None
     camera: CameraSpec = field(default_factory=lambda: replace(DEFAULT_CAMERA))
     #: Attached only with --presentation.
     orbit_camera: CameraSpec = field(default_factory=lambda: replace(DEFAULT_ORBIT_CAMERA))

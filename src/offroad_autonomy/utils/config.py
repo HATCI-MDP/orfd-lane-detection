@@ -12,6 +12,7 @@ import yaml
 from offroad_autonomy.control.predictive_config import CONTROL_MODES, PredictiveConfig
 from offroad_autonomy.planning.grid_config import GridPlannerConfig
 from offroad_autonomy.runtime.video_recorder import X264_PRESETS
+from offroad_autonomy.simulation.daylight import validate_daylight
 from offroad_autonomy.types import (
     CAMERA_TRANSPORTS,
     DEBUG_VIEWS,
@@ -255,6 +256,15 @@ def _camera_transport(raw: object) -> str:
     return transport
 
 
+def _daylight(raw: object) -> float | None:
+    if raw is None:
+        return None
+    try:
+        return validate_daylight(raw)
+    except ValueError as exc:
+        raise ValueError(f"beamng.daylight_pct: {exc}") from exc
+
+
 def _load_recording(raw: dict) -> dict:
     fps = float(raw.get("fps", 20.0))
     crf = int(raw.get("crf", 23))
@@ -389,6 +399,7 @@ def load_config(path: str | Path) -> PipelineConfig:
         beamng_map=bng.get("map", "automation_test_track"),
         beamng_vehicle=bng.get("vehicle", "pickup"),
         beamng_spawn_index=bng.get("spawn_index", 0),
+        beamng_daylight_pct=_daylight(bng.get("daylight_pct")),
         camera=camera,
         orbit_camera=_load_orbit_camera(_section(_section(raw, "presentation"), "orbit_camera")),
         map_spawns=bng.get("maps", {}),

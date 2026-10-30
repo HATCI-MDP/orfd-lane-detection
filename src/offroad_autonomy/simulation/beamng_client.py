@@ -15,6 +15,7 @@ import zlib
 import cv2
 import numpy as np
 
+from offroad_autonomy.simulation.daylight import daylight_to_tod, tod_distance, tod_to_clock
 from offroad_autonomy.simulation.odometry import WheelGyroOdometry
 from offroad_autonomy.types import (
     CameraFrame,
@@ -29,6 +30,11 @@ logger = logging.getLogger("offroad_autonomy.simulation")
 
 _PHYSICS_SETTLE_S = 3.0
 _SENSOR_WARMUP_S = 1.0
+# BeamNG round-trips the time of day through Lua as a float; closer than
+# about 1.5 s of game clock is the value that was set.
+_TOD_TOLERANCE = 2e-5
+# Long enough for a running day cycle to move the clock past the tolerance.
+_TOD_FREEZE_CHECK_S = 0.5
 
 # Sensor-equivalent channels only. No State sensor, position, orientation,
 # world velocity or road geometry. These are ideal simulated readings, not
@@ -125,6 +131,9 @@ class BeamNGClient:
         scenario.make(self._bng)
         self._bng.scenario.load(scenario)
         self._bng.scenario.start()
+        # Loading a scenario restores the map's own time of day, so daylight
+        # can only be applied once the scenario is running.
+        self._apply_daylight()
         vehicle.connect(self._bng)
         self._vehicle = vehicle
         # Hold the spawn while sensors settle. In arcade mode the service
@@ -342,6 +351,27 @@ class BeamNGClient:
 
         self._vehicle = None
         logger.info("BeamNG session closed")
+
+    def _apply_daylight(self) -> None:
+        percent = self._config.beamng_daylight_pct
+        if percent is None:
+            return
+        tod = daylight_to_tod(percent)
+        env = self._bng.env
+        # A running day cycle would change the lighting during the drive and
+        # blur the condition being tested, so the clock is frozen.
+        env.set_tod(tod=tod, play=False)
+        actual = float(env.get_tod()["time"])
+        if tod_distance(actual, tod) > _TOD_TOLERANCE:
+            raise RuntimeError(f"BeamNG time of day is {actual}, expected {tod} for {percent}%")
+        # get_tod does not report whether the cycle plays, so watch the clock.
+        time.sleep(_TOD_FREEZE_CHECK_S)
+        later = float(env.get_tod()["time"])
+        if tod_distance(later, actual) > _TOD_TOLERANCE:
+            raise RuntimeError(f"BeamNG day cycle is still running: {actual} became {later}")
+        logger.info(
+            "Daylight %g%%: time of day %.4f (%s), clock frozen", percent, tod, tod_to_clock(tod)
+        )
 
     def _resolve_spawn(self, cfg: PipelineConfig) -> tuple[tuple, tuple]:
         map_cfg = cfg.map_spawns.get(cfg.beamng_map)

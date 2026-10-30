@@ -42,6 +42,15 @@ environment settings out of committed configs.
 Dashboard keys: `E` safe stop, `P` resume, `0/1/6/9` debug views, `T` timing, `Q` quit.
 Use `--headless` to run without a window or `--config <file>` for a config overlay.
 
+`--daylight <0-100>` sets the map's lighting for a run: 100 is noon, 0 is midnight, and
+values in between step through the afternoon (74 is about 15:07). The clock is frozen so the
+lighting cannot change mid-run, and the run stops if BeamNG does not take the value. Without
+the flag the map keeps its own time of day (`beamng.daylight_pct` in the config).
+
+```bash
+offroad-autonomy --config configs/grid.yaml --daylight 74
+```
+
 ## Build
 
 ```bash
@@ -67,6 +76,7 @@ Creates the wheel and source archive in `dist/`.
 | `ruff format --check src tests scripts` | Check formatting                                   |
 | `offroad-autonomy --record-video`       | Record the dashboard; requires ffmpeg with libx264 |
 | `offroad-autonomy --presentation-view`  | Show the presentation layout                       |
+| `offroad-autonomy --daylight 74`        | Run at 74% daylight (100 is noon, 0 is midnight)   |
 | `python scripts/derive_ego_mask.py`     | Regenerate hood exclusion after camera changes     |
 
 ## Development Notes

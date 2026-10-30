@@ -18,6 +18,10 @@ beamng:
   map: automation_test_track
   vehicle: hopper
   spawn_index: 0
+  # Daylight in percent: 100 is noon, 0 is midnight, in equal afternoon clock
+  # steps (74 is about 15:07). The clock is frozen so lighting cannot drift
+  # mid-run. null keeps the map's own time of day; --daylight overrides it.
+  daylight_pct: null
   # One dashcam supplies inference, ground-plane planning, control and display.
   # BeamNG vehicle space: +X left, -Y forward, +Z up.
   camera:
