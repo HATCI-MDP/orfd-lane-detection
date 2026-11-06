@@ -428,3 +428,37 @@ def test_a_metric_path_is_not_recentred_on_image_edges():
     command = controller.compute(plan, VehicleState(speed_mps=2.0))
 
     assert command.debug.centering_shift_m == 0.0
+
+
+def test_predicted_pose_includes_the_camera_swing_about_the_rear_axle():
+    """The car turns about its rear axle, so a camera mounted ahead of it
+    also moves sideways by the yaw times its lever arm."""
+    config = _config(control_latency_s=0.35, camera_ahead_of_rear_axle_m=1.4)
+    controller = StanleyController(config)
+    controller._prev_steering = 0.5
+    speed = 3.0
+    plan = _path(config, lambda f: 0.0, forward=np.linspace(0.5, 14.0, 24))
+
+    command = controller.compute(plan, VehicleState(speed_mps=speed))
+
+    curvature = math.tan(0.5 * math.radians(config.max_wheel_angle_deg)) / config.wheelbase_m
+    yaw = curvature * speed * config.control_latency_s
+    lever = config.camera_ahead_of_rear_axle_m
+    camera_right = (1.0 - math.cos(yaw)) / curvature + lever * math.sin(yaw)
+    assert command.debug.cross_track_m == pytest.approx(-camera_right, abs=0.01)
+
+
+def test_speed_ramp_restarts_from_the_vehicle_speed_after_a_gate_stop():
+    config = _config(max_target_speed_increase_mps=0.1)
+    controller = StanleyController(config)
+    straight = _path(config, lambda f: 0.0, forward=np.linspace(1.0, 14.0, 24))
+    gate_stop = PathPlan(centerline=np.empty((0, 2), np.float32), speed_scale=0.0)
+    for _ in range(10):
+        controller.compute(straight, VehicleState(speed_mps=2.0))
+    for _ in range(5):
+        controller.compute(gate_stop, VehicleState(speed_mps=0.0))
+
+    debug = controller.compute(straight, VehicleState(speed_mps=0.0)).debug
+
+    assert debug.target_speed_mps == pytest.approx(0.1, abs=1e-6)
+    assert debug.speed_reason == "ramp up"

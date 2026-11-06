@@ -307,6 +307,7 @@ class StanleyController:
         )
         self._cap_at_high = float(np.clip(config.steer_cap_at_high_speed, 0.05, 1.0))
         self._wheelbase = float(max(config.wheelbase_m, 0.5))
+        self._camera_ahead = float(config.camera_ahead_of_rear_axle_m)
         self._max_wheel_angle = math.radians(max(config.max_wheel_angle_deg, 1.0))
         self._path_end_margin = float(max(config.path_end_margin_m, 0.0))
         self._path_end_decel = float(max(config.path_end_decel_mps2, 0.1))
@@ -455,7 +456,10 @@ class StanleyController:
         arc_heading = 0.0
         cte_at = 0.0
         if self._predict_pose:
-            arc_offset = 0.5 * arc * f0 * f0
+            # The car yaws about its rear axle, so the camera ahead of it also
+            # swings sideways by its lever arm times the yaw. In a 10 m bend at
+            # cruise that swing is about three quarters of the offset.
+            arc_offset = arc * f0 * (0.5 * f0 + self._camera_ahead)
             arc_heading = arc * f0
             cte_at = f0
         reference_at = max(cte_at, path.start, ref.start)
@@ -622,6 +626,9 @@ class StanleyController:
             # The perception gate has nothing left to drive: stop now rather
             # than coasting along a path nobody perceived.
             debug.target_speed_mps, debug.speed_reason = 0.0, "gate stop"
+            # Otherwise the ramp resumes from the target before the stop, and
+            # the car relaunches from standstill straight at cruise.
+            self._prev_target = None
             return 0.0, self._max_brake
 
         if state.speed_mps > self._speed_limit:
